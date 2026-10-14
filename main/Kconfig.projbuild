@@ -45,6 +45,16 @@ config USE_SERVER_AEC
     default n
     depends on USE_AUDIO_PROCESSOR
 
+config METALIO_TOUCH_UPGRADE_ON_BOOT
+    bool "Upgrade LT0470GF0430M FT6336U touch firmware to V03 on boot"
+    default n
+    help
+        Only for the LT0470GF0430M 684x1216 FT6336U panel. Runs before
+        touch/display tasks start, using the embedded supplier app image.
+        Checks chip and bootloader IDs, packet status, XOR and final version.
+        Skips V03 and newer versions. Keep power connected throughout the
+        update. Disable after a successful update; not for other touch panels.
+
 config USE_AUDIO_DEBUGGER
     bool "Audio debugger"
     default n

@@ -1275,6 +1275,8 @@ CONFIG_WAKE_WORD_DISABLED=y
 # default:
 # CONFIG_USE_AUDIO_PROCESSOR is not set
 # default:
+CONFIG_METALIO_TOUCH_UPGRADE_ON_BOOT=y
+# default:
 # CONFIG_USE_AUDIO_DEBUGGER is not set
 # end of Metalio E-Ink4-Plus
 

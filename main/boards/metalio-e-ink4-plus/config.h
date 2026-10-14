@@ -17,7 +17,7 @@
     (DISPLAY_HEIGHT - DISPLAY_CONTENT_TOP_INSET - DISPLAY_CONTENT_BOTTOM_INSET)
 /* 逻辑触点微调（inset 之后再加）；负 Y=上移。指腹触点常比目视中心偏下约一指节 */
 #define DISPLAY_TOUCH_OFFSET_X  0
-#define DISPLAY_TOUCH_OFFSET_Y  (-10)
+#define DISPLAY_TOUCH_OFFSET_Y  0
 #define EPD_VCOM_MV    1200
 
 /* 并行数据 / 控制（原理图 V1.2） */

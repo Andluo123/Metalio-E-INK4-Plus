@@ -204,6 +204,9 @@
     X(SETTINGS_TEST_CAMERA, "摄像头", "Camera")                                                                \
     X(SETTINGS_TEST_BACK, "返回", "Back")                                                                      \
     X(SETTINGS_TEST_TOUCH_START, "点击屏幕，开始测试", "Tap screen to start")                                  \
+    X(SETTINGS_TEST_TOUCH_SIZE, "请选择测试点大小", "Select test point size")                                 \
+    X(SETTINGS_TEST_TOUCH_SMALL, "小测试点", "Small test points")                                              \
+    X(SETTINGS_TEST_TOUCH_LARGE, "大测试点", "Large test points")                                              \
     X(SETTINGS_TEST_BATTERY_HINT, "SOC: 3.30~4.33V; ≥4.33需稳30s→100%",                                         \
       "SOC: 3.30~4.33V; ≥4.33 hold 30s→100%")                                                                   \
     X(SETTINGS_TEST_BATTERY_GAUGE, "电量计", "Fuel gauge")                                                     \

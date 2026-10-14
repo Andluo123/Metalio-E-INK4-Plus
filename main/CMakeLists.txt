@@ -168,6 +168,7 @@ idf_component_register(
         "boards/common/sensor/sc7a20h.cc"
         "boards/metalio-e-ink4-plus/periph/metalio_accel.cc"
     EMBED_FILES
+        "boards/metalio-e-ink4-plus/display/firmware/ft6336u_v03_app.bin"
         ${ASSISTANT_HINT_EN_A2I1}
     INCLUDE_DIRS
         "."

@@ -19,6 +19,7 @@
 #include "metalio_sd.h"
 #include "metalio_sys_mon.h"
 #include "metalio_touch.h"
+#include "metalio_touch_upgrade.h"
 #include "metalio_vibe.h"
 #include "power_policy.h"
 #include "settings.h"
@@ -55,6 +56,9 @@ public:
         if (!MetalioEpd_Init()) {
             ESP_LOGE(TAG, "epd init fail");
             return;
+        }
+        if (!MetalioTouch_UpgradeOnBoot()) {
+            ESP_LOGE(TAG, "touch upgrade failed; continuing with touch probe");
         }
         MetalioPower_Init();
         // 前光尽早：勿等 SD/音频；否则首帧已出仍一片暗
