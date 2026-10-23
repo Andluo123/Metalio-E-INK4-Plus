@@ -12,7 +12,9 @@
 #include "book_screen/book_vk.h"
 #include "book_screen/book_nav.h"
 #include "book_screen/reader/book_reader_overlay.h"
+#include "book_screen/reader/book_reader_body.h"
 #include "book_screen/settings/book_settings_sheet.h"
+#include "book_screen/settings/book_font_multi.h"
 
 #include <lvgl.h>
 #include <atomic>
@@ -22,6 +24,7 @@
 #include "SdCardManager.hpp"
 #include "reader/reader.h"
 #include "reader/book_library.h"
+#include "reader/book_home_snapshot.h"
 #include "screen_common.h"
 #include "vk_key_handler.h"
 
@@ -38,7 +41,8 @@ BookUiState& Book_State() {
     return s;
 }
 
-lv_obj_t* BookScreen::Create() {
+static lv_obj_t* CreateBookHome(bool continue_latest) {
+    CancelReadFontScan();
     auto& st = Book_State();
     const bool workers_busy = st.reader.opening.load() || st.reader.layout_busy.load() ||
                               st.reader.chapter_pages_busy.load() || st.reader.page_image_busy.load();
@@ -74,6 +78,8 @@ lv_obj_t* BookScreen::Create() {
     st.reader.status_overlay = nullptr;
     st.reader.status_h = 0;
     st.settings.settings_sheet = nullptr;
+    st.settings.reader_light_panel = nullptr;
+    st.settings.reader_light_page = false;
     ClearSettingsSheetWidgetRefs();
     StopTtfPollTimer();
     st.ttf.ttf_mode = BookUiState::TtfMode::kNone;
@@ -115,12 +121,24 @@ lv_obj_t* BookScreen::Create() {
 
     ScreenSetIsHome(false);
 
+    if (continue_latest && !workers_busy && SdCardManager::GetInstance().IsMounted()) {
+        const std::string latest = reader::book_home_snapshot::LoadLatestAbsPath();
+        if (!latest.empty()) {
+            reader::LoadBookLibrary(reader::kDefaultBooksDir, st.shelf.books);
+            for (size_t i = 0; i < st.shelf.books.size(); ++i) {
+                if (st.shelf.books[i].path == latest) {
+                    st.shelf.selected = static_cast<int>(i);
+                    return CreateReaderScreen(st.shelf.books[i]);
+                }
+            }
+        }
+    }
+
     lv_obj_t* scr = lv_obj_create(nullptr);
     lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, Book_ListFont(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    Book_DisableScroll(scr);
     st.shelf.list_scr = scr;
     lv_obj_add_event_cb(
         scr,
@@ -204,4 +222,12 @@ lv_obj_t* BookScreen::Create() {
     // factory=Create：进百问后返回阅读首页
     VkKey_AttachScreen(scr, kScreenLibrary, BookAiLongPressDesc(BookScreen::Create));
     return scr;
+}
+
+lv_obj_t* BookScreen::Create() {
+    return CreateBookHome(false);
+}
+
+lv_obj_t* BookScreen::CreateLatest() {
+    return CreateBookHome(true);
 }

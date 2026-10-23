@@ -5,6 +5,7 @@
 
 #include "../epdiy.h"
 #include "lut.h"
+#include "spatial_wipe.h"
 #include "render_method.h"
 
 /// For waveforms without timing and the I2S diving method,
@@ -83,10 +84,12 @@ void IRAM_ATTR prepare_context_for_next_frame(RenderContext_t* ctx) {
         = ctx->waveform->mode_data[ctx->waveform_index]->range_data[ctx->waveform_range];
 
     assert(ctx->lut_build_func != NULL);
-    ctx->lut_build_func(ctx->conversion_lut, phases, ctx->current_frame);
+    if(ctx->spatial_luts) epd_spatial_build(ctx->spatial_luts,phases,ctx->current_frame);
+    else ctx->lut_build_func(ctx->conversion_lut, phases, ctx->current_frame);
 
     ctx->lines_prepared = 0;
     ctx->lines_consumed = 0;
+    if (ctx->line_ready) memset(ctx->line_ready,0,ctx->lines_total);
     if (ctx->line_threads != NULL) {
         for (int i = 0; i < ctx->lines_total; i++) {
             ctx->line_threads[i] = (uint8_t)(i % NUM_RENDER_THREADS);
@@ -101,10 +104,18 @@ void epd_populate_line_mask(uint8_t* line_mask, const uint8_t* dirty_columns, in
         int pixels = mask_len * 4;
         for (int c = 0; c < pixels / 2; c += 2) {
             uint8_t mask = 0;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+            // Match the S31 LUT output: p0 is bits 7:6, p3 is bits 1:0.
+            mask |= (dirty_columns[c] & 0x0F) != 0 ? 0xC0 : 0x00;
+            mask |= (dirty_columns[c] & 0xF0) != 0 ? 0x30 : 0x00;
+            mask |= (dirty_columns[c + 1] & 0x0F) != 0 ? 0x0C : 0x00;
+            mask |= (dirty_columns[c + 1] & 0xF0) != 0 ? 0x03 : 0x00;
+#else
             mask |= (dirty_columns[c + 1] & 0xF0) != 0 ? 0xC0 : 0x00;
             mask |= (dirty_columns[c + 1] & 0x0F) != 0 ? 0x30 : 0x00;
             mask |= (dirty_columns[c] & 0xF0) != 0 ? 0x0C : 0x00;
             mask |= (dirty_columns[c] & 0x0F) != 0 ? 0x03 : 0x00;
+#endif
             line_mask[c / 2] = mask;
         }
     }

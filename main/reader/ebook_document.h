@@ -51,9 +51,10 @@ public:
     // 轻量读 Metadata.extra.book_id（Header + Meta，不读章节索引）；缺失/非 .ebook → false 且 out 空
     static bool PeekBookId(const char* path, std::string& out);
 
-    // 按章流式读块 → ContentBlock（图用 ebook:blk:<file_offset> 引用）。
-    // 空章返回 true 且 out 为空（不再填「本章无内容」占位）。
-    bool LoadChapterBlocks(int chapter_index, std::vector<ContentBlock>& out);
+    /** @brief 按块同步读取正文，消费后释放，不累计整章。 */
+    bool StreamChapterBlocks(int chapter_index, const ContentBlockSink& sink);
+    /** @brief 获取最近一次读取失败的原因。 */
+    BookReadError Error() const { return fp_ && std::ferror(fp_) ? BookReadError::kFileIo : error_; }
 
     // 轻量判断章是否有内容（读索引 flags/uncompressed_total，不解压块）。
     bool ChapterLikelyHasContent(int chapter_index) const;
@@ -88,9 +89,9 @@ private:
     bool InflateBlock(const uint8_t* comp, size_t comp_len, uint8_t* raw, size_t raw_len);
     bool ReadOneBlockAt(uint32_t offset, uint8_t& type, std::vector<uint8_t>& raw_out,
                         uint32_t* next_offset);
-    static void TextPayloadToBlocks(const uint8_t* data, size_t len, std::vector<ContentBlock>& out);
     static bool ImagePayloadToBytes(const uint8_t* raw, size_t raw_len, std::vector<uint8_t>& out);
 
+    BookReadError error_ = BookReadError::kInvalidData; // 最近一次读取失败原因
     FILE* fp_ = nullptr;
     std::string path_;
     std::string title_;

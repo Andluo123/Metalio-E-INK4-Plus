@@ -7,6 +7,12 @@ bool Bluetooth_parse_bt_device_line(const std::string& line, char* address, size
                                     size_t name_sz);
 /** @brief 下发模式切换 AT/命令 */
 void Bluetooth_send_mode_command(BtMode mode);
+/** @brief 阻塞下发模式指令，供复位后恢复使用；调用方持有命令忙标记 */
+void Bluetooth_apply_mode_commands(BtMode mode);
+/** @brief 更新模式的功放需求；模式3跨页面持有 */
+void Bluetooth_set_mode_audio_power(BtMode mode);
+/** @brief 离开页面仅释放非模式3的音频需求 */
+void Bluetooth_release_page_audio_power();
 /** @brief UART 收包回调 */
 void Bluetooth_on_uart_data(const std::vector<uint8_t>& data);
 /** @brief 复位蓝牙页 UI 状态 */

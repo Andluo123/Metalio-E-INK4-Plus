@@ -1,4 +1,9 @@
+#include "assets/lang_reader.h"
 #include "assets/lang_config.h"
+#include "assets/lang_pixel.h"
+#include "assets/lang_log.h"
+#include "assets/lang_haptic.h"
+#include "assets/lang_bluetooth.h"
 
 #include "settings.h"
 
@@ -13,6 +18,105 @@
 
 // X(name, zh, en)
 #define LANG_STRING_LIST(X)                                                                                    \
+    X(AUDIO_INIT_FAILED, "音频初始化失败", "Audio initialization failed") \
+    X(SETTINGS_TEST_CAMERA_DETECTED, "已检测到", "Detected") \
+    X(SETTINGS_TEST_CAMERA_NOT_DETECTED, "未检测到", "Not detected") \
+    X(SETTINGS_TEST_CAMERA_SHOT, "拍照", "Capture") \
+    X(SETTINGS_TEST_CAMERA_RESULT, "拍照结果", "Camera result") \
+    X(SETTINGS_TEST_CAPTURING, "拍照中…", "Capturing…") \
+    X(SETTINGS_TEST_DETECTING, "检测中…", "Detecting…") \
+    X(SETTINGS_TEST_TASK_CREATE_FAIL, "任务创建失败", "Task creation failed") \
+    X(SETTINGS_TEST_CELL_EXT, "4G·外置", "4G·External") \
+    X(SETTINGS_TEST_CELL_INT, "4G·内置", "4G·Internal") \
+    X(SETTINGS_TEST_SCANNING, "扫描中…", "Scanning…") \
+    X(SETTINGS_TEST_WIFI_CLOSE, "关闭", "Close") \
+    X(SETTINGS_TEST_WIFI_COUNT_FMT, "共 %d 个网络", "%d network(s)") \
+    X(SETTINGS_TEST_WIFI_FOUND_FMT, "发现 %d 个", "Found %d") \
+    X(SETTINGS_TEST_WIFI_NEARBY, "附近 WiFi", "Nearby Wi-Fi") \
+    X(SETTINGS_TEST_WIFI_NEXT, "下页", "Next") \
+    X(SETTINGS_TEST_WIFI_NONE, "未发现网络", "No networks") \
+    X(SETTINGS_TEST_WIFI_PREV, "上页", "Prev") \
+    X(SETTINGS_TEST_WIFI_RESCAN, "重扫", "Rescan") \
+    X(SETTINGS_TEST_WIFI_SCANNING, "正在扫描…", "Scanning…") \
+    X(SETTINGS_TEST_WIFI_SCAN_FAIL, "扫描失败", "Scan failed") \
+    X(REGISTERING_NETWORK, "等待网络...", "Waiting for network...") \
+    X(SETTINGS_NET_BOARD_NO_AP, "当前板型不支持配网模式", "This board has no Wi-Fi config mode") \
+    X(SETTINGS_NET_CFUN0, "正在关闭射频…\nAT+CFUN=0", "RF off…\nAT+CFUN=0") \
+    X(SETTINGS_NET_CFUN0_FAIL, "AT+CFUN=0 执行失败", "AT+CFUN=0 failed") \
+    X(SETTINGS_NET_CFUN1, "正在重新搜网…\nAT+CFUN=1", "Searching network…\nAT+CFUN=1") \
+    X(SETTINGS_NET_CURRENT_FMT, "当前：%s", "Current: %s") \
+    X(SETTINGS_NET_CUR_4G, "当前：4G 上网", "Current: Cellular") \
+    X(SETTINGS_NET_CUR_DASH, "当前：--", "Current: --") \
+    X(SETTINGS_NET_ECSIMCFG_FAIL, "AT+ECSIMCFG 执行失败", "AT+ECSIMCFG failed") \
+    X(SETTINGS_NET_MODE_4G, "4G 上网", "Cellular") \
+    X(SETTINGS_NET_MODE_TITLE, "上网方式", "Network mode") \
+    X(SETTINGS_NET_MODE_WIFI, "WiFi 上网", "Wi-Fi") \
+    X(SETTINGS_NET_NOT_4G, "当前不在 4G 模式，无法切换", "Not in 4G mode, cannot switch") \
+    X(SETTINGS_NET_NO_4G, "未检测到 4G 模块", "No 4G module") \
+    X(SETTINGS_NET_REBOOT_HINT, "切换后设备将自动重启", "Device reboots after switching") \
+    X(SETTINGS_NET_SIM_EXT, "外置卡", "External SIM") \
+    X(SETTINGS_NET_SIM_INT, "内置卡", "Internal SIM") \
+    X(SETTINGS_NET_SIM_TASK_FAIL, "无法启动 SIM 切换任务", "Cannot start SIM switch task") \
+    X(SETTINGS_NET_SIM_TITLE, "SIM 卡", "SIM") \
+    X(SETTINGS_NET_SWITCHED_FMT, "已切换到%s", "Switched to %s") \
+    X(SETTINGS_NET_SWITCH_4G, "正在切换到 4G…", "Switching to 4G…") \
+    X(SETTINGS_NET_SWITCH_SIM_CFUN0_FMT, "正在切换到%s…\nAT+CFUN=0", "Switching to %s…\nAT+CFUN=0") \
+    X(SETTINGS_NET_SWITCH_SIM_FMT, "正在切换到%s…\n%s", "Switching to %s…\n%s") \
+    X(SETTINGS_NET_SWITCH_WIFI, "正在切换到 WiFi…", "Switching to Wi-Fi…") \
+    X(SETTINGS_TEST_CELL_CANCELLED, "测试已取消", "Test cancelled") \
+    X(SETTINGS_TEST_CELL_CFUN0_FAIL, "CFUN=0失败", "CFUN=0 failed") \
+    X(SETTINGS_TEST_CELL_CFUN1_FAIL, "CFUN=1失败", "CFUN=1 failed") \
+    X(SETTINGS_TEST_CELL_LOSS_FMT, "丢包 %d/%d", "Loss %d/%d") \
+    X(SETTINGS_TEST_CELL_MODEM_NOT_READY, "模组未就绪", "Modem not ready") \
+    X(SETTINGS_TEST_CELL_MODEM_NO_RESP, "模组无响应", "Modem no response") \
+    X(SETTINGS_TEST_CELL_NEED_4G, "需切到4G模式", "Switch to 4G mode") \
+    X(SETTINGS_TEST_CELL_NO_RESOURCE, "资源不足", "Out of resources") \
+    X(SETTINGS_TEST_CELL_NO_SIM, "未检测到SIM卡", "No SIM detected") \
+    X(SETTINGS_TEST_CELL_PING_CMD_FAIL, "PING命令失败", "PING command failed") \
+    X(SETTINGS_TEST_CELL_PING_FAIL, "PING失败", "PING failed") \
+    X(SETTINGS_TEST_CELL_PING_OK, "PING成功", "PING OK") \
+    X(SETTINGS_TEST_CELL_PING_WAIT_TIMEOUT, "PING等待超时", "PING wait timeout") \
+    X(SETTINGS_TEST_CELL_REG_REJECT, "网络注册被拒绝", "Registration rejected") \
+    X(SETTINGS_TEST_CELL_SEARCH_TIMEOUT, "搜网超时", "Network search timeout") \
+    X(SETTINGS_TEST_CELL_SIM_SWITCH_FAIL, "切换SIM失败", "SIM switch failed") \
+    X(SETTINGS_TEST_CELL_SLOT_FAIL, "SIM槽位未生效", "SIM slot not applied") \
+    X(SETTINGS_TEST_CELL_TESTING, "测试中…", "Testing…") \
+    X(SETTINGS_TEST_CELL_TEST_FAIL, "测试失败", "Test failed") \
+    X(SETTINGS_TEST_CELL_WAIT_RESOURCE, "等待资源…", "Waiting for resources…") \
+    X(SETTINGS_TEST_SIGNAL_BOARD_UNSUP, "板型不支持", "Board unsupported") \
+    X(SETTINGS_TEST_SIGNAL_CELL_CSQ_FMT, "4G CSQ %2d", "4G CSQ %2d") \
+    X(SETTINGS_TEST_SIGNAL_CELL_CSQ_UNKNOWN, "4G CSQ 未知", "4G CSQ unknown") \
+    X(SETTINGS_TEST_SIGNAL_CELL_UNAVAIL, "4G 不可用", "4G unavailable") \
+    X(SETTINGS_TEST_SIGNAL_READING, "读取中…", "Reading…") \
+    X(SETTINGS_TEST_SIGNAL_TITLE, "网络信号", "Signal") \
+    X(SETTINGS_TEST_SIGNAL_WIFI_DISCONNECTED, "WiFi 未连接", "Wi-Fi disconnected") \
+    X(SETTINGS_TEST_SIGNAL_WIFI_READ_FAIL, "WiFi 读取失败", "Wi-Fi read failed") \
+    X(SETTINGS_TEST_SIGNAL_WIFI_RSSI_FMT, "WiFi %d dBm", "Wi-Fi %d dBm") \
+    X(SWITCH_TO_4G_NETWORK, "切换到 4G...", "Switching to 4G...") \
+    X(SWITCH_TO_WIFI_NETWORK, "切换到 Wi-Fi...", "Switching to Wi-Fi...") \
+    X(SETTINGS_TAB_LOG, "日志", "Logs") \
+    X(SETTINGS_LOG_TITLE, "设备日志", "Device logs") \
+    X(SETTINGS_LOG_ON, "开启", "On") \
+    X(SETTINGS_LOG_OFF, "关闭", "Off") \
+    X(SETTINGS_LOG_CURRENT_ON, "当前：开启", "Current: On") \
+    X(SETTINGS_LOG_CURRENT_OFF, "当前：关闭", "Current: Off") \
+    X(SETTINGS_LOG_HINT, "开启后将运行日志写入SD卡：metalio/e-ink/logs/metalio_logs.txt", "When on, runtime logs are saved to SD: metalio/e-ink/logs/metalio_logs.txt") \
+    X(SETTINGS_LOG_HINT_OFF, "关闭后停止采集；虚拟U盘启用期间暂停写盘", "Off stops capture. SD writing pauses while USB disk is enabled") \
+    X(SETTINGS_LOG_CLEAR, "清除日志", "Clear logs") \
+    X(SETTINGS_LOG_CLEARING, "正在清理…", "Clearing…") \
+    X(SETTINGS_LOG_CLEAR_OK, "日志已清除", "Logs cleared") \
+    X(SETTINGS_LOG_CLEAR_FAIL, "清理失败，请检查SD卡或稍后重试", "Clear failed. Check SD card or try again.") \
+    X(SETTINGS_LOG_UPLOAD, "上传日志", "Upload logs") \
+    X(SETTINGS_LOG_CONNECTING_NET, "正在连接网络", "Connecting to network") \
+    X(SETTINGS_LOG_UPLOAD_COUNT_FMT, "已完成 %u，待上传 %u", "Completed %u, remaining %u") \
+    X(SETTINGS_LOG_UPLOADING, "正在上传日志", "Uploading logs") \
+    X(SETTINGS_LOG_UPLOAD_OK, "日志上传成功", "Logs uploaded") \
+    X(SETTINGS_LOG_UPLOAD_FAIL, "日志上传失败，请重试", "Upload failed. Please retry") \
+    X(SETTINGS_LOG_UPLOAD_NO_FILE, "没有可上传的日志", "No logs to upload") \
+    X(SETTINGS_LOG_CANCELLING, "正在取消，请稍候", "Cancelling, please wait") \
+    X(SETTINGS_LOG_PREPARING, "正在准备日志", "Preparing logs") \
+    X(SETTINGS_LOG_SD_UNAVAILABLE, "SD卡不可用，请关闭虚拟U盘后重试", "SD unavailable. Disable USB disk and retry") \
+    X(SETTINGS_LOG_NO_MEMORY, "内存不足，请稍后重试", "Not enough memory. Please retry later") \
     X(HOME_APP_TASK, "每日清单", "Tasks")                                                                      \
     X(HOME_APP_ASSISTANT, "百问AI", "Ask AI")                                                                  \
     X(HOME_APP_BOOK, "阅读", "Books")                                                                          \
@@ -38,7 +142,21 @@
     X(SETTINGS_TAB_LANGUAGE, "语言", "Language")                                                               \
     X(SETTINGS_TAB_HAPTIC, "震动", "Haptic")                                                                   \
     X(SETTINGS_TAB_POWER, "功耗", "Power")                                                                     \
-    X(SETTINGS_TAB_FRONTLIGHT, "前光", "Light")                                                                \
+    X(SETTINGS_SCREEN_BLACK_DEPTH_TITLE, "黑色深度", "Black depth") \
+    X(SETTINGS_SCREEN_BLACK_DEPTH_DEFAULT, "默认", "Default") \
+    X(SETTINGS_SCREEN_BLACK_DEPTH_MEDIUM, "中", "Medium") \
+    X(SETTINGS_SCREEN_BLACK_DEPTH_STRONG, "强", "Strong") \
+    X(SETTINGS_SCREEN_BLACK_DEPTH_HINT, "提高黑色深度可能影响屏幕寿命，并造成累积发黄，建议优先使用默认档。", "Increasing black depth may affect display lifespan and cause cumulative yellowing. Default is recommended.") \
+    X(SETTINGS_SCREEN_REFRESH_TITLE, "刷新模式", "Refresh mode") \
+    X(SETTINGS_SCREEN_REFRESH_CLEAR, "清晰", "Clear") \
+    X(SETTINGS_SCREEN_REFRESH_CLEAR_HINT, "细节更清晰，残影更少。", "Sharper detail, less ghosting.") \
+    X(SETTINGS_SCREEN_REFRESH_BALANCED_HINT, "兼顾画质与速度，可能加重残影。", "Balanced quality and speed; may increase ghosting.") \
+    X(SETTINGS_SCREEN_REFRESH_BALANCED, "均衡", "Balanced") \
+    X(SETTINGS_SCREEN_REFRESH_FAST, "快速", "Fast") \
+    X(SETTINGS_SCREEN_REFRESH_EXTREME, "极速", "Ultra fast") \
+    X(SETTINGS_SCREEN_REFRESH_EXTREME_HINT, "翻页最快，可能加重残影。", "Fastest page turns; may increase ghosting.") \
+    X(SETTINGS_SCREEN_REFRESH_FAST_HINT, "保留灰阶，响应更快；可能加重残影。", "Faster response with grayscale retained; may increase ghosting.") \
+    X(SETTINGS_TAB_FRONTLIGHT, "屏幕", "Screen")                                                                \
     X(SETTINGS_TAB_CONVERSATION, "对话", "Talk")                                                               \
     X(SETTINGS_TAB_STORAGE, "存储", "Storage")                                                                 \
     X(SETTINGS_TAB_BLUETOOTH, "蓝牙", "Bluetooth")                                                             \
@@ -46,6 +164,13 @@
     X(SETTINGS_TAB_ABOUT, "关于", "About")                                                                     \
     X(SETTINGS_THEME_TITLE, "首页主题", "Home theme")                                                          \
     X(SETTINGS_THEME_HINT, "返回首页后立即生效", "Applies when you return home")                               \
+    X(SETTINGS_THEME_PIXEL, "像素视界", "Pixel Vision") \
+    X(SETTINGS_THEME_CURRENT_PIXEL, "当前：像素视界", "Current: Pixel Vision") \
+    X(HOME_PIXEL_TODAY, "今日事项", "Today") \
+    X(HOME_PIXEL_PENDING, "未完成", "Pending") \
+    X(HOME_PIXEL_DAY_NOTE, "诸事皆宜", "A good day") \
+    X(HOME_PIXEL_READ, "阅读", "Read") \
+    X(HOME_PIXEL_NOTES, "便签", "Notes") \
     X(SETTINGS_THEME_WHITE, "白底", "White")                                                                   \
     X(SETTINGS_THEME_GRAY, "网点灰底", "Dotted gray")                                                          \
     X(SETTINGS_THEME_BORDER, "黑色描边", "Black border")                                                       \
@@ -66,6 +191,13 @@
     X(SETTINGS_HAPTIC_OFF, "关闭", "Off")                                                                      \
     X(SETTINGS_HAPTIC_CURRENT_ON, "当前：开启", "Current: On")                                                 \
     X(SETTINGS_HAPTIC_CURRENT_OFF, "当前：关闭", "Current: Off")                                               \
+    X(SETTINGS_HAPTIC_INTENSITY_TITLE, "震动强度", "Haptic strength") \
+    X(SETTINGS_HAPTIC_WEAK, "弱", "Weak") \
+    X(SETTINGS_HAPTIC_MEDIUM, "中", "Medium") \
+    X(SETTINGS_HAPTIC_STRONG, "强", "Strong") \
+    X(SETTINGS_HAPTIC_CURRENT_WEAK, "当前：弱", "Current: Weak") \
+    X(SETTINGS_HAPTIC_CURRENT_MEDIUM, "当前：中", "Current: Medium") \
+    X(SETTINGS_HAPTIC_CURRENT_STRONG, "当前：强", "Current: Strong") \
     X(SETTINGS_POWER_3_MIN, "3 分", "3 min")                                                                   \
     X(SETTINGS_POWER_10_MIN, "10 分", "10 min")                                                                \
     X(SETTINGS_POWER_30_MIN, "30 分", "30 min")                                                                \
@@ -106,18 +238,17 @@
     X(SETTINGS_STORAGE_MISSING, "内存卡：未检测到", "SD: not detected")                                          \
     X(SETTINGS_STORAGE_CAP_DASH, "容量：—", "Capacity: —")                                                       \
     X(SETTINGS_STORAGE_CAP_EXPORT, "容量：导出中，停用后可查看", "Capacity: exporting; disable to view")         \
-    X(SETTINGS_STORAGE_CAP_FMT, "剩余 %s / 总容量 %s", "%s free / %s total")                                     \
+    X(SETTINGS_STORAGE_CAP_FMT, "容量：%.1fGB/%.1fGB", "Capacity: %.1fGB/%.1fGB")                                 \
     X(SETTINGS_STORAGE_CAP_FAIL, "容量：读取失败", "Capacity: read failed")                                      \
     X(SETTINGS_STORAGE_USB_OFF, "停用模拟 U 盘", "Disable USB disk")                                             \
     X(SETTINGS_STORAGE_USB_ON, "启用模拟 U 盘", "Enable USB disk")                                               \
     X(SETTINGS_STORAGE_USB_DISABLED, "当前固件未启用模拟 U 盘", "USB disk not enabled in this firmware")         \
-    X(SETTINGS_STORAGE_USB_HINT_IDLE, "启用后电脑可将本机识别为 U 盘", "When enabled, PC sees this device as a USB disk") \
+    X(SETTINGS_STORAGE_USB_HINT_IDLE, "启用后电脑可以将本机识别为U盘", "After enabling, a PC can see this device as a USB drive") \
     X(SETTINGS_STORAGE_USB_HINT_SWITCHING, "正在切换，请稍候…", "Switching, please wait…")                       \
     X(SETTINGS_STORAGE_USB_HINT_ENABLING, "正在启用模拟 U 盘…", "Enabling USB disk…")                            \
     X(SETTINGS_STORAGE_USB_HINT_DISABLING, "正在停用模拟 U 盘…", "Disabling USB disk…")                          \
-    X(SETTINGS_STORAGE_USB_HINT_HOST, "已启用，请在电脑访问；停用前请先弹出", "Enabled — access from PC; eject before disable") \
+    X(SETTINGS_STORAGE_USB_HINT_HOST, "已启用，请在电脑访问，\n停用前请先弹出", "Enabled, open it on the PC\nEject before turning it off") \
     X(SETTINGS_STORAGE_USB_HINT_LOCAL, "已启用，主机未占用；点停用恢复 USB 调试", "Enabled — host idle; disable to restore USB debug") \
-    X(SETTINGS_STORAGE_USB_HINT_DISABLED, "启用后占用 USB；停用后恢复 USB 调试口", "Uses USB when on; disable restores debug port") \
     X(SETTINGS_STORAGE_USB_HINT_ENABLE_FAIL, "启用失败，请检查 USB 线并重试", "Enable failed — check USB cable and retry") \
     X(SETTINGS_STORAGE_USB_HINT_DISABLE_FAIL, "停用失败，请先在电脑上弹出 U 盘", "Disable failed — eject the disk on PC first") \
     X(SETTINGS_STORAGE_USB_HINT_NO_SD, "未检测到内存卡", "No SD card detected")                                  \
@@ -153,8 +284,10 @@
     X(BT_UART_NOT_INIT, "UART 未初始化", "UART not initialized")                                               \
     X(BT_SWITCH_CALL, "切换通话模式...", "Switching to call mode...")                                          \
     X(BT_SWITCH_MUSIC, "切换音乐模式...", "Switching to music mode...")                                        \
-    X(BT_PWR_RESET_UNSUP, "当前硬件不支持蓝牙电源复位", "BT power reset not supported")                          \
     X(BT_PWR_RESET_OK, "蓝牙电源已复位", "BT power reset")                                                      \
+    X(BT_PWR_RESETTING, "正在复位，请稍候...", "Resetting, please wait...")                                     \
+    X(BT_PWR_RESET_RECONNECT, "已复位，正在重新连接...", "Reset complete, reconnecting...")                    \
+    X(BT_PWR_RESET_FAILED, "复位失败，请重试", "Reset failed, please retry")                                   \
     X(BT_NEED_MODE2, "请先切换到模式2", "Switch to mode 2 first")                                               \
     X(BT_SCAN_START, "开始扫描...", "Starting scan...")                                                        \
     X(BT_NEED_CONNECT, "请先连接蓝牙设备", "Connect a Bluetooth device first")                                  \
@@ -175,8 +308,10 @@
     X(SETTINGS_ABOUT_CHIP, "芯片型号", "Chip")                                                                 \
     X(SETTINGS_ABOUT_CORES, "CPU 核心", "CPU cores")                                                           \
     X(SETTINGS_ABOUT_CORES_FMT, "%u 核", "%u cores")                                                           \
-    X(SETTINGS_ABOUT_FW, "固件版本", "Firmware")                                                               \
-    X(SETTINGS_ABOUT_FW_VER_FMT, "固件版本:%s", "Firmware:%s")                                                 \
+    X(OTA_CHECK_FAILED, "检测失败，请检查网络后重试", "Check failed. Check network and retry.") \
+    X(OTA_ALREADY_LATEST, "当前已是最新版本", "Firmware is up to date") \
+    X(SETTINGS_ABOUT_FW, "点击检测更新", "Check for updates")                                                               \
+    X(SETTINGS_ABOUT_FW_VER_FMT, "固件版本 %s", "Firmware %s")                                                 \
     X(SETTINGS_ABOUT_BUILD, "编译时间", "Build time")                                                          \
     X(SETTINGS_ABOUT_MAC, "MAC 地址", "MAC")                                                                   \
     X(SETTINGS_ABOUT_FLASH, "Flash 容量", "Flash")                                                             \
@@ -332,7 +467,7 @@
     X(TASK_TAB_DONE, "已完成", "Done")                                                                         \
     X(TASK_TAB_TODO, "待办", "Todo")                                                                           \
     X(TASK_TITLE_DONE, "已完成", "Done")                                                                       \
-    X(TASK_TITLE_TODO, "日程待办", "Schedule")                                                                 \
+    X(TASK_TITLE_TODO, "待办事项", "Schedule")                                                                 \
     X(CONNECT_TO, "连接 ", "Connect ")                                                                         \
     X(CONNECTED_TO, "已连接 ", "Connected ")                                                                   \
     X(SETTINGS_NET_WIFI_CFG_TITLE, "WiFi 网络", "Wi-Fi network")                                               \
@@ -439,10 +574,13 @@
     X(BOOK_NO_SD, "未检测到 SD 卡\n请插入后重试", "No SD card\nInsert and retry") \
     X(BOOK_NO_SD_SHORT, "未检测到 SD 卡", "No SD card") \
     X(BOOK_OPEN_FAILED, "打开失败", "Open failed") \
-    X(BOOK_OPEN_FAILED_CHAPTER, "打开失败\n章节过大或内存不足", "Open failed\nChapter too large or out of memory") \
-    X(BOOK_OPEN_FAILED_EPUB, "打开失败\n请检查 EPUB 完整性", "Open failed\nCheck EPUB integrity") \
+    X(BOOK_OPEN_FAILED_IO, "打开失败\n文件不存在或 SD 读取失败", "Open failed\nFile missing or SD read failed") \
+    X(BOOK_OPEN_FAILED_DATA, "打开失败\n书籍损坏或正文格式无效", "Open failed\nDamaged book or invalid content") \
+    X(BOOK_OPEN_FAILED_MEMORY, "打开失败\n可用内存不足", "Open failed\nNot enough memory") \
+    X(BOOK_OPEN_FAILED_CACHE, "打开失败\nSD 缓存创建或读写失败，请检查空间", "Open failed\nCannot create or access SD cache") \
+    X(BOOK_OPEN_FAILED_UNSUPPORTED, "打开失败\n不支持的格式或超出安全边界", "Open failed\nUnsupported format or safety limit") \
+    X(BOOK_OPEN_CANCELLED, "已取消打开", "Opening cancelled") \
     X(BOOK_OPEN_FAILED_TASK, "打开失败\n无法启动解析任务", "Open failed\nCannot start parse task") \
-    X(BOOK_OPEN_FAILED_TXT, "打开失败\nTXT 过大或内存不足", "Open failed\nTXT too large or out of memory") \
     X(BOOK_OPENING, "正在打开", "Opening") \
     X(BOOK_ORIENT, "屏幕方向", "Orientation") \
     X(BOOK_ORIENT_LAND_LEFT, "左横", "Left") \
@@ -477,6 +615,7 @@
     X(BOOK_TAP_ZONES_RESET, "恢复默认", "Reset") \
     X(BOOK_TAP_ZONES_TITLE, "触摸分区", "Tap zones") \
     X(BOOK_TOC, "目录", "Contents") \
+    X(BOOK_TOC_BUILDING, "目录识别中…", "Finding contents...") \
     X(BOOK_TOC_EMPTY, "暂无目录", "No contents") \
     X(BOOK_TOC_PAGE_FMT, "目录 %d/%d", "Contents %d/%d") \
     X(BOOK_TODAY_DURATION, "今日时长", "Today") \
@@ -524,15 +663,17 @@
     X(CLOUD_PREVIEW_FAIL, "无法预览", "Cannot preview") \
     X(CLOUD_PREVIEW_START_FAIL, "预览启动失败", "Failed to start preview") \
     X(CLOUD_PREVIEW_URL_LONG, "预览地址过长", "Preview URL too long") \
-    X(CLOUD_PUSH_BOOK, "书籍推送", "Book push") \
-    X(CLOUD_PUSH_FONT, "字体推送", "Font push") \
-    X(CLOUD_PUSH_WALLPAPER, "壁纸推送", "Walls push") \
     X(CLOUD_READ_TIMEOUT, "读取超时或中断", "Read timeout or interrupted") \
     X(CLOUD_REFRESH, "刷新", "Refresh") \
     X(CLOUD_REFRESHED, "已刷新", "Refreshed") \
     X(CLOUD_REFRESHING, "刷新中…", "Refreshing…") \
     X(CLOUD_REQUEST_FAIL, "请求失败", "Request failed") \
     X(CLOUD_SAVE, "保存", "Save") \
+    X(CLOUD_FILE_EXISTS, "此位置已有同名文件", "A file with this name already exists") \
+    X(CLOUD_CONFLICT_FMT, "此位置已有同名文件\n%s\n请选择保存方式", "File already exists\n%s\nChoose how to save") \
+    X(CLOUD_KEEP_BOTH, "保留两份", "Keep both") \
+    X(CLOUD_SKIP_FILE, "跳过此文件", "Skip file") \
+    X(CLOUD_REPLACE_FILE, "覆盖原文件", "Replace file") \
     X(CLOUD_SAVE_FAIL, "保存失败", "Save failed") \
     X(CLOUD_SAVE_LOCAL, "保存到本地", "Save to device") \
     X(CLOUD_SAVED_0_1, "已保存 0 / 共 1", "Saved 0 / 1") \
@@ -545,6 +686,23 @@
     X(CLOUD_STORAGE_UNAVAIL, "存储目录不可用", "Storage unavailable") \
     X(CLOUD_SYNC_FAIL, "同步失败", "Sync failed") \
     X(CLOUD_TAB_ALL, "全部", "All") \
+    X(CLOUD_TAB_APP, "APP推送", "APP Push") \
+    X(CLOUD_TAB_AP, "AP传输", "Hotspot") \
+    X(CLOUD_TAB_USB, "USB传输", "USB") \
+    X(CLOUD_AP_STEP1, "第一步", "Step 1") \
+    X(CLOUD_AP_JOIN, "用手机或电脑连接到热点或扫码连接", "Join the hotspot, or scan the code") \
+    X(CLOUD_AP_SSID_FMT, "WiFi名称：%s", "Wi-Fi: %s") \
+    X(CLOUD_AP_STEP2, "第二步", "Step 2") \
+    X(CLOUD_AP_OPEN, "用手机或电脑浏览器访问这个地址：", "Open this address in a browser:") \
+    X(CLOUD_AP_HINT, "也可以扫描下方二维码打开地址", "Or scan the code below") \
+    X(CLOUD_AP_OPENING, "AP打开中...", "Starting hotspot...") \
+    X(CLOUD_WIFI_CONNECTING, "WiFi连接中...", "Connecting Wi-Fi...") \
+    X(CLOUD_AP_FAIL, "热点启动失败", "Hotspot failed to start") \
+    X(CLOUD_AP_FAIL_INIT, "WiFi初始化失败", "Wi-Fi init failed") \
+    X(CLOUD_AP_FAIL_START, "热点打开失败", "Hotspot failed to start") \
+    X(CLOUD_AP_FAIL_HTTP, "网页服务启动失败", "Web page failed to start") \
+    X(CLOUD_WIFI_FAIL, "WiFi连接失败", "Wi-Fi connection failed") \
+    X(CLOUD_USB_WAY, "方式一", "Method") \
     X(CLOUD_TAB_BOOK, "书籍", "Books") \
     X(CLOUD_TAB_FONT, "字体", "Fonts") \
     X(CLOUD_TAB_WALLPAPER, "壁纸", "Walls") \

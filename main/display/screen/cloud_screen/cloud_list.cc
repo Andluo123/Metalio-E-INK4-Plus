@@ -1,3 +1,4 @@
+#include "epd_content_policy.h"
 #include "cloud_screen/cloud_list.h"
 #include "cloud_screen/cloud_screen_priv.h"
 #include "cloud_screen/cloud_dialogs.h"
@@ -222,6 +223,8 @@ void PatchRowThumb(int index) {
     auto& img = *st.data.thumbs[static_cast<size_t>(index)];
     lv_obj_t* thumb = lv_image_create(thumb_box);
     lv_image_set_src(thumb, &img.dsc);
+    // 列表封面使用黑白模式，灰阶仅用于详情图，避免影响整页对比度。
+    EpdSetContentRole(thumb, EpdContentRole::Monochrome);
     lv_obj_set_size(thumb, img.width, img.height);
     lv_obj_center(thumb);
     lv_obj_clear_flag(thumb, LV_OBJ_FLAG_CLICKABLE);
@@ -275,6 +278,8 @@ lv_obj_t* CreateResourceRow(lv_obj_t* parent, const reader::CloudPushResource& i
             !st.data.thumbs[static_cast<size_t>(index)]->empty()) {
             lv_obj_t* thumb = lv_image_create(thumb_box);
             lv_image_set_src(thumb, &st.data.thumbs[static_cast<size_t>(index)]->dsc);
+            // 列表封面使用黑白模式，灰阶仅用于详情图，避免影响整页对比度。
+            EpdSetContentRole(thumb, EpdContentRole::Monochrome);
             lv_obj_set_size(thumb, st.data.thumbs[static_cast<size_t>(index)]->width,
                             st.data.thumbs[static_cast<size_t>(index)]->height);
             lv_obj_center(thumb);
@@ -348,7 +353,7 @@ void RenderListPageInternal(bool schedule_thumbs) {
     lv_obj_set_flex_flow(st.chrome.list_body, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(st.chrome.list_body, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_row(st.chrome.list_body, kRowGap, 0);
+    lv_obj_set_style_pad_row(st.chrome.list_body, UiSy(4), 0);
     lv_obj_clean(st.chrome.list_body);
     Cloud_DisableScroll(st.chrome.list_body);
 

@@ -2,6 +2,7 @@
 #include "assistant_screen_priv.h"
 
 #include "assistant_flow.h"
+#include "assistant_paginate.h"
 #include "a2ui.h"
 #include "a2ui_image.h"
 #include "application.h"
@@ -57,12 +58,17 @@ bool Assistant_TrimFlowToMaxPages() {
 }
 
 void Assistant_ClearSession() {
+    Assistant_ResetYunxinPagination();
     if (Assistant_State().stream.coalesce_timer != nullptr) {
         esp_timer_stop(Assistant_State().stream.coalesce_timer);
     }
     Assistant_State().stream.coalesce_buf.clear();
-    Assistant_State().stream.coalesce_jump = false;
     Assistant_State().stream.coalesce_pending = false;
+    ChatString{}.swap(Assistant_State().stream.yunxin_text);
+    Assistant_State().stream.yunxin_formatter = YunxinTextFormatter{};
+    Assistant_State().stream.yunxin_dirty = false;
+    Assistant_State().stream.yunxin_rendered = false;
+    ChatString{}.swap(Assistant_State().stream.rendered_page_json);
     {
         std::lock_guard<std::mutex> g(Assistant_State().stream.session_mu);
         Assistant_State().layout.flow.clear();
@@ -181,24 +187,52 @@ void Assistant_AppendFlowAndShow(FlowList&& chunk, bool jump_to_new) {
     PresentAppendUi(jump_to_new, reflow_from_page, true);
 }
 
+bool Assistant_ReplaceYunxinSpeech(FlowList&& chunk) {
+    auto& st = Assistant_State();
+    if (chunk.size() != 1 || chunk.front().kind != FlowKind::RichText) { return false; }
+    if (st.stream.coalesce_pending && !st.stream.coalesce_buf.empty()) {
+        if (st.stream.coalesce_buf.back().kind != FlowKind::RichText) { return false; }
+        st.stream.coalesce_buf.back() = std::move(chunk.front());
+        return true;
+    }
+    bool repaint = false;
+    {
+        std::lock_guard<std::mutex> g(st.stream.session_mu);
+        if (st.layout.flow.empty() || st.layout.flow.back().kind != FlowKind::RichText) {
+            return false;
+        }
+        st.layout.flow.back() = std::move(chunk.front());
+        int reflow_from_page = Assistant_RebuildYunxinTextTail();
+        if (Assistant_TrimFlowToMaxPages()) { reflow_from_page = 0; }
+        Assistant_ClampPageIndex();
+        repaint = st.layout.page_index >= reflow_from_page;
+    }
+    auto* display = Board::GetInstance().GetDisplay();
+    if (display != nullptr) {
+        DisplayLockGuard lock(display);
+        if (AssistantScreen::IsActive()) {
+            if (repaint) { Assistant_RequestRenderCurrentPage(); }
+            else { Assistant_UpdatePageIndicator(); }
+        }
+    }
+    return true;
+}
+
 void CoalesceTimerCb(void* /*arg*/) {
     Application::GetInstance().Schedule([]() {
         FlowList chunk;
-        bool jump = false;
         {
             if (!Assistant_State().stream.coalesce_pending) {
                 return;
             }
             chunk = std::move(Assistant_State().stream.coalesce_buf);
-            jump = Assistant_State().stream.coalesce_jump;
-            Assistant_State().stream.coalesce_jump = false;
             Assistant_State().stream.coalesce_pending = false;
             Assistant_State().stream.coalesce_buf.clear();
         }
         if (chunk.empty() || !AssistantScreen::IsActive()) {
             return;
         }
-        Assistant_AppendFlowAndShow(std::move(chunk), jump);
+        Assistant_AppendFlowAndShow(std::move(chunk), false);
     });
 }
 
@@ -228,15 +262,13 @@ void Assistant_QueueOrShowChunk(FlowList&& chunk, bool jump_to_new) {
     if (jump_to_new || Assistant_State().layout.replaying_history) {
         if (Assistant_State().stream.coalesce_pending) {
             FlowList merged = std::move(Assistant_State().stream.coalesce_buf);
-            const bool pending_jump = Assistant_State().stream.coalesce_jump;
             Assistant_State().stream.coalesce_buf.clear();
-            Assistant_State().stream.coalesce_jump = false;
             Assistant_State().stream.coalesce_pending = false;
             if (Assistant_State().stream.coalesce_timer != nullptr) {
                 esp_timer_stop(Assistant_State().stream.coalesce_timer);
             }
             if (!merged.empty()) {
-                Assistant_AppendFlowAndShow(std::move(merged), pending_jump);
+                Assistant_AppendFlowAndShow(std::move(merged), false);
             }
         }
         Assistant_AppendFlowAndShow(std::move(chunk), jump_to_new);
@@ -266,7 +298,7 @@ void Assistant_QueueOrShowChunk(FlowList&& chunk, bool jump_to_new) {
 void Assistant_ReplayHistoryFromStore()
 {
     if (!assistant_chat_store_is_ready()) {
-        ESP_LOGI(TAG, "history: no store (no SD or init skipped)");
+        ESP_LOGD(TAG, "history: no store (no SD or init skipped)");
         return;
     }
 
@@ -314,12 +346,12 @@ void Assistant_ReplayHistoryFromStore()
         return;
     }
     if (acc.ok == 0) {
-        ESP_LOGI(TAG, "history: empty (skip=%u)", acc.skip);
+        ESP_LOGD(TAG, "history: empty (skip=%u)", acc.skip);
         Assistant_State().layout.replaying_history = false;
         return;
     }
 
-    ESP_LOGI(TAG, "history replay %u record(s) skip=%u", acc.ok, acc.skip);
+    ESP_LOGD(TAG, "history replay %u record(s) skip=%u", acc.ok, acc.skip);
     if (!acc.chunk.empty()) {
         // 进页回放落在末条所在页（最近一轮）
         Assistant_AppendFlowAndShow(std::move(acc.chunk), true);

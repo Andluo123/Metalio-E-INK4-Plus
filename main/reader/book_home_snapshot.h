@@ -22,6 +22,19 @@ constexpr size_t kRecentDisplayMax = 2;
  * 必须先由 DRAM 栈任务 HydrateFromNvs()；UI 只碰内存；落盘走异步 DRAM 任务。
  */
 
+struct WeekStats {
+    bool valid = false; // local date trusted and NVS hydrated
+    uint32_t dates[7] = {}; // Monday through Sunday
+    uint32_t seconds[7] = {};
+    uint64_t total_seconds = 0;
+    uint32_t undated_seconds = 0; // retained until a trusted calendar date becomes available
+};
+
+/** Add only the newly folded seconds; shares the existing NVS worker. */
+void AddDailyReadingSeconds(uint32_t date, uint32_t seconds);
+/** Memory-only current calendar week; no UI-side NVS access. */
+WeekStats LoadWeekStats();
+
 struct AggregateStats {
     bool valid = false;
     uint32_t total_seconds = 0;
@@ -51,6 +64,9 @@ void SubtractAggregateContribution(uint32_t reading_seconds, bool finished);
  * 过滤已删文件；若有剔除则异步写回 NVS。
  */
 size_t LoadRecentAbsPaths(std::vector<std::string>& out);
+
+/** @brief 仅读取内存中的最近阅读路径，不检查磁盘；无内存记录时返回空串 */
+std::string LoadLatestAbsPath();
 
 /** 仅读内存；未 Hydrate 则 valid=false。 */
 AggregateStats LoadAggregateStats();

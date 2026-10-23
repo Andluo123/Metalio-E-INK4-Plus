@@ -2,7 +2,7 @@
 
 /**
  * @file a2ui_img_cache.h
- * @brief Session-scoped A2I1 blob cache on SD card (optional).
+ * @brief Session-scoped A2I1/A2L8 blob cache on SD card (optional).
  *
  * Architecture
  * ------------
@@ -48,7 +48,7 @@ bool a2ui_img_cache_is_ready(void);
 esp_err_t a2ui_img_cache_load(const char *url, uint8_t **out_buf, size_t *out_len);
 
 /**
- * Store a validated A2I1 payload for url. Best-effort.
+ * Store a validated A2I1/A2L8 payload for url. Best-effort.
  * If soft budget cannot hold this blob, wipe cache dir then write.
  */
 esp_err_t a2ui_img_cache_store(const char *url, const uint8_t *data, size_t len);

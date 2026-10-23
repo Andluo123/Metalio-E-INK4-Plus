@@ -14,6 +14,13 @@ typedef struct {
     int raw_y; // 芯片原始 Y
 } metalio_touch_point_t;
 
+typedef struct {
+    bool ok;
+    uint32_t samples, read_errors, irqs;
+    int last_error, raw_x, raw_y, irq_level, pause_depth;
+} metalio_touch_stats_t;
+metalio_touch_stats_t metalio_touch_stats(void);
+
 /**
  * @brief 采样回调：count=0 抬起；>0 按下（raw/logical 有效）
  * @note 在 touch_feed 任务调用，可做盖板键；勿长时间占 I2C/LVGL
@@ -50,7 +57,7 @@ void metalio_touch_set_ui_suppress(bool suppress);
 
 /**
  * @brief 暂停/恢复 touch_feed（待机 Park/GC16 与浅睡前；对齐 397 PauseStandbyBackgroundWork）
- * @note 暂停时清空 pending 边沿，忽略 INT，避免落墨期间误报 down/up
+ * @note 保留已采样的 press/release；恢复后继续交付，避免刷屏吞掉点击
  */
 void metalio_touch_set_feed_paused(bool paused);
 

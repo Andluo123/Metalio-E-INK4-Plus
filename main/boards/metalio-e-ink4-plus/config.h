@@ -6,11 +6,12 @@
 /* ED047TC2_1216：原生 1216x684；逻辑竖屏 684x1216 */
 #define DISPLAY_WIDTH  684
 #define DISPLAY_HEIGHT 1216
-/* UI 可绘区相对逻辑全屏内缩（基础规范：LVGL/触摸/布局一律遵守，勿按面板全尺寸排版） */
-#define DISPLAY_CONTENT_LEFT_INSET   8
-#define DISPLAY_CONTENT_RIGHT_INSET  8
-#define DISPLAY_CONTENT_TOP_INSET    6
-#define DISPLAY_CONTENT_BOTTOM_INSET 10
+/* 普通 UI 内缩；壁纸、待机与关机画面使用完整面板区域。 */
+#define DISPLAY_CONTENT_LEFT_INSET  2
+#define DISPLAY_CONTENT_RIGHT_INSET  2
+#define DISPLAY_CONTENT_TOP_INSET    2
+#define DISPLAY_CONTENT_BOTTOM_INSET 2
+#define DISPLAY_WHITE_BORDER_PIXELS  0
 #define DISPLAY_CONTENT_W \
     (DISPLAY_WIDTH - DISPLAY_CONTENT_LEFT_INSET - DISPLAY_CONTENT_RIGHT_INSET)
 #define DISPLAY_CONTENT_H \
@@ -69,6 +70,13 @@
 #define EPD_IO_MOTOR         3  // P03 震动马达，高有效
 #define EPD_IO_PA_EN         4  // P04 功放使能（NS4150 CTRL），高有效
 #define EPD_IO_CAM_SCR_EN    5  // P05 摄像头/屏幕电源，高有效
+#define CAM_SCCB_ADDR       0x3C
+#define CAM_PIN_D0          GPIO_NUM_46
+#define CAM_PIN_PCLK        GPIO_NUM_54
+#define CAM_PIN_MCLK        GPIO_NUM_55
+#define CAM_PIN_VSYNC       GPIO_NUM_56
+#define CAM_PIN_HREF        GPIO_NUM_57
+#define CAM_MCLK_HZ         20000000
 #define VIBRATION_MOTOR_PULSE_MS 50 // 短震脉宽 ms
 
 #define I2C_SDA_PIN          GPIO_NUM_0
@@ -86,8 +94,10 @@
 /* FT6336U：I2C 与 TPS/TCA 同总线；INT=GPIO5；RST=IO_P12=P12（勿用 ESP GPIO12=EPD D4） */
 #define TOUCH_I2C_ADDR 0x38
 #define TOUCH_INT_PIN  GPIO_NUM_5
-#define EPD_IO_TP_RST  10 // P12 触摸等电源/RST，高有效（低=断电）
-#define EPD_IO_BT_PA_PWR 12 // P14 蓝牙+功放电源，高有效
+#define EPD_IO_TP_RST  10 // P12 触摸/4G 共享 RST（4G 正常工作须为高），高有效（低=断电）
+// GC2145 DVP_RST 同接 P12：运行期只做传感器软件复位，不拉低共享脚。
+#define EPD_IO_CAM_RST EPD_IO_TP_RST
+#define EPD_IO_BT_PA_PWR 12 // P14 4G+蓝牙+功放共享电源，高有效
 #define ANA_SW_GPIO      GPIO_NUM_36 // 1.4：模拟开关（原 TCA P16）
 
 /* 盖板虚拟键：FT 报点 Y≈1600（屏外）；X 实测 home=100 / 返回·上页=200 / 下页=300 */
@@ -142,5 +152,11 @@
 /* 38/39 接 BH 串口；无 BT RX 回显时对调（当前：39=TX，38=RX） */
 #define BT_AUDIO_TX_PIN GPIO_NUM_39 // 主控 TX → 蓝牙芯片
 #define BT_AUDIO_RX_PIN GPIO_NUM_38 // 主控 RX ← 蓝牙芯片
+
+
+#define NT26_TX_PIN GPIO_NUM_58
+#define NT26_RX_PIN GPIO_NUM_59
+#define NT26_MRDY_PIN GPIO_NUM_60
+#define NT26_SRDY_PIN GPIO_NUM_3
 
 #endif /* _BOARD_CONFIG_H_ */

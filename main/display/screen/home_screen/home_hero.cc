@@ -55,10 +55,22 @@ const char* HomeHero_WeekdayName(int wday) {
     }
 }
 
+// Log the first displayed clock and validity transitions, without per-frame noise.
+static void LogHomeClock(time_t now,const tm& local,bool valid) {
+    static int previous=-1;
+    if(previous==static_cast<int>(valid))return;
+    previous=valid;
+    ESP_LOGI("HomeClock","system epoch=%lld local=%04d-%02d-%02d %02d:%02d:%02d valid=%d display=%s",
+             static_cast<long long>(now),local.tm_year+1900,local.tm_mon+1,local.tm_mday,
+             local.tm_hour,local.tm_min,local.tm_sec,valid,valid?"system time":"00:00 placeholder");
+}
+
 void HomeHero_FormatClassicClock(char* time_buf, size_t time_len, char* date_buf, size_t date_len) {
     time_t now = time(nullptr);
     struct tm tm_info = {};
-    if (localtime_r(&now, &tm_info) == nullptr || tm_info.tm_year < (2020 - 1900)) {
+    const bool valid=localtime_r(&now,&tm_info)!=nullptr && tm_info.tm_year >= (2020-1900);
+    LogHomeClock(now,tm_info,valid);
+    if (!valid) {
         std::snprintf(time_buf, time_len, "00:00");
         std::snprintf(date_buf, date_len, Lang::Strings::HOME_DATE_PLACEHOLDER);
         return;
@@ -72,7 +84,9 @@ void HomeHero_FormatSlashClock(char* hour_buf, size_t hour_len, char* min_buf, s
                       char* date_buf, size_t date_len, char* wday_buf, size_t wday_len) {
     time_t now = time(nullptr);
     struct tm tm_info = {};
-    if (localtime_r(&now, &tm_info) == nullptr || tm_info.tm_year < (2020 - 1900)) {
+    const bool valid=localtime_r(&now,&tm_info)!=nullptr && tm_info.tm_year >= (2020-1900);
+    LogHomeClock(now,tm_info,valid);
+    if (!valid) {
         std::snprintf(hour_buf, hour_len, "00");
         std::snprintf(min_buf, min_len, "00");
         std::snprintf(date_buf, date_len, Lang::Strings::HOME_DATE_SLASH_PLACEHOLDER);
@@ -106,6 +120,10 @@ void HomeHero_RefreshClock(bool force) {
         if (force || std::strcmp(time_key, HomeHero_State().last_time) != 0) {
             lv_label_set_text(HomeHero_State().hour_lbl, hour);
             lv_label_set_text(HomeHero_State().minute_lbl, minute);
+            // 数字宽度改变时，分隔斜线也要按新的视觉中心重绘。
+            if (HomeHero_State().slash_gap != nullptr) {
+                lv_obj_invalidate(HomeHero_State().slash_gap);
+            }
             std::snprintf(HomeHero_State().last_time, sizeof(HomeHero_State().last_time), "%s", time_key);
         }
         if (force || std::strcmp(date_str, HomeHero_State().last_date) != 0) {

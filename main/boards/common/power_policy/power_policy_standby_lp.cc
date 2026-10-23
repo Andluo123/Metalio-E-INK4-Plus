@@ -5,6 +5,8 @@
 #include "screen_common.h"
 #include "metalio_keys.h"
 #include "config.h"
+#include "application.h"
+#include "sd_access.h"
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -19,16 +21,6 @@ constexpr const char* TAG = "PowerPolicy";
 
 constexpr int kKeyBoot = 0;
 constexpr int kKeyPower = 3;
-
-void LvAsyncCall(void (*cb)(void*), void* user_data)
-{
-    if (cb == nullptr) {
-        return;
-    }
-    if (!ScreenLvAsyncUrgent(cb, user_data)) {
-        ScreenLvAsync(cb, user_data);
-    }
-}
 
 int MeasureKeyHoldMs(int key_index)
 {
@@ -95,6 +87,13 @@ bool DispatchStandbyPowerKey(int held_ms)
 
 bool PollStandbyPhysicalKeys()
 {
+    if (StandbyScreen::HasWakeRequest()) {
+        pwr::RequestDismissStandbyOverlay();
+        return true;
+    }
+    if (MetalioKeys_TakePowerClick()) {
+        return DispatchStandbyPowerKey(0);
+    }
     const bool boot_held = MetalioKeys_IsDown(kKeyBoot);
     const bool power_held = MetalioKeys_IsDown(kKeyPower);
     if (!boot_held && !power_held) {
@@ -104,7 +103,15 @@ bool PollStandbyPhysicalKeys()
     if (boot_held) {
         return RunStandbyBootKeyGesture(MeasureKeyHoldMs(kKeyBoot));
     }
-    return DispatchStandbyPowerKey(MeasureKeyHoldMs(kKeyPower));
+    const int held = MeasureKeyHoldMs(kKeyPower);
+    if (held >= kPowerLongPressMs) return DispatchStandbyPowerKey(held);
+    // Let the sampling task publish the release. Never synthesize a second
+    // click from the raw level: that would re-enter standby after dismissal.
+    for (int i = 0; i < 10; ++i) {
+        if (MetalioKeys_TakePowerClick()) return DispatchStandbyPowerKey(0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return false;
 }
 
 /**
@@ -151,14 +158,14 @@ bool DelayMsWithStandbyKeyPoll(uint32_t delay_ms)
     return false;
 }
 
-/** 攒帧 defer：壁纸解码完 / 经典页首帧 flush 完即 Park；上限 kStandbyUiSettleMs。 */
+/** 壁纸解码/经典页 flush 必须完成；超时只诊断，不强制卸卡。 */
 bool WaitStandbyPaintReady()
 {
     constexpr uint32_t kMinMs = 80;
     constexpr uint32_t kStepMs = 50;
     uint32_t elapsed_ms = 0;
-    ESP_LOGI(TAG, "LP phase wait_paint (settle_max=%d)", pwr::kStandbyUiSettleMs);
-    while (elapsed_ms < static_cast<uint32_t>(pwr::kStandbyUiSettleMs)) {
+    ESP_LOGI(TAG, "LP phase wait_paint (no forced SD timeout)");
+    while (StandbyScreen::IsActive()) {
         if (PollStandbyPhysicalKeys()) {
             ESP_LOGI(TAG, "LP phase wait_paint: key -> skip park/sleep");
             return true;
@@ -168,14 +175,37 @@ bool WaitStandbyPaintReady()
                      static_cast<unsigned>(elapsed_ms));
             return false;
         }
-        const uint32_t remain = static_cast<uint32_t>(pwr::kStandbyUiSettleMs) - elapsed_ms;
-        const uint32_t step_ms = remain > kStepMs ? kStepMs : remain;
-        vTaskDelay(pdMS_TO_TICKS(step_ms));
-        elapsed_ms += step_ms;
+        if (elapsed_ms != 0 && elapsed_ms % 2000 == 0) {
+            ESP_LOGW(TAG, "waiting standby decode/paint; SD remains available to decoder");
+        }
+        vTaskDelay(pdMS_TO_TICKS(kStepMs));
+        elapsed_ms += kStepMs;
     }
-    ESP_LOGW(TAG, "LP phase wait_paint: settle timeout %d ms (ready=%d)",
-             pwr::kStandbyUiSettleMs, StandbyScreen::IsPaintReady() ? 1 : 0);
-    return false;
+    return true;
+}
+
+bool DrainSdAndBootWork()
+{
+    unsigned waited_ms = 0;
+    while (!sd_access::IsIdle()) {
+        if (PollStandbyPhysicalKeys()) return true;
+        vTaskDelay(pdMS_TO_TICKS(20));
+        waited_ms += 20;
+        if (waited_ms % 2000 == 0) {
+            ESP_LOGI(TAG, "SD drain pending=%u waited=%u ms", sd_access::Pending(), waited_ms);
+        }
+    }
+    if (PollStandbyPhysicalKeys()) return true;
+    ESP_LOGI(TAG, "SD drained; stopping SD before waiting for boot checkpoint");
+    while (power_hw_sd_park() != ESP_OK) {
+        if (PollStandbyPhysicalKeys()) return true;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    while (Application::GetInstance().IsBootWorkActive()) {
+        if (PollStandbyPhysicalKeys()) return true;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return PollStandbyPhysicalKeys();
 }
 
 int64_t StandbyUiRemainUsLocked()
@@ -232,8 +262,15 @@ bool RunLightSleepSlice()
     xSemaphoreGive(pwr::mu);
 
     ESP_LOGI(TAG, "LP phase pre_sleep max_us=%llu", static_cast<unsigned long long>(slice));
-    power_hw_light_sleep_once(slice);
+    const esp_err_t sleep_result = power_hw_light_sleep_once(slice);
     ESP_LOGI(TAG, "LP phase post_sleep");
+    if (sleep_result != ESP_OK) {
+        xSemaphoreTake(pwr::mu, portMAX_DELAY);
+        OpenStandbyAwakeSegmentLocked();
+        xSemaphoreGive(pwr::mu);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        return PollStandbyPhysicalKeys();
+    }
 
     const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     if (IsKeyWakeCause(cause)) {
@@ -359,7 +396,8 @@ void StandbyLpTask(void* /*arg*/)
 
         ESP_LOGI(TAG, "LP phase touch_slp done (asleep=%d)",
                  PowerPolicy::GetInstance().IsTouchAsleep() ? 1 : 0);
-        const bool key_in_settle = WaitStandbyPaintReady();
+        bool key_in_settle = WaitStandbyPaintReady();
+        if (!key_in_settle) key_in_settle = DrainSdAndBootWork();
         if (!key_in_settle) {
             ESP_LOGI(TAG, "LP phase epd_park");
             StandbyScreen::EnterEpdSleep();
@@ -370,8 +408,22 @@ void StandbyLpTask(void* /*arg*/)
         }
 
         xSemaphoreTake(pwr::mu, portMAX_DELAY);
+        const bool wake_exit = pwr::standby_wake_exit;
+        const bool shutting_down = pwr::shutdown_requested;
         pwr::lp_session_active = false;
         xSemaphoreGive(pwr::mu);
+        if (wake_exit && !shutting_down) {
+            // Also covers wake during draining, before light_sleep_once was called.
+            power_hw_sd_restore();
+            power_hw_cellular_resume();
+            MetalioKeys_TakePowerClick();
+            // Do not depend on MainEventLoop, which may still be waiting for a
+            // network request. Retry the LVGL queue with the wake request intact.
+            while (StandbyScreen::IsActive() &&
+                   !ScreenLvAsyncUrgent([](void*) { StandbyScreen::FinishWake(); })) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+        }
         ESP_LOGI(TAG, "standby LP session end");
     }
 }
@@ -432,20 +484,13 @@ void PrepareStandbyWakeExitLocked()
     ClearStandbyElapsedLocked();
 }
 
-void DismissStandbyOverlayAsync(void* /*arg*/)
-{
-    if (StandbyScreen::IsActive()) {
-        StandbyScreen::Dismiss();
-    }
-}
-
 void RequestDismissStandbyOverlay()
 {
     xSemaphoreTake(mu, portMAX_DELAY);
     PrepareStandbyWakeExitLocked();
     last_user_activity_us = esp_timer_get_time();
     xSemaphoreGive(mu);
-    LvAsyncCall(DismissStandbyOverlayAsync, nullptr);
+    if (!StandbyScreen::HasWakeRequest()) StandbyScreen::RequestWake();
 }
 
 void RequestStandbyUiAsync()
@@ -469,11 +514,6 @@ void RequestShutdownLocked()
     ESP_LOGW(TAG, "standby LP idle elapsed=%ld s (limit %d s) -> power off",
              static_cast<long>(elapsed_s), standby_to_shutdown_sec);
     BeginPowerOffLocked();
-}
-
-void ResumeIotKeysIfNeeded()
-{
-    // S31 无 iot_button；按键由 MetalioKeys 轮询
 }
 
 void ArmStandbyLpTaskLocked()

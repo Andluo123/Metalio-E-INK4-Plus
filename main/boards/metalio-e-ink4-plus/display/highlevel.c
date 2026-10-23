@@ -86,6 +86,8 @@ enum EpdDrawError epd_hl_update_screen_full(
     EpdiyHighlevelState* state, enum EpdDrawMode mode, int temperature
 ) {
     assert(state != NULL);
+    // Full/recovery draws intentionally retain same-color conditioning pulses.
+    mode &= ~MODE_SKIP_UNCHANGED;
 
     EpdRect area = epd_full_screen();
     uint32_t ts = esp_timer_get_time() / 1000;
@@ -131,7 +133,7 @@ enum EpdDrawError epd_hl_update_screen_full(
     uint32_t t2 = esp_timer_get_time() / 1000;
 
     int fb_size = col_bytes * fb_height;
-    memcpy(state->back_fb, state->front_fb, fb_size);
+    if (err == EPD_DRAW_SUCCESS) memcpy(state->back_fb, state->front_fb, fb_size);
 
     uint32_t t3 = esp_timer_get_time() / 1000;
 
@@ -239,7 +241,9 @@ enum EpdDrawError epd_hl_update_area(EpdiyHighlevelState* state, enum EpdDrawMod
         epd_full_screen(),
         state->difference_fb,
         diff_area,
-        MODE_PACKING_1PPB_DIFFERENCE | mode,
+        // Row/column masks are coarse; the phase LUT must also suppress each
+        // unchanged pixel, including gray pixels inside active intersections.
+        MODE_PACKING_1PPB_DIFFERENCE | MODE_SKIP_UNCHANGED | mode,
         temperature,
         state->dirty_lines,
         state->dirty_columns,
@@ -255,7 +259,7 @@ enum EpdDrawError epd_hl_update_area(EpdiyHighlevelState* state, enum EpdDrawMod
 
     int buf_width = epd_width();
 
-    for (int l = diff_area.y; l < diff_area.y + diff_area.height; l++) {
+    for (int l = diff_area.y; err == EPD_DRAW_SUCCESS && l < diff_area.y + diff_area.height; l++) {
         if (state->dirty_lines[l] > 0) {
             uint8_t* lfb = state->front_fb + buf_width / 2 * l;
             uint8_t* lbb = state->back_fb + buf_width / 2 * l;

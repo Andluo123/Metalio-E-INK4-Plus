@@ -7,38 +7,6 @@
 namespace reader {
 namespace {
 
-void AppendText(std::string& buf, char c) {
-    if (c == '\r') {
-        return;
-    }
-    if (c == '\n' || c == '\t') {
-        c = ' ';
-    }
-    if (c == ' ' && (buf.empty() || buf.back() == ' ' || buf.back() == '\n')) {
-        return;
-    }
-    buf.push_back(c);
-}
-
-void FlushParagraph(std::string& buf, std::vector<ContentBlock>& out) {
-    while (!buf.empty() && (buf.back() == ' ' || buf.back() == '\n')) {
-        buf.pop_back();
-    }
-    size_t start = 0;
-    while (start < buf.size() && (buf[start] == ' ' || buf[start] == '\n')) {
-        ++start;
-    }
-    if (start >= buf.size()) {
-        buf.clear();
-        return;
-    }
-    ContentBlock b;
-    b.kind = ContentKind::kText;
-    b.text = buf.substr(start);
-    out.push_back(std::move(b));
-    buf.clear();
-}
-
 std::string ToLower(std::string s) {
     for (char& c : s) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -227,87 +195,110 @@ std::string NormalizeZipPath(const std::string& base_dir, const std::string& hre
     return out;
 }
 
-void HtmlToBlocks(const std::string& html, const std::string& base_dir, std::vector<ContentBlock>& out) {
-    out.clear();
-    std::string text;
-    bool in_script = false;
-    bool in_style = false;
-    size_t i = 0;
-    while (i < html.size()) {
-        if (html[i] == '<') {
-            const size_t end = html.find('>', i + 1);
-            if (end == std::string::npos) {
-                break;
-            }
-            const char* tag_start = html.data() + i + 1;
-            const char* tag_end = html.data() + end;
-            bool closing = false;
-            if (*tag_start == '/') {
-                closing = true;
-                ++tag_start;
-            }
-            while (tag_start < tag_end &&
-                   (*tag_start == ' ' || *tag_start == '\t' || *tag_start == '\n')) {
-                ++tag_start;
-            }
-            std::string name;
-            const char* p = tag_start;
-            while (p < tag_end && std::isalnum(static_cast<unsigned char>(*p))) {
-                name.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
-                ++p;
-            }
-
-            if (name == "script") {
-                in_script = !closing;
-            } else if (name == "style") {
-                in_style = !closing;
-            } else if (!in_script && !in_style) {
-                if (!closing && (name == "img" || name == "image")) {
-                    FlushParagraph(text, out);
-                    std::string src = ReadAttrValue(tag_start, tag_end, "src");
-                    if (src.empty()) {
-                        src = ReadAttrValue(tag_start, tag_end, "xlink:href");
-                    }
-                    src = DecodeHtmlEntities(src);
-                    const std::string path = NormalizeZipPath(base_dir, src);
-                    if (!path.empty()) {
-                        ContentBlock b;
-                        b.kind = ContentKind::kImage;
-                        b.image_href = path;
-                        out.push_back(std::move(b));
-                    }
-                } else if (name == "br") {
-                    text.push_back('\n');
-                } else if (closing && IsBlockEndTag(name)) {
-                    text.push_back('\n');
-                    FlushParagraph(text, out);
-                } else if (!closing && IsBlockEndTag(name) && name != "br") {
-                    if (!text.empty()) {
-                        text.push_back('\n');
-                    }
-                }
-            }
-            i = end + 1;
-            continue;
-        }
-
-        if (!in_script && !in_style) {
-            if (html[i] == '&') {
-                const size_t semi = html.find(';', i + 1);
-                if (semi != std::string::npos && semi - i < 16) {
-                    const std::string decoded = DecodeHtmlEntities(html.substr(i, semi - i + 1));
-                    for (char c : decoded) {
-                        AppendText(text, c);
-                    }
-                    i = semi + 1;
-                    continue;
-                }
-            }
-            AppendText(text, html[i]);
-        }
-        ++i;
-    }
-    FlushParagraph(text, out);
+bool HtmlBlockParser::Emit(bool more) {
+    if (!more) while (!text_.empty() && (text_.back() == ' ' || text_.back() == '\n')) text_.pop_back();
+    if (text_.empty() && !continuation_) return true;
+    ContentBlock block;
+    block.text.swap(text_); block.continuation = continuation_; block.continues = more;
+    if (!sink_(std::move(block))) return false;
+    continuation_ = more;
+    if (!more) last_space_ = true;
+    return true;
 }
 
-}  // namespace reader
+bool HtmlBlockParser::Append(char c) {
+    // UTF-8 最多跨分片边界补齐三个字节，异常续字节不能无限扩展缓冲。
+    if (text_.size() >= 8195 && (static_cast<uint8_t>(c) & 0xC0) == 0x80) return false;
+    if (text_.size() >= 8192 && (static_cast<uint8_t>(c) & 0xC0) != 0x80 && !Emit(true)) return false;
+    text_.push_back(c);
+    last_space_ = c == ' ' || c == '\n';
+    return true;
+}
+
+bool HtmlBlockParser::Text(char c) {
+    if (c == '\r') return true;
+    if (c == '\n' || c == '\t') c = ' ';
+    if (c == ' ' && last_space_) return true;
+    return Append(c);
+}
+
+bool HtmlBlockParser::Tag() {
+    const char* begin = tag_.data();
+    const char* end = begin + tag_.size();
+    bool closing = begin < end && *begin == '/';
+    if (closing) ++begin;
+    while (begin < end && std::isspace(static_cast<unsigned char>(*begin))) ++begin;
+    const char* p = begin;
+    while (p < end && std::isalnum(static_cast<unsigned char>(*p))) ++p;
+    const std::string name = ToLower(std::string(begin, p));
+    if (name == "script") in_script_ = !closing;
+    else if (name == "style") in_style_ = !closing;
+    else if (!in_script_ && !in_style_) {
+        if (!closing && (name == "img" || name == "image")) {
+            if (!Emit(false)) return false;
+            std::string src = ReadAttrValue(begin, end, "src");
+            if (src.empty()) src = ReadAttrValue(begin, end, "xlink:href");
+            ContentBlock image; image.kind = ContentKind::kImage;
+            image.image_href = NormalizeZipPath(base_, DecodeHtmlEntities(src));
+            if (!image.image_href.empty() && !sink_(std::move(image))) return false;
+        } else if (name == "br") {
+            if (!Append('\n')) return false;
+        } else if (closing && IsBlockEndTag(name)) {
+            if (!Emit(false)) return false;
+        } else if (!closing && IsBlockEndTag(name) && name != "br" && !text_.empty()) {
+            if (!Append('\n')) return false;
+        }
+    }
+    return true;
+}
+
+bool HtmlBlockParser::Feed(const uint8_t* data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        const char c = static_cast<char>(data[i]);
+        if (in_tag_) {
+            if (comment_) {
+                tag_.push_back(c);
+                if (tag_.size() > 3) tag_.erase(0, tag_.size() - 3);
+                if (tag_ == "-->") { comment_ = in_tag_ = false; tag_.clear(); }
+                continue;
+            }
+            if (c == '>' && !quote_) {
+                if (!Tag()) return false;
+                tag_.clear(); in_tag_ = false;
+            } else {
+                if (tag_.size() >= 8192) return false;
+                tag_.push_back(c);
+                if (tag_ == "!--") { comment_ = true; tag_.clear(); }
+                else if (quote_ && c == quote_) quote_ = 0;
+                else if (!quote_ && (c == '\'' || c == '"')) quote_ = c;
+            }
+            continue;
+        }
+        if (!entity_.empty()) {
+            if (c == ';') {
+                entity_.push_back(c);
+                for (char out : DecodeHtmlEntities(entity_)) if (!Text(out)) return false;
+                entity_.clear(); continue;
+            }
+            if (entity_.size() < 16 && c != '<' && c != '&' && !std::isspace(static_cast<unsigned char>(c))) {
+                entity_.push_back(c); continue;
+            }
+            for (char out : entity_) if (!Text(out)) return false;
+            entity_.clear();
+        }
+        if (c == '<') { in_tag_ = true; continue; }
+        if (in_script_ || in_style_) continue;
+        if (c == '&') entity_ = "&";
+        else if (!Text(c)) return false;
+    }
+    return true;
+}
+
+bool HtmlBlockParser::Finish() {
+    if (in_tag_) return false;
+    for (char c : entity_) if (!Text(c)) return false;
+    entity_.clear();
+    return Emit(false);
+}
+
+} // namespace reader

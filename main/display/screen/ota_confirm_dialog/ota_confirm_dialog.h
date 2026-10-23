@@ -12,6 +12,7 @@ public:
     };
 
     enum class Choice {
+        Failed, // UI 未能创建或被外部关闭；不能当成用户选择
         Upgrade,
         IgnorePersist,
         RemindLater,

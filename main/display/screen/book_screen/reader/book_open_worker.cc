@@ -1,6 +1,9 @@
 #pragma GCC optimize("O1")
 
+#include "assets/lang_reader.h"
+
 #include "book_screen/reader/book_open_worker.h"
+#include "book_screen/reader/book_auto_turn.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/shelf/book_bookshelf.h"
 #include "book_screen/shelf/book_detail.h"
@@ -32,6 +35,7 @@
 #include "lv_adapter_display.h"
 #include "reader/book_cover_sidecar.h"
 #include "reader/reader.h"
+#include "sd_access.h"
 #include "screen_common.h"
 #include "vk_key_handler.h"
 
@@ -58,6 +62,11 @@ static void AsyncOpenDone(void* user_data);
 void BookDrainPendingOpenDone() {
     OpenDoneMsg* msg = s_pending_open_done.exchange(nullptr, std::memory_order_acq_rel);
     if (msg != nullptr) {
+        if (Book_State().reader.standby_paused) {
+            Book_State().reader.opening.store(false);
+            s_pending_open_done.store(msg, std::memory_order_release);
+            return;
+        }
         AsyncOpenDone(msg);
     }
 }
@@ -140,7 +149,7 @@ void ShowOpenProgress(int percent) {
 static void AsyncOpenProgress(void* user_data) {
     auto* msg = static_cast<OpenProgressMsg*>(user_data);
     auto& st = Book_State();
-    if (msg->token == st.reader.open_token.load() && st.reader.opening.load() &&
+    if (msg->token == st.reader.open_token.load() && st.reader.opening.load() && !st.reader.standby_paused &&
         st.reader.content != nullptr) {
         ShowOpenProgress(msg->percent);
     }
@@ -171,13 +180,17 @@ static void AsyncOpenDone(void* user_data) {
     if (!msg->ok || !st.reader.session || !st.reader.session->IsOpen()) {
         EndReadingTimeTracking();
         ReleaseBookFont();
-        if (st.reader.opening_format == reader::BookFormat::kTxt) {
-            Book_ShowMessage(st.reader.content, Lang::Strings::BOOK_OPEN_FAILED_TXT);
-        } else if (st.reader.opening_format == reader::BookFormat::kEbook) {
-            Book_ShowMessage(st.reader.content, Lang::Strings::BOOK_OPEN_FAILED_CHAPTER);
-        } else {
-            Book_ShowMessage(st.reader.content, Lang::Strings::BOOK_OPEN_FAILED_EPUB);
+        const auto error = st.reader.session ? st.reader.session->Error() : reader::BookReadError::kInvalidData;
+        const char* message = Lang::Strings::BOOK_OPEN_FAILED_DATA;
+        switch (error) {
+            case reader::BookReadError::kFileIo: message = Lang::Strings::BOOK_OPEN_FAILED_IO; break;
+            case reader::BookReadError::kNoMemory: message = Lang::Strings::BOOK_OPEN_FAILED_MEMORY; break;
+            case reader::BookReadError::kCacheIo: message = Lang::Strings::BOOK_OPEN_FAILED_CACHE; break;
+            case reader::BookReadError::kUnsupported: message = Lang::Strings::BOOK_OPEN_FAILED_UNSUPPORTED; break;
+            case reader::BookReadError::kCancelled: message = Lang::Strings::BOOK_OPEN_CANCELLED; break;
+            default: break;
         }
+        Book_ShowMessage(st.reader.content, message);
         delete msg;
         return;
     }
@@ -201,9 +214,12 @@ static void AsyncOpenDone(void* user_data) {
         RenderReaderPage();
         ESP_LOGI(TAG, "AsyncOpenDone RenderReaderPage cost=%lldms",
                  static_cast<long long>((esp_timer_get_time() - t0) / 1000));
-        ShowReadSettingsSheet();
+        ShowReadSettingsSheet(false);
         BeginReadingTimeTracking();
-        if (st.reader.session->NeedsChapterPageRebuild()) {
+        if (st.reader.session->LiveRelayoutPending() && st.reader.session->NeedsTxtIndexRebuild()) {
+            st.reader.layout_anchor = st.reader.session->CaptureLayoutAnchor();
+            StartLayoutWorker();
+        } else if (st.reader.session->NeedsChapterPageRebuild()) {
             StartChapterPageWorker();
         }
         delete msg;
@@ -217,7 +233,10 @@ static void AsyncOpenDone(void* user_data) {
                  static_cast<long long>((esp_timer_get_time() - t0) / 1000));
     }
     BeginReadingTimeTracking();
-    if (st.reader.session->NeedsChapterPageRebuild()) {
+    if (st.reader.session->LiveRelayoutPending() && st.reader.session->NeedsTxtIndexRebuild()) {
+        st.reader.layout_anchor = st.reader.session->CaptureLayoutAnchor();
+        StartLayoutWorker();
+    } else if (st.reader.session->NeedsChapterPageRebuild()) {
         StartChapterPageWorker();
     }
     delete msg;
@@ -239,6 +258,7 @@ void OpenBookWorker(void* arg) {
         ESP_LOGW(TAG, "book_open skip: token stale %u!=%u", static_cast<unsigned>(ctx->token),
                  static_cast<unsigned>(token_now));
     } else {
+        sd_access::Permit permit;
         st.reader.session->SetOpenProgress(OnOpenProgress,
                                            reinterpret_cast<void*>(static_cast<uintptr_t>(ctx->token)));
         ok = st.reader.session->Open(ctx->info);
@@ -266,11 +286,12 @@ void OpenBookWorker(void* arg) {
         delete stale;
     }
     delete ctx;
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 void StartOpenWorker(int book_index) {
     auto& st = Book_State();
+    if (st.reader.standby_paused) return;
     if (st.reader.opening.load()) {
         const char* path = (book_index >= 0 && book_index < static_cast<int>(st.shelf.books.size()))
                                ? st.shelf.books[static_cast<size_t>(book_index)].path.c_str()
@@ -344,15 +365,8 @@ void BackToLibraryAsync(void* /*user_data*/) {
 }
 
 void BackToDetailAsync(void* /*user_data*/) {
-    auto& st = Book_State();
-    const int index = st.shelf.selected;
-    // 与进百问同源：open_token 失效 worker 回调；opening 时 deferred_cleanup，避免 UAF/泄漏
     ReleaseReaderSessionForLeave();
-    if (index < 0 || index >= static_cast<int>(st.shelf.books.size())) {
-        ScreenLoadReplace(BookScreen::Create());
-        return;
-    }
-    ScreenLoadReplace(CreateDetailScreen(index));
+    BackToLibraryAsync(nullptr);
 }
 
 void OpenDetailAsync(void* user_data) {
@@ -368,7 +382,7 @@ void OpenDetailAsync(void* user_data) {
     } else {
         st.shelf.back_root = BookUiState::NavRoot::kHome;
     }
-    ScreenLoadReplace(CreateDetailScreen(index));
+    StartReadAsync(user_data);
 }
 
 void OpenBookshelfAsync(void* /*user_data*/) {
@@ -424,6 +438,8 @@ void OnDetailStartClicked(lv_event_t* /*e*/) {
 }
 
 void DispatchTapZoneAction(BookTapZoneAction action) {
+    if (action == BookTapZoneAction::kPrev || action == BookTapZoneAction::kNext)
+        ReaderAutoTurnManualInput();
     auto& st = Book_State();
     if (st.reader.opening.load() || !st.reader.session || !st.reader.session->IsOpen()) {
         return;
@@ -447,6 +463,15 @@ void DispatchTapZoneAction(BookTapZoneAction action) {
             break;
         case BookTapZoneAction::kToc:
             OpenReadToc();
+            break;
+        case BookTapZoneAction::kBookmarks:
+            OpenReadBookmarks();
+            break;
+        case BookTapZoneAction::kFontSettings:
+            OpenReadFontSettings();
+            break;
+        case BookTapZoneAction::kSettings:
+            OpenReadSettings();
             break;
         case BookTapZoneAction::kFullRefresh:
             if (auto* disp = LVAdapterDisplay::Instance()) {

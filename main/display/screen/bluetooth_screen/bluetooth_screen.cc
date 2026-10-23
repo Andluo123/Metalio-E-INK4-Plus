@@ -3,10 +3,14 @@
 #include "bluetooth_uart.h"
 
 #include "assets/lang_config.h"
+#include "assets/lang_bluetooth.h"
 #include "fontpack_lvgl.h"
 #include "haptic_feedback.h"
 #include "power_policy.h"
+#include "power_hw.h"
+#include "epd_refresh.h"
 #include "settings_common.h"
+#include "screen_common.h"
 #include "simple_uart.hpp"
 #include "ui_scale.h"
 
@@ -31,6 +35,15 @@ ConnState Bluetooth_conn_state = ConnState::kIdle;
 std::string Bluetooth_rx_buffer;
 std::vector<BtDevice> Bluetooth_devices;
 bool Bluetooth_screen_active = false;
+
+namespace {
+std::string last_connect_address; // UI 线程记录最近主动连接的耳机。
+struct ResetArgs {
+    BtMode mode;
+    std::string address;
+    uint32_t status_sequence;
+};
+}
 
 void Bluetooth_strip_container(lv_obj_t* obj) {
     lv_obj_remove_style_all(obj);
@@ -128,6 +141,8 @@ void Bluetooth_async_add_device_item(void* user_data) {
                     return;
                 }
                 char cmd[48];
+                if (Bluetooth_mode_cmd_busy.load(std::memory_order_acquire)) return;
+                last_connect_address = addr;
                 snprintf(cmd, sizeof(cmd), "AT+CONNECT=%s\r\n", addr);
                 SimpleUart::getInstance().sendString(cmd);
                 ESP_LOGI(TAG, "TX: AT+CONNECT=%s", addr);
@@ -208,30 +223,72 @@ void Bluetooth_on_mode_btn_clicked(lv_event_t* e) {
     Bluetooth_send_mode_command(static_cast<BtMode>(idx + 1));
 }
 
-void Bluetooth_async_after_bt_reset(void* /*user_data*/) {
-    Bluetooth_refresh_mode_buttons();
-    Bluetooth_show_mode1_panel(false);
-    Bluetooth_show_mode2_panel(false);
-}
-
-void Bluetooth_bt_reset_task(void* /*param*/) {
-    if (!kBtPowerResetSupported) {
-        Bluetooth_post_status(Lang::Strings::BT_PWR_RESET_UNSUP);
+void Bluetooth_bt_reset_task(void* param) {
+    auto* args = static_cast<ResetArgs*>(param);
+    // 保持唤醒和网络电源策略，但不申请会开启 PA 的 BtAudio。
+    PowerPolicy::GetInstance().Acquire(PowerNeed::StandbyInhibit);
+    PowerPolicy::GetInstance().Acquire(PowerNeed::PeripheralReset);
+    // 先让“正在复位”真正落墨，再进入禁止屏幕操作的断电窗口。
+    if (!EpdWait(args->status_sequence, 5000)) {
+        Bluetooth_post_status(Lang::Strings::BT_PWR_RESET_FAILED);
+        PowerPolicy::GetInstance().Release(PowerNeed::PeripheralReset);
+        PowerPolicy::GetInstance().Release(PowerNeed::StandbyInhibit);
+        Bluetooth_mode_cmd_busy.store(false, std::memory_order_release);
+        delete args;
         vTaskDelete(nullptr);
         return;
     }
     Bluetooth_active_mode = BtMode::kNone;
+    Bluetooth_set_mode_audio_power(BtMode::kNone);
     Bluetooth_conn_state = ConnState::kIdle;
-    lv_async_call(Bluetooth_async_after_bt_reset, nullptr);
-    Bluetooth_post_status(Lang::Strings::BT_PWR_RESET_OK);
+    esp_err_t err = power_hw_bt_power_reset();
+    if (err == ESP_OK && SimpleUart::getInstance().isInitialized()) {
+        Bluetooth_post_status(Lang::Strings::BT_PWR_RESET_RECONNECT);
+        // 给音频芯片启动时间，再恢复复位前模式和主动连接的耳机。
+        vTaskDelay(pdMS_TO_TICKS(500));
+        Bluetooth_apply_mode_commands(args->mode);
+        Bluetooth_active_mode = args->mode;
+        if (args->mode == BtMode::kMode2 && !args->address.empty()) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            SimpleUart::getInstance().sendString("AT+CONNECT=" + args->address + "\r\n");
+            Bluetooth_conn_state = ConnState::kConnecting;
+        }
+        if (Bluetooth_screen_active) {
+            ScreenLvAsync([](void*) { Bluetooth_restore_mode_ui(); }, nullptr);
+        }
+    }
+    PowerPolicy::GetInstance().Release(PowerNeed::PeripheralReset);
+    PowerPolicy::GetInstance().Release(PowerNeed::StandbyInhibit);
+    if (err == ESP_OK) {
+        Bluetooth_post_status(args->mode == BtMode::kMode2 && !args->address.empty()
+                                  ? Lang::Strings::BT_PWR_RESET_RECONNECT
+                                  : Lang::Strings::BT_PWR_RESET_OK);
+    } else {
+        ESP_LOGE(TAG, "BT power reset failed: %s", esp_err_to_name(err));
+        Bluetooth_post_status(Lang::Strings::BT_PWR_RESET_FAILED);
+    }
+    delete args;
+    Bluetooth_mode_cmd_busy.store(false, std::memory_order_release);
     vTaskDelete(nullptr);
 }
 
 void Bluetooth_on_reset_bt_clicked(lv_event_t* /*e*/) {
-    xTaskCreate(Bluetooth_bt_reset_task, "bt_reset", 4096, nullptr, 5, nullptr);
+    bool expected = false;
+    if (!Bluetooth_mode_cmd_busy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+    auto* args = new (std::nothrow) ResetArgs{
+        Bluetooth_active_mode == BtMode::kNone ? BtMode::kMode1 : Bluetooth_active_mode,
+        last_connect_address, EpdGetStats().submitted + 1};
+    Bluetooth_update_status_label(Lang::Strings::BT_PWR_RESETTING);
+    if (args == nullptr || xTaskCreate(Bluetooth_bt_reset_task, "bt_reset", 4096, args, 5, nullptr) != pdPASS) {
+        delete args;
+        Bluetooth_mode_cmd_busy.store(false, std::memory_order_release);
+        Bluetooth_update_status_label(Lang::Strings::BT_PWR_RESET_FAILED);
+        ESP_LOGE(TAG, "BT reset task create failed");
+    }
 }
 
 void Bluetooth_on_scan_clicked(lv_event_t* /*e*/) {
+    if (Bluetooth_mode_cmd_busy.load(std::memory_order_acquire)) return;
     if (Bluetooth_active_mode != BtMode::kMode2) {
         Bluetooth_post_status(Lang::Strings::BT_NEED_MODE2);
         return;
@@ -248,6 +305,7 @@ void Bluetooth_on_scan_clicked(lv_event_t* /*e*/) {
 }
 
 void Bluetooth_on_call_mode_clicked(lv_event_t* /*e*/) {
+    if (Bluetooth_mode_cmd_busy.load(std::memory_order_acquire)) return;
     if (Bluetooth_conn_state != ConnState::kConnected) {
         Bluetooth_post_status(Lang::Strings::BT_NEED_CONNECT);
         return;
@@ -256,6 +314,7 @@ void Bluetooth_on_call_mode_clicked(lv_event_t* /*e*/) {
 }
 
 void Bluetooth_on_music_mode_clicked(lv_event_t* /*e*/) {
+    if (Bluetooth_mode_cmd_busy.load(std::memory_order_acquire)) return;
     if (Bluetooth_conn_state != ConnState::kConnected) {
         Bluetooth_post_status(Lang::Strings::BT_NEED_CONNECT);
         return;
@@ -398,6 +457,7 @@ void BluetoothScreen::ResetUi() {
 }
 
 void BluetoothScreen::ApplyDefaultMode() {
+    Bluetooth_set_mode_audio_power(BtMode::kMode1);
     Bluetooth_active_mode = BtMode::kMode1;
     SimpleUart& uart = SimpleUart::getInstance();
     if (!uart.isInitialized()) {
@@ -422,7 +482,7 @@ void BluetoothScreen::OnActivated() {
 
 void BluetoothScreen::OnDeactivated() {
     ESP_LOGI(TAG, "deactivate: bluetooth tab");
-    PowerPolicy::GetInstance().Release(PowerNeed::BtAudio);
+    Bluetooth_release_page_audio_power();
     SimpleUart::getInstance().registerCallback(
         std::function<void(const std::vector<uint8_t>&)>());
     Bluetooth_screen_active = false;

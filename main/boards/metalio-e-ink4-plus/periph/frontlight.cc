@@ -19,6 +19,7 @@
 #define FL_CH_WARM      LEDC_CHANNEL_1
 #define FL_LEDC_RES     LEDC_TIMER_10_BIT
 #define FL_DUTY_MAX     1023
+#define FL_OUTPUT_MAX_PERCENT 20 // UI 100 maps to 20% of the original PWM output.
 #define FL_STEP_US      (5 * 1000) // 与参考 Backlight 一致：每 5ms 步进 1
 
 Frontlight& Frontlight::GetInstance() {
@@ -115,7 +116,7 @@ void Frontlight::SetDriveMode(FrontlightDriveMode mode) {
              (int)cct_);
 }
 
-void Frontlight::RestoreBrightness() {
+void Frontlight::PrepareBrightnessRestore() {
     if (!initialized_) {
         return;
     }
@@ -126,12 +127,17 @@ void Frontlight::RestoreBrightness() {
     } else if (saved_brightness > 100) {
         saved_brightness = 100;
     }
+    target_brightness_ = static_cast<uint8_t>(saved_brightness);
+}
+
+void Frontlight::RestoreBrightness() {
+    if (!initialized_) return;
+    PrepareBrightnessRestore();
     // 开机恢复瞬时到位，避免首帧已出仍在 5ms/档爬升
     if (transition_timer_ != nullptr) {
         esp_timer_stop(transition_timer_);
     }
-    brightness_ = static_cast<uint8_t>(saved_brightness);
-    target_brightness_ = brightness_;
+    brightness_ = target_brightness_;
     ApplyOutput(brightness_);
     ESP_LOGI(TAG, "Restore brightness to %d", brightness_);
 }
@@ -275,7 +281,7 @@ void Frontlight::ApplyOutput(uint8_t brightness) {
     const bool warm_on = (cct_ == FrontlightCct::kWarm || cct_ == FrontlightCct::kBoth);
 
     if (drive_mode_ == FrontlightDriveMode::kPwm) {
-        const uint32_t duty = (FL_DUTY_MAX * brightness) / 100;
+        const uint32_t duty = (FL_DUTY_MAX * brightness * FL_OUTPUT_MAX_PERCENT) / 10000;
         ledc_set_duty(FL_LEDC_MODE, FL_CH_COOL, cool_on ? duty : 0);
         ledc_update_duty(FL_LEDC_MODE, FL_CH_COOL);
         ledc_set_duty(FL_LEDC_MODE, FL_CH_WARM, warm_on ? duty : 0);

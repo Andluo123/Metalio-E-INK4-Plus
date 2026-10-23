@@ -12,19 +12,28 @@
 extern "C" {
 #endif
 
+/** 初始化 S31 浅睡校准依赖；启动时调用一次，保留看门狗保护。 */
+esp_err_t power_hw_sleep_init(void);
+/** Log reset reason and retained sleep checkpoint before peripheral initialization. */
+void power_hw_log_sleep_reset(void);
+/** Replay the previous-boot diagnostic after USB enumeration; call from policy tick. */
+void power_hw_report_sleep_reset(void);
+
+/** 退出实际待机后按需恢复 4G；定时唤醒只恢复电源，不启动搜网。 */
+void power_hw_cellular_resume(void);
+
 /**
  * @brief 开关功放 PA
  * @param on true 打开，false 关闭
  * @return ESP_OK 成功
  */
 esp_err_t power_hw_pa_set(bool on);
+/** @brief 蓝牙共享 P14 电源低 3 秒后高；调用方须保持唤醒。 */
+esp_err_t power_hw_bt_power_reset(void);
 
 /**
- * @brief 外设总电源轨 MAIN_PWR（与保网停/启同生命周期）
- * @param on true 上电；false 掉电（AppIdle/待机 Overlay 后）
- * @note 幂等；false→true 时 settle 后重发蓝牙模式1，并在 4G 模式下异步重建 NT26。
- *       掉电前会先 Stop 4G 模组。勿用 ESP_ERROR_CHECK 中断策略任务。
- * @return ESP_OK / ESP_ERR_INVALID_STATE（IO 未就绪）
+ * @brief 网络电源策略标记；S31 实际 P14 在浅睡路径关闭/恢复。
+ * @note 上电策略可请求 4G 异步恢复；false 不直接切 P14（与蓝牙/功放共享）。
  */
 esp_err_t power_hw_main_rail_set(bool on);
 
@@ -65,6 +74,11 @@ void power_hw_begin_power_off(void);
  * @return ESP_OK 或唤醒相关错误
  */
 esp_err_t power_hw_light_sleep_once(uint64_t max_sleep_us);
+
+/** @brief SD 访问排空后卸载并锁存引脚低电平；重复调用无副作用。 */
+esp_err_t power_hw_sd_park(void);
+/** @brief 恢复已休眠的 SD 和串口；日志在退出待机后恢复。 */
+esp_err_t power_hw_sd_restore(void);
 
 /**
  * @brief 取最近一次浅睡返回瞬间的按键锁存

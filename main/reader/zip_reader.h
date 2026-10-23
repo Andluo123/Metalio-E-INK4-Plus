@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <zlib.h>
+#include "book_read_error.h"
 
 namespace reader {
 
@@ -23,6 +24,8 @@ public:
     ZipReader& operator=(const ZipReader&) = delete;
 
     bool Open(const char* path);
+    /** @brief 最近一次源文件或解压读取错误。 */
+    BookReadError Error() const { return fp_ && std::ferror(fp_) ? BookReadError::kFileIo : error_; }
     void Close();
     /** @brief 已解析过中央目录（句柄可暂卸，见 DetachFile） */
     bool IsOpen() const { return cd_loaded_ && !path_.empty(); }
@@ -54,7 +57,9 @@ public:
 
 private:
     struct Entry {
+        uint16_t flags = 0; // ZIP 加密等标志
         uint16_t method = 0;
+        uint32_t crc = 0; // 解压数据校验值
         uint32_t comp_size = 0;
         uint32_t uncomp_size = 0;
         uint32_t local_header_off = 0;
@@ -65,7 +70,9 @@ private:
     bool InflateEntry(const Entry& e, std::vector<uint8_t>& out, size_t max_bytes);
     bool SeekEntryPayload(const Entry& e, uint32_t* comp_remain);
     void ReleaseStreamLock();
+    size_t ValidateStreamChunk(const uint8_t* bytes, size_t size);
 
+    BookReadError error_ = BookReadError::kInvalidData; // 最近一次错误分类
     FILE* fp_ = nullptr;
     std::string path_;
     std::unordered_map<std::string, Entry> entries_;
@@ -82,6 +89,9 @@ private:
     bool stream_store_ = false;
     uint32_t stream_comp_remain_ = 0;
     uint32_t stream_uncomp_size_ = 0;
+    uint32_t stream_expected_crc_ = 0; // 条目预期校验值
+    uint32_t stream_crc_ = 0; // 已读数据校验值
+    uint64_t stream_total_ = 0; // 已读解压字节数
     z_stream stream_z_{};
     bool stream_z_init_ = false;
     uint8_t* stream_inbuf_ = nullptr;

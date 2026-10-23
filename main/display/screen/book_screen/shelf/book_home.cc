@@ -14,6 +14,7 @@
 #include <lvgl.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 #include "assets/lang_config.h"
 #include "SdCardManager.hpp"
@@ -21,40 +22,24 @@
 #include "haptic_feedback.h"
 #include "reader/reader.h"
 #include "reader/book_library.h"
+#include "reader/book_home_snapshot.h"
 
-void DrawHomeBarChart(lv_obj_t* parent, lv_coord_t area_w, lv_coord_t area_h, int finished,
-                      int book_count) {
-    lv_obj_t* chart = lv_obj_create(parent);
-    lv_obj_remove_style_all(chart);
-    lv_obj_set_size(chart, area_w, area_h);
-    lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(chart, LV_OBJ_FLAG_CLICKABLE);
-    Book_DisableScroll(chart);
-
-    constexpr int kBars = 6;
-    const lv_coord_t bar_w = kHomeChartBarW;
-    const int seed = std::max(1, book_count) + finished * 3;
-    const lv_coord_t heights[kBars] = {
-        static_cast<lv_coord_t>(area_h * (35 + (seed * 11) % 45) / 100),
-        static_cast<lv_coord_t>(area_h * (50 + (seed * 7) % 40) / 100),
-        static_cast<lv_coord_t>(area_h * (70 + (seed * 3) % 25) / 100),
-        static_cast<lv_coord_t>(area_h * (45 + (seed * 13) % 40) / 100),
-        static_cast<lv_coord_t>(area_h * (55 + (seed * 5) % 35) / 100),
-        static_cast<lv_coord_t>(area_h * (40 + (seed * 17) % 40) / 100),
-    };
-    const lv_coord_t stride = (area_w - bar_w * kBars) / (kBars - 1);
-    for (int i = 0; i < kBars; ++i) {
-        lv_obj_t* bar = lv_obj_create(chart);
-        lv_obj_remove_style_all(bar);
-        const lv_coord_t bh = std::max<lv_coord_t>(bar_w + 4, heights[i]);
-        lv_obj_set_size(bar, bar_w, bh);
-        lv_obj_set_style_bg_color(bar, lv_color_black(), 0);
-        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(bar, bar_w / 2, 0); // 顶底圆弧
-        lv_obj_set_pos(bar, i * (bar_w + stride), area_h - bh);
-        lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
-        Book_DisableScroll(bar);
-    }
+// One-bit output needs a stippled texture to retain the reference's light gray blocks.
+static const lv_image_dsc_t* EmptyWeekTexture() {
+    static const uint8_t pixels[] = {0,255,255,255, 255,255,0,255,
+                                   255,255,255,255, 255,255,255,255};
+    static const lv_image_dsc_t image = [] {
+        lv_image_dsc_t d{};
+        d.header.magic = LV_IMAGE_HEADER_MAGIC;
+        d.header.cf = LV_COLOR_FORMAT_L8;
+        d.header.w = 4;
+        d.header.h = 4;
+        d.header.stride = 4;
+        d.data_size = sizeof(pixels);
+        d.data = pixels;
+        return d;
+    }();
+    return &image;
 }
 
 void RenderReadingHome() {
@@ -104,9 +89,7 @@ void RenderReadingHome() {
         (num_font != nullptr && num_font->line_height > 0) ? num_font->line_height : lh;
 
     // 继续阅读黑卡略抬；余量留给最近阅读封面下单行书名
-    const lv_coord_t dash_h =
-        kContPad * 2 + lh + kHomeDashInnerGap + std::max(kHomeProgBarH, kHomeThumbW) +
-        kHomeDashInnerGap + kContBtnH + kFooterH;
+    const lv_coord_t dash_h = UiSy(164);
 
     lv_obj_t* dash = lv_obj_create(st.shelf.list_body);
     lv_obj_remove_style_all(dash);
@@ -119,7 +102,7 @@ void RenderReadingHome() {
     Book_DisableScroll(dash);
 
     // 继续阅读 / 阅读数据 对半
-    const lv_coord_t cont_w = (content_w - kHomeGap) / 2;
+    const lv_coord_t cont_w = content_w * 49 / 100;
     const lv_coord_t stats_w = content_w - kHomeGap - cont_w;
 
     lv_obj_t* cont = lv_obj_create(dash);
@@ -138,8 +121,11 @@ void RenderReadingHome() {
     char prog_txt[32];
     int bar_pct = 0;
     if (stats.continue_progress_x10 >= 0) {
-        FormatBookReadPctLabel(prog_txt, sizeof(prog_txt), stats.continue_progress_x10);
-        bar_pct = stats.continue_progress_x10 / 10;
+        bar_pct = std::clamp(stats.continue_progress_x10 / 10, 0, 100);
+        const char* fmt = Lang::Strings::BOOK_READ_PCT_FMT;
+        const char* pct = std::strchr(fmt, '%');
+        std::snprintf(prog_txt, sizeof(prog_txt), "%.*s %d%%",
+                      pct ? static_cast<int>(pct - fmt) : 0, fmt, bar_pct);
     } else if (stats.continue_index >= 0) {
         std::snprintf(prog_txt, sizeof(prog_txt), "%s", Lang::Strings::BOOK_START);
     } else {
@@ -241,98 +227,120 @@ void RenderReadingHome() {
     }
     lv_obj_t* cont_btn_lbl = lv_label_create(cont_btn);
     lv_label_set_text(cont_btn_lbl, Lang::Strings::BOOK_CONTINUE);
-    lv_obj_set_style_text_font(cont_btn_lbl, item_f, 0);
+    lv_obj_set_style_text_font(cont_btn_lbl, list_f, 0);
     lv_obj_set_style_text_color(cont_btn_lbl, lv_color_black(), 0);
     lv_obj_center(cont_btn_lbl);
     lv_obj_clear_flag(cont_btn_lbl, LV_OBJ_FLAG_CLICKABLE);
 
-    // 右侧统计：柱图高度封顶，下方数字区固定，避免重叠
-    lv_obj_t* stats_box = lv_obj_create(dash);
-    lv_obj_remove_style_all(stats_box);
-    lv_obj_set_size(stats_box, stats_w, dash_h);
-    lv_obj_set_style_bg_opa(stats_box, LV_OPA_TRANSP, 0);
-    lv_obj_set_flex_flow(stats_box, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(stats_box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(stats_box, 6, 0);
-    lv_obj_clear_flag(stats_box, LV_OBJ_FLAG_CLICKABLE);
-    Book_DisableScroll(stats_box);
+    const auto week_stats = reader::book_home_snapshot::LoadWeekStats();
+    constexpr uint32_t kDaySeconds = 24u * 60u * 60u;
+    // 本地日历周，周一到周日；零时长使用淡灰基线。
+    lv_obj_t* week = lv_obj_create(dash);
+    lv_obj_remove_style_all(week);
+    lv_obj_set_size(week, stats_w, dash_h);
+    Book_DisableScroll(week);
+    lv_obj_clear_flag(week, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t* week_title = lv_label_create(week);
+    lv_label_set_text(week_title, "本周阅读");
+    lv_obj_set_style_text_font(week_title, list_f, 0);
+    lv_obj_set_pos(week_title, UiSx(12), UiSy(10));
+    lv_obj_t* week_value = lv_label_create(week);
+    char week_text[48];
+    if (week_stats.valid) {
+        std::snprintf(week_text, sizeof(week_text), "%.1f 分钟", static_cast<double>(week_stats.total_seconds) / 60.0);
+    } else {
+        std::snprintf(week_text, sizeof(week_text), "%.1f 分钟", static_cast<double>(week_stats.undated_seconds) / 60.0);
+    }
+    lv_label_set_text(week_value, week_text);
+    lv_obj_set_style_text_font(week_value, item_f, 0);
+    lv_obj_set_style_text_color(week_value, lv_color_black(), 0);
+    lv_obj_set_pos(week_value, UiSx(12), UiSy(46));
+    const char* days[] = {"一", "二", "三", "四", "五", "六", "日"};
+    const lv_coord_t day_w = stats_w / 7;
+    for (int i = 0; i < 7; ++i) {
+        lv_obj_t* bar = lv_obj_create(week);
+        lv_obj_remove_style_all(bar);
+        const lv_coord_t bw = UiSx(16);
+        const uint32_t seconds = week_stats.seconds[i];
+        // Fixed daily scale: 24 hours fills the chart; a nonzero subpixel value gets one pixel.
+        const lv_coord_t bar_h = seconds ? std::max<lv_coord_t>(1,
+            static_cast<lv_coord_t>(static_cast<uint64_t>(std::min(seconds, kDaySeconds)) *
+                                    UiSy(66) / kDaySeconds)) : UiSy(16);
+        lv_obj_set_size(bar, bw, bar_h);
+        if (seconds) {
+            lv_obj_set_style_bg_color(bar, lv_color_black(), 0);
+            lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+        } else {
+            lv_obj_set_style_bg_image_src(bar, EmptyWeekTexture(), 0);
+            lv_obj_set_style_bg_image_tiled(bar, true, 0);
+        }
+        lv_obj_set_pos(bar, i * day_w + (day_w - bw) / 2, dash_h - UiSy(24) - bar_h);
+        Book_DisableScroll(bar);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* day = lv_label_create(week);
+        lv_label_set_text(day, days[i]);
+        lv_obj_set_style_text_font(day, item_f, 0);
+        lv_obj_set_width(day, day_w);
+        lv_obj_set_style_text_align(day, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(day, i * day_w, dash_h - ih);
+    }
 
-    // 数字+下划线+文案（含 pad_row×2），柱图高度据此封顶，避免叠到竖条上
-    const lv_coord_t stats_block_h = nh + 4 + 2 + 4 + ih;
-    const lv_coord_t chart_h =
-        std::max<lv_coord_t>(36, dash_h - stats_block_h - 6);
-    DrawHomeBarChart(stats_box, stats_w, chart_h, stats.finished_count,
-                     static_cast<int>(st.shelf.books.size()));
-
-    lv_obj_t* stats_row = lv_obj_create(stats_box);
+    auto make_vgap = [&](lv_coord_t h) {
+        lv_obj_t* gap = lv_obj_create(st.shelf.list_body);
+        lv_obj_remove_style_all(gap);
+        lv_obj_set_size(gap, content_w, h);
+        lv_obj_clear_flag(gap, LV_OBJ_FLAG_CLICKABLE);
+        Book_DisableScroll(gap);
+    };
+    make_vgap(UiSy(34));
+    const lv_coord_t stats_block_h = nh + UiSy(8) + ih;
+    lv_obj_t* stats_row = lv_obj_create(st.shelf.list_body);
     lv_obj_remove_style_all(stats_row);
-    lv_obj_set_size(stats_row, stats_w, stats_block_h);
-    lv_obj_set_flex_flow(stats_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(stats_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_START);
-    lv_obj_set_style_clip_corner(stats_row, true, 0);
-    lv_obj_clear_flag(stats_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(stats_row, content_w, stats_block_h);
     Book_DisableScroll(stats_row);
-
-    auto make_stat_col = [&](const char* value, const char* label) {
-        const lv_coord_t col_w = (stats_w - 8) / 2;
-        lv_obj_t* col = lv_obj_create(stats_row);
-        lv_obj_remove_style_all(col);
-        lv_obj_set_size(col, col_w, stats_block_h);
-        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-        lv_obj_set_style_pad_row(col, 4, 0);
-        lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE);
-        Book_DisableScroll(col);
-
-        lv_obj_t* num = lv_label_create(col);
+    lv_obj_clear_flag(stats_row, LV_OBJ_FLAG_CLICKABLE);
+    const lv_coord_t col_w = content_w / 3;
+    auto make_stat_col = [&](int index, const char* value, const char* label) {
+        lv_obj_t* num = lv_label_create(stats_row);
         lv_label_set_text(num, value);
         lv_obj_set_style_text_font(num, num_font, 0);
         lv_obj_set_width(num, col_w);
-        lv_label_set_long_mode(num, LV_LABEL_LONG_CLIP);
-        lv_obj_clear_flag(num, LV_OBJ_FLAG_CLICKABLE);
-
-        lv_obj_t* line = lv_obj_create(col);
-        lv_obj_remove_style_all(line);
-        lv_obj_set_size(line, col_w, 2);
-        lv_obj_set_style_bg_color(line, lv_color_black(), 0);
-        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
-        lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
-        Book_DisableScroll(line);
-
-        lv_obj_t* lab = lv_label_create(col);
+        lv_obj_set_style_text_align(num, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(num, index * col_w, 0);
+        lv_obj_t* lab = lv_label_create(stats_row);
         lv_label_set_text(lab, label);
         lv_obj_set_style_text_font(lab, item_f, 0);
         lv_obj_set_width(lab, col_w);
-        lv_label_set_long_mode(lab, LV_LABEL_LONG_CLIP);
-        lv_obj_clear_flag(lab, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_text_align(lab, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(lab, index * col_w, nh + UiSy(8));
+        if (index > 0) {
+            lv_obj_t* line = lv_obj_create(stats_row);
+            lv_obj_remove_style_all(line);
+            lv_obj_set_size(line, 2, stats_block_h);
+            lv_obj_set_style_bg_color(line, lv_color_black(), 0);
+            lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+            lv_obj_set_pos(line, index * col_w - 1, 0);
+            Book_DisableScroll(line);
+            lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
+        }
     };
+    char duration[24], weekly[24], finished[24];
+    FormatHomeDurationShort(duration, sizeof(duration), stats.total_seconds);
+    if (week_stats.valid) {
+        const bool hours = week_stats.total_seconds >= 3600;
+        std::snprintf(weekly, sizeof(weekly), "%.1f%s",
+                      static_cast<double>(week_stats.total_seconds) / (hours ? 3600.0 : 60.0),
+                      hours ? "h" : "m");
+    } else {
+        std::snprintf(weekly, sizeof(weekly), "%.1fm", static_cast<double>(week_stats.undated_seconds) / 60.0);
+    }
+    std::snprintf(finished, sizeof(finished), Lang::Strings::BOOK_COUNT_FMT, stats.finished_count);
+    make_stat_col(0, weekly, "本周阅读时长");
+    make_stat_col(1, duration, "总阅读时长");
+    make_stat_col(2, finished, Lang::Strings::BOOK_FINISHED);
+    make_vgap(UiSy(24));
 
-    char dur_val[24];
-    FormatHomeDurationShort(dur_val, sizeof(dur_val), stats.total_seconds);
-    char fin_val[24];
-    std::snprintf(fin_val, sizeof(fin_val), Lang::Strings::BOOK_COUNT_FMT, stats.finished_count);
-    make_stat_col(dur_val, Lang::Strings::BOOK_READ_DURATION);
-    make_stat_col(fin_val, Lang::Strings::BOOK_FINISHED);
-
-    // 封面恢复比例高度；余白落在继续阅读与最近阅读之间
-    auto make_vgap = [&](lv_coord_t h) {
-        lv_obj_t* g = lv_obj_create(st.shelf.list_body);
-        lv_obj_remove_style_all(g);
-        lv_obj_set_size(g, content_w, h);
-        lv_obj_set_style_bg_opa(g, LV_OPA_TRANSP, 0);
-        lv_obj_clear_flag(g, LV_OBJ_FLAG_CLICKABLE);
-    };
-
-    lv_obj_t* mid_spacer = lv_obj_create(st.shelf.list_body);
-    lv_obj_remove_style_all(mid_spacer);
-    lv_obj_set_width(mid_spacer, content_w);
-    lv_obj_set_flex_grow(mid_spacer, 1);
-    lv_obj_set_style_bg_opa(mid_spacer, LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(mid_spacer, LV_OBJ_FLAG_CLICKABLE);
-
-    // 最近阅读：左标题，右「进度」开关（同书架封面/列表按钮样式）
+    // 最近阅读：左对齐标题与双封面。
     {
         lv_obj_t* recent_hdr = lv_obj_create(st.shelf.list_body);
         lv_obj_remove_style_all(recent_hdr);
@@ -351,40 +359,15 @@ void RenderReadingHome() {
         lv_obj_set_style_text_color(recent_lbl, lv_color_black(), 0);
         lv_obj_clear_flag(recent_lbl, LV_OBJ_FLAG_CLICKABLE);
 
-        const bool pct_on = BookReaderPrefsShowShelfProgress() != 0;
-        lv_obj_t* pct_btn = lv_obj_create(recent_hdr);
-        lv_obj_remove_style_all(pct_btn);
-        lv_obj_set_size(pct_btn, kShelfViewBtnW, kShelfViewBtnH);
-        lv_obj_set_style_border_width(pct_btn, 2, 0);
-        lv_obj_set_style_border_color(pct_btn, lv_color_black(), 0);
-        lv_obj_set_style_radius(pct_btn, 4, 0);
-        lv_obj_set_style_bg_color(pct_btn, pct_on ? lv_color_black() : lv_color_white(), 0);
-        lv_obj_set_style_bg_opa(pct_btn, pct_on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-        lv_obj_add_flag(pct_btn, LV_OBJ_FLAG_CLICKABLE);
-        Book_DisableScroll(pct_btn);
-        HapticAttachClick(pct_btn);
-        lv_obj_add_event_cb(
-            pct_btn,
-            [](lv_event_t* /*e*/) {
-                BookReaderPrefsSetShowShelfProgress(BookReaderPrefsShowShelfProgress() ? 0 : 1);
-                RenderReadingHome();
-            },
-            LV_EVENT_CLICKED, nullptr);
-        lv_obj_t* pct_lbl = lv_label_create(pct_btn);
-        lv_label_set_text(pct_lbl, "进度");
-        lv_obj_set_style_text_font(pct_lbl, item_f, 0);
-        lv_obj_set_style_text_color(pct_lbl, pct_on ? lv_color_white() : lv_color_black(), 0);
-        lv_obj_center(pct_lbl);
-        lv_obj_clear_flag(pct_lbl, LV_OBJ_FLAG_CLICKABLE);
-
         make_vgap(8);
 
         const lv_coord_t recent_cell_w = (content_w - kHomeGap) / 2;
-        lv_coord_t recent_cover_h =
-            std::min(kRecentCoverH, static_cast<lv_coord_t>(recent_cell_w * 4 / 3));
-        if (recent_cover_h < 140) {
-            recent_cover_h = 140;
-        }
+        lv_obj_update_layout(st.shelf.list_body);
+        const lv_coord_t available_h = lv_obj_get_content_height(st.shelf.list_body);
+        const lv_coord_t reserved_h = dash_h + UiSy(34) + stats_block_h + UiSy(24) +
+            kShelfViewToggleH + 8 + kRecentTitleGap + ih + kHomeShelfTopGap + kHomeShelfBtnH;
+        const lv_coord_t recent_cover_h = std::max<lv_coord_t>(UiSy(100),
+            std::min<lv_coord_t>(recent_cell_w * 7 / 5, available_h - reserved_h));
 
         lv_obj_t* recent_row = lv_obj_create(st.shelf.list_body);
         lv_obj_remove_style_all(recent_row);

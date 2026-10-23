@@ -9,6 +9,7 @@ public:
     static constexpr int kCardStyleGray = 1;
     static constexpr int kCardStyleBorder = 2;
     static constexpr int kCardStyleSlash = 3;
+    static constexpr int kCardStylePixel = 4; // 像素视界
 
     /** @brief 创建首页 */
     static lv_obj_t* Create();

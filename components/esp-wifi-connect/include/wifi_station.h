@@ -9,6 +9,11 @@
 #include <esp_timer.h>
 #include <esp_netif.h>
 #include <esp_wifi_types_generic.h>
+#include <sdkconfig.h>
+
+#if CONFIG_BOARD_TYPE_METALIO_E_INK4_PLUS
+constexpr int8_t kMetalioWifiMaxTxPower = 48; // TX 功率请求上限，单位 0.25 dBm，对应 12 dBm
+#endif
 
 struct WifiApRecord {
     std::string ssid;
@@ -47,6 +52,11 @@ public:
      */
     bool IsScanning();
     bool WaitForConnected(int timeout_ms = 10000);
+    // Status queries tolerate disconnect/stop racing with the driver call.
+    // On failure, ap_info is cleared and callers must treat it as unavailable.
+    bool TryGetApInfo(wifi_ap_record_t& ap_info);
+    static constexpr int8_t kRssiUnavailable = -128;
+    static constexpr uint8_t kChannelUnavailable = 0;
     int8_t GetRssi();
     std::string GetSsid() const { return ssid_; }
     std::string GetIpAddress() const { return ip_address_; }

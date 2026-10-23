@@ -32,8 +32,9 @@ constexpr lv_coord_t kSectionGap = UiSy(48);
 constexpr lv_coord_t kHeroSectionGap = UiSy(20);
 constexpr lv_coord_t kHeroInnerGap = UiSy(4);
 constexpr lv_coord_t kTopPad = UiSy(12);
-constexpr lv_coord_t kCatW = UiSx(424);
-constexpr lv_coord_t kCatH = UiSy(202);
+// 宽铺满可绘区；高按源图 424×202 等比
+constexpr lv_coord_t kCatW = DISPLAY_WIDTH;
+constexpr lv_coord_t kCatH = (202 * DISPLAY_WIDTH + 424 / 2) / 424;
 constexpr lv_coord_t kBubbleW = UiSx(316);
 constexpr lv_coord_t kBubbleH = UiSy(94);
 constexpr lv_coord_t kMenuIcon = UiSx(30);

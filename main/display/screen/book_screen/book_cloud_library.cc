@@ -55,17 +55,18 @@ static bool DownloadUrlToBuffer(const char* url, std::vector<uint8_t>& out, size
         err_out = Lang::Strings::BOOK_CONN_FAIL;
         return false;
     }
+    DownloadGate::Binding binding;
     Http* http_raw = http.get();
     if (gate != nullptr) {
-        if (!gate->BindHttp(std::move(http))) {
+        if (!gate->BindHttp(http.get())) {
             err_out = Lang::Strings::BOOK_CANCELLED;
             return false;
         }
     }
+    binding.gate = gate;
 
     http_raw->SetTimeout(kHttpTimeoutMs);
     api::ApplyCommonHeaders(http_raw);
-    api::LogHttpRequest(TAG, "GET", url);
     if (!http_raw->Open("GET", url)) {
         if (gate != nullptr) {
             gate->CloseHttp();
@@ -208,7 +209,7 @@ std::string FormatCloudFileSize(uint64_t bytes) {
 
 bool DownloadCloudBook(const CloudBookTask& task, std::string& err_out,
                        CloudDownloadProgressFn on_progress, void* progress_user, DownloadGate* gate,
-                       const uint8_t* cover_bytes, size_t cover_len) {
+                       const uint8_t* cover_bytes, size_t cover_len, const char* save_path, bool overwrite) {
     err_out.clear();
     PowerNeedHold hold_net(PowerNeed::OtaDownload);
     if (gate != nullptr && gate->IsCancelled()) {
@@ -232,7 +233,7 @@ bool DownloadCloudBook(const CloudBookTask& task, std::string& err_out,
         return false;
     }
 
-    const std::string final_path = task.LocalPath();
+    const std::string final_path = save_path != nullptr ? save_path : task.LocalPath();
     // 必须落在书库目录下，防止异常 name 写出目录外
     const std::string books_prefix = std::string(SD_PATH_BOOKS) + "/";
     if (final_path.rfind(books_prefix, 0) != 0 && final_path != SD_PATH_BOOKS) {
@@ -252,14 +253,13 @@ bool DownloadCloudBook(const CloudBookTask& task, std::string& err_out,
         return false;
     }
 
-    unlink(final_path.c_str());  // 覆盖旧文件
-    if (rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+    if (!CommitDownloadedFile(tmp_path, final_path, overwrite, err_out)) {
         unlink(tmp_path.c_str());
-        err_out = Lang::Strings::BOOK_SAVE_FAIL;
         return false;
     }
     ESP_LOGI(TAG, "saved cloud book -> %s", final_path.c_str());
 
+    DeleteBookCoverSidecar(final_path.c_str());
     // 旁路封面：优先列表已缓存的 coverImageUrl 字节；否则再 HTTP；再失败抽书内嵌
     const BookFormat fmt = DetectFormatByPath(final_path.c_str());
     if (fmt == BookFormat::kEbook || fmt == BookFormat::kEpub) {

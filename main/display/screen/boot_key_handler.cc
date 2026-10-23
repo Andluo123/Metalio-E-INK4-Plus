@@ -7,9 +7,11 @@
 #include "ota_confirm_dialog/ota_confirm_dialog.h"
 #include "ota_upgrade_screen/ota_upgrade_screen.h"
 #include "power_policy.h"
+#include "settings_screen/settings_log_upload.h"
 #include "screen_common.h"
 #include "standby_screen/standby_screen.h"
 #include "vk_key_handler.h"
+#include "usb_virtual_disk.h"
 
 #include <atomic>
 #include <esp_log.h>
@@ -37,12 +39,14 @@ static bool OtaBlocks() {
 }
 
 static void EnterStandbyAsync(void* /*arg*/) {
+    SettingsLogUpload_RequestAbort("power_key");
     CloudScreen::StopTransfer();
+    CloudScreen::ParkApForStandby();
     StandbyScreen::Show();
 }
 
 void BootKey_OnPressDown() {
-    if (OtaBlocks()) {
+    if (SettingsLogUpload_IsActive() || OtaBlocks()) {
         return;
     }
     s_boot_held.store(true);
@@ -52,7 +56,7 @@ void BootKey_OnPressDown() {
 }
 
 void BootKey_OnPressUp() {
-    if (OtaBlocks()) {
+    if (SettingsLogUpload_IsActive() || OtaBlocks()) {
         s_boot_held.store(false);
         return;
     }
@@ -62,7 +66,7 @@ void BootKey_OnPressUp() {
 }
 
 void BootKey_OnClick() {
-    if (OtaBlocks() || s_long_press_fired.load()) {
+    if (SettingsLogUpload_IsActive() || OtaBlocks() || s_long_press_fired.load()) {
         return;
     }
     const char* screen = VkKey_ActiveScreen();
@@ -70,7 +74,7 @@ void BootKey_OnClick() {
 }
 
 void BootKey_OnDoubleClick() {
-    if (OtaBlocks() || s_long_press_fired.load()) {
+    if (SettingsLogUpload_IsActive() || OtaBlocks() || s_long_press_fired.load()) {
         return;
     }
     const char* screen = VkKey_ActiveScreen();
@@ -78,7 +82,7 @@ void BootKey_OnDoubleClick() {
 }
 
 void BootKey_OnLongPress() {
-    if (OtaBlocks()) {
+    if (SettingsLogUpload_IsActive() || OtaBlocks()) {
         s_long_press_fired.store(true);
         return;
     }
@@ -98,7 +102,12 @@ void PowerKey_OnClick() {
         return;
     }
     if (StandbyScreen::IsActive()) {
-        ESP_LOGI(TAG, "power short ignored (already standby)");
+        StandbyScreen::RequestWake();
+        return;
+    }
+    auto& usb = UsbVirtualDisk::GetInstance();
+    if (usb.IsGadgetActive() || usb.IsBusy()) {
+        ESP_LOGI(TAG, "power standby deferred: USB owns SD");
         return;
     }
     ESP_LOGI(TAG, "power short -> standby");
@@ -106,12 +115,6 @@ void PowerKey_OnClick() {
     if (!ScreenLvAsyncUrgent(EnterStandbyAsync)) {
         ScreenLvAsync(EnterStandbyAsync);
     }
-}
-
-void PowerKey_OnLongPress() {
-    ESP_LOGI(TAG, "power long -> RequestPowerOff");
-    CloudScreen::StopTransfer();
-    PowerPolicy::GetInstance().RequestPowerOff();
 }
 
 bool BootKey_IsHeld() {

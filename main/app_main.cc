@@ -4,6 +4,7 @@
  */
 #include "application.h"
 #include "epd_board_metalio_eink4_plus.h"
+#include "power_hw.h"
 
 #include <esp_event.h>
 #include <esp_log.h>
@@ -14,6 +15,7 @@
 #define TAG "eink4p_main"
 
 extern "C" void app_main(void) {
+    power_hw_log_sleep_reset();
     epd_board_metalio_eink4_plus_boot_release_holds();
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());

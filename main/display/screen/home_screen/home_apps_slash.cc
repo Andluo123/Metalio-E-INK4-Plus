@@ -3,6 +3,7 @@
 #include "home_screen_priv.h"
 #include "home_screen_ui.h"
 #include "home_apps_slash.h"
+#include "home_icon_source.h"
 #include "home_screen/home_hero.h"
 #include "assistant_screen/assistant_screen.h"
 #include "assets/lang_config.h"
@@ -85,6 +86,15 @@
         // 用整格坐标画梯形；content_coords 会扣掉 pad，中缝会被垫宽
         lv_area_t a;
         lv_obj_get_coords(obj, &a);
+        // 描边沿路径两侧展开，内缩半个线宽避免外侧被格子裁掉。
+        if (!black)
+        {
+            const lv_coord_t inset = (HOME_SLASH_BORDER_W + 1) / 2;
+            a.x1 += inset;
+            a.x2 -= inset;
+            a.y1 += inset;
+            a.y2 -= inset;
+        }
         const lv_coord_t slant = HOME_SLASH_SLANT;
 
         lv_point_precise_t p[4];
@@ -195,14 +205,9 @@
 
         auto make_icon = [&]() {
             lv_obj_t *icon = lv_image_create(cell);
-            lv_image_set_src(icon, entry.icon_path);
-            lv_obj_set_size(icon, HOME_SLASH_ICON, HOME_SLASH_ICON);
-            lv_image_set_inner_align(icon, LV_IMAGE_ALIGN_CONTAIN);
-            if (black)
-            {
-                lv_obj_set_style_image_recolor(icon, lv_color_white(), 0);
-                lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
-            }
+            lv_image_set_src(icon, HomeIconSource(entry.icon_path));
+            lv_obj_set_style_image_recolor(icon, fg, 0);
+            lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
             lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
         };
         auto make_name = [&]() {
@@ -215,6 +220,7 @@
                 name_font = fontpack_lv_font_ui();
             }
             lv_obj_set_style_text_font(name, name_font, 0);
+            lv_obj_add_event_cb(name, Home_OnAppNameDraw, LV_EVENT_DRAW_MAIN_END, nullptr);
             lv_obj_set_style_text_color(name, fg, 0);
             lv_obj_clear_flag(name, LV_OBJ_FLAG_CLICKABLE);
         };

@@ -1,3 +1,4 @@
+#include "sd_log_writer.h"
 #include "usb_virtual_disk.h"
 
 #include "assets/lang_config.h"
@@ -58,6 +59,8 @@
 namespace {
 
 constexpr const char* TAG = "UsbVirtualDisk";
+constexpr uint32_t kUsbDisconnectMs = 250;
+constexpr uint32_t kUsbRouteSettleMs = 100;
 
 // 启用期间挡住无操作进待机；与 s_gadget_active 对齐，避免重复 Acquire/Release
 std::atomic<bool> s_standby_block_held{false};
@@ -85,6 +88,10 @@ enum UsbReq : int {
 
 tinyusb_msc_storage_handle_t s_storage_hdl = nullptr;
 QueueHandle_t s_usb_req_queue = nullptr;
+StaticQueue_t s_usb_queue_storage;
+uint8_t s_usb_queue_bytes[sizeof(UsbReq)];
+TaskHandle_t s_usb_worker = nullptr;
+std::mutex s_usb_work_mu;
 #if !CONFIG_IDF_TARGET_ESP32S31
 usb_phy_handle_t s_phy_hdl = nullptr;
 #endif
@@ -178,36 +185,40 @@ void NotifyUi() {
     }
 }
 
-// 启停请求可覆盖队列；挂载切换绝不能盖掉启停。
-void PostGadgetRequest(UsbReq req) {
-    if (s_usb_req_queue == nullptr) {
-        return;
+void UsbWorkerTask(void* arg);
+
+// 调用方持有 s_usb_work_mu；任务只在处理请求期间占用栈。
+bool StartUsbWorkerLocked() {
+    if (s_usb_worker != nullptr) return true;
+    if (xTaskCreate(UsbWorkerTask, "usb_vd_worker", 12288, nullptr, 6, &s_usb_worker) != pdPASS) {
+        s_usb_worker = nullptr;
+        xQueueReset(s_usb_req_queue);
+        ESP_LOGE(TAG, "create usb worker failed");
+        return false;
     }
+    s_op_in_progress.store(true, std::memory_order_relaxed);
+    return true;
+}
+
+// 启停请求可覆盖队列；调用方持有 s_usb_work_mu。
+bool PostGadgetRequest(UsbReq req) {
+    if (s_usb_req_queue == nullptr) return false;
     xQueueOverwrite(s_usb_req_queue, &req);
+    return StartUsbWorkerLocked();
 }
 
 void PostMountRequest(UsbReq req) {
-    if (s_usb_req_queue == nullptr) {
-        return;
-    }
-    // 队列非空（多半是启停）时丢掉挂载请求，避免反复枚举冲掉 Disable。
-    xQueueSend(s_usb_req_queue, &req, 0);
+    std::lock_guard<std::mutex> lock(s_usb_work_mu);
+    if (s_usb_req_queue == nullptr) return;
+    // 挂载请求不能覆盖尚未处理的启停请求。
+    if (xQueueSend(s_usb_req_queue, &req, 0) == pdTRUE) StartUsbWorkerLocked();
 }
 
-void PostReconcileLocked() {
-    if (s_usb_req_queue == nullptr) {
-        return;
-    }
+bool PostReconcileLocked() {
     const bool want = s_want_active.load(std::memory_order_relaxed);
     const bool active = s_gadget_active.load(std::memory_order_relaxed);
-    if (want == active) {
-        return;
-    }
-    if (want) {
-        PostGadgetRequest(kReqEnableGadget);
-    } else {
-        PostGadgetRequest(kReqDisableGadget);
-    }
+    if (want == active) return true;
+    return PostGadgetRequest(want ? kReqEnableGadget : kReqDisableGadget);
 }
 
 void RoutePhyToOtg() {
@@ -370,6 +381,9 @@ void StorageMountChangedCb(tinyusb_msc_storage_handle_t /*handle*/, tinyusb_msc_
     }
     s_sd_to_usb.store(event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB,
                       std::memory_order_relaxed);
+    ESP_LOGI(TAG, "MSC mount complete: owner=%s switching=%d",
+             event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP",
+             s_usb_switching.load(std::memory_order_relaxed) ? 1 : 0);
     SyncSdCardManagerFlags();
     if (!s_usb_switching.load(std::memory_order_relaxed) &&
         s_gadget_active.load(std::memory_order_relaxed)) {
@@ -378,7 +392,15 @@ void StorageMountChangedCb(tinyusb_msc_storage_handle_t /*handle*/, tinyusb_msc_
 }
 
 void UsbEventCb(tinyusb_event_t* event, void* /*arg*/) {
-    if (event == nullptr || s_usb_switching.load(std::memory_order_relaxed) ||
+    if (event == nullptr) return;
+    if (event->id == TINYUSB_EVENT_ATTACHED || event->id == TINYUSB_EVENT_DETACHED) {
+        ESP_LOGI(TAG, "USB host %s: switching=%d active=%d sd_to_usb=%d",
+                 event->id == TINYUSB_EVENT_ATTACHED ? "configured (enumeration complete)" : "detached",
+                 s_usb_switching.load(std::memory_order_relaxed) ? 1 : 0,
+                 s_gadget_active.load(std::memory_order_relaxed) ? 1 : 0,
+                 s_sd_to_usb.load(std::memory_order_relaxed) ? 1 : 0);
+    }
+    if (s_usb_switching.load(std::memory_order_relaxed) ||
         !s_gadget_active.load(std::memory_order_relaxed)) {
         return;
     }
@@ -480,11 +502,9 @@ esp_err_t UsbGadgetTeardownUnlocked() {
     vTaskDelay(pdMS_TO_TICKS(100));
     s_gadget_active.store(false, std::memory_order_relaxed);
     s_sd_to_usb.store(false, std::memory_order_relaxed);
-    SetStandbyBlock(false);
 #if CONFIG_IDF_TARGET_ESP32S31
     epd_board_metalio_eink4_plus_ana_sw_set(true); // 关闭虚拟 U 盘：ANA_SW(GPIO36) 置高
 #endif
-    SyncSdCardManagerFlags();
     return first_err;
 }
 
@@ -504,13 +524,13 @@ esp_err_t MountToAppWithRetry(int attempts, uint32_t delay_ms) {
     return err;
 }
 
-// USB 已拆后收回 SD：先走 MSC→APP，失败再删 storage 本机 remount。
+// USB 已拆后，删除 MSC 的 VFS/磁盘注册，再释放 raw card 并普通挂载。
+// TinyUSB APP mount 没有 IDF esp_vfs_fat_sdmmc_mount 的 context，不能留给普通卸载。
 esp_err_t ReclaimSdAfterUsbDown() {
     if (s_storage_hdl != nullptr) {
-        if (MountToAppWithRetry(5, 100) == ESP_OK) {
-            return ESP_OK;
-        }
-        ESP_LOGW(TAG, "MountToApp after USB down failed, rebuild VFS");
+        // delete_storage handles both APP and USB mount states and does not free the card.
+        // No USB task remains after UsbGadgetTeardownUnlocked.
+        SdLogWriter_OnSdUnmounting();
         if (tinyusb_msc_delete_storage(s_storage_hdl) != ESP_OK) {
             ESP_LOGW(TAG, "tinyusb_msc_delete_storage failed; keep MSC handle");
             SyncMountFlagsFromStorage();
@@ -519,6 +539,7 @@ esp_err_t ReclaimSdAfterUsbDown() {
         }
         s_storage_hdl = nullptr;
         s_sd_card = nullptr;
+        SdCardManager::GetInstance().NotifyExportedToHost(); // MSC VFS is now gone
         if (tinyusb_msc_uninstall_driver() != ESP_OK) {
             ESP_LOGW(TAG, "tinyusb_msc_uninstall_driver failed");
         }
@@ -528,7 +549,7 @@ esp_err_t ReclaimSdAfterUsbDown() {
         ESP_LOGE(TAG, "RemountVfsFromCard failed after USB down");
         return ESP_FAIL;
     }
-    // MountToApp 未成功时上面不会 Invalidate；重建 VFS 后同样作废书库缓存
+    // 普通挂载后作废主机可能改动过的书库缓存。
     InvalidateBookLibraryAfterHostExport();
     return ESP_OK;
 }
@@ -563,6 +584,7 @@ esp_err_t UsbGadgetStart() {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "tinyusb_driver_install failed: %s", esp_err_to_name(err));
         RoutePhyToUsj();
+        ReclaimSdAfterUsbDown();
         s_usb_switching.store(false, std::memory_order_relaxed);
         return err;
     }
@@ -576,6 +598,7 @@ esp_err_t UsbGadgetStart() {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "usb_new_phy failed: %s", esp_err_to_name(err));
         RoutePhyToUsj();
+        ReclaimSdAfterUsbDown();
         s_usb_switching.store(false, std::memory_order_relaxed);
         return err;
     }
@@ -598,29 +621,46 @@ esp_err_t UsbGadgetStart() {
         usb_del_phy(s_phy_hdl);
         s_phy_hdl = nullptr;
         RoutePhyToUsj();
+        ReclaimSdAfterUsbDown();
         s_usb_switching.store(false, std::memory_order_relaxed);
         return err;
     }
 #endif
+
+    // Driver installation starts the device controller. Disconnect it again
+    // before routing the cable, so the host sees a clean attach only after the
+    // SD medium and analog switch are ready (also when the cable is plugged in).
+    ESP_LOGI(TAG, "USB re-enumeration: soft disconnect, wait %lu ms",
+             static_cast<unsigned long>(kUsbDisconnectMs));
+    tud_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(kUsbDisconnectMs));
+#if CONFIG_IDF_TARGET_ESP32S31
+    epd_board_metalio_eink4_plus_ana_sw_set(false);
+    ESP_LOGI(TAG, "USB re-enumeration: ANA_SW(GPIO36)=0, settle %lu ms",
+             static_cast<unsigned long>(kUsbRouteSettleMs));
+#endif
+    vTaskDelay(pdMS_TO_TICKS(kUsbRouteSettleMs));
 
     s_gadget_active.store(true, std::memory_order_relaxed);
     err = MountToUsb();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mount USB after start failed, rollback");
-        MountToAppWithRetry(3, 150);
         UsbGadgetTeardownUnlocked();
+        ReclaimSdAfterUsbDown();
         s_usb_switching.store(false, std::memory_order_relaxed);
         SyncUiFromState();
         return err;
     }
 
-    s_usb_switching.store(false, std::memory_order_relaxed);
     SetStandbyBlock(true);
-#if CONFIG_IDF_TARGET_ESP32S31
-    epd_board_metalio_eink4_plus_ana_sw_set(false); // 虚拟 U 盘：ANA_SW(GPIO36) 置低
-#endif
+    // Accept the first host configuration callback as soon as we reconnect.
+    s_usb_switching.store(false, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "USB re-enumeration: SD ready, soft connect; awaiting host configuration");
+    tud_connect();
     SyncUiFromState();
-    ESP_LOGI(TAG, "virtual U-disk enabled");
+    ESP_LOGI(TAG, "virtual U-disk enabled: connected=%d configured=%d sd_to_usb=%d",
+             tud_connected() ? 1 : 0, tud_mounted() ? 1 : 0,
+             s_sd_to_usb.load(std::memory_order_relaxed) ? 1 : 0);
     return ESP_OK;
 }
 
@@ -630,17 +670,22 @@ esp_err_t UsbGadgetStart() {
 esp_err_t UsbGadgetStop(bool /*force*/) {
     if (!s_gadget_active.load(std::memory_order_relaxed)) {
         RoutePhyToUsj();
+        const esp_err_t err = ReclaimSdAfterUsbDown();
         s_want_active.store(false, std::memory_order_relaxed);
+        SetStandbyBlock(false);
         SyncUiFromState();
-        return ESP_OK;
+        return err;
     }
 
     s_usb_switching.store(true, std::memory_order_relaxed);
 
     esp_err_t err = UsbGadgetTeardownUnlocked();
-    if (ReclaimSdAfterUsbDown() != ESP_OK) {
+    const esp_err_t reclaim_err = ReclaimSdAfterUsbDown();
+    if (reclaim_err != ESP_OK) {
         ESP_LOGW(TAG, "USB down but SD reclaim incomplete");
+        if (err == ESP_OK) err = reclaim_err;
     }
+    SetStandbyBlock(false);
 
     s_want_active.store(false, std::memory_order_relaxed);
     s_usb_switching.store(false, std::memory_order_relaxed);
@@ -654,10 +699,23 @@ esp_err_t UsbGadgetStop(bool /*force*/) {
 void UsbWorkerTask(void* /*arg*/) {
     UsbReq req = kReqDisableGadget;
     while (true) {
-        if (xQueueReceive(s_usb_req_queue, &req, portMAX_DELAY) != pdTRUE) {
-            continue;
+        bool received;
+        {
+            std::lock_guard<std::mutex> lock(s_usb_work_mu);
+            if (s_reconcile_pending.exchange(false, std::memory_order_relaxed)) {
+                PostReconcileLocked();
+            }
+            received = xQueueReceive(s_usb_req_queue, &req, 0) == pdTRUE;
+            if (!received) {
+                s_op_in_progress.store(false, std::memory_order_relaxed);
+                s_usb_worker = nullptr;
+            }
         }
-        s_op_in_progress.store(true, std::memory_order_relaxed);
+        if (!received) {
+            vTaskDelete(nullptr);
+            return;
+        }
+        SdLogWriter_OnSdUnmounting(); // drain logger/snapshot before any MSC transition
         SetHint(UsbVirtualDisk::UiHint::Switching);
         NotifyUi();
 
@@ -689,7 +747,6 @@ void UsbWorkerTask(void* /*arg*/) {
                 }
                 break;
             case kReqForceDisableGadget:
-                s_want_active.store(false, std::memory_order_relaxed);
                 SetHint(UsbVirtualDisk::UiHint::Disabling);
                 NotifyUi();
                 if (UsbGadgetStop(true) != ESP_OK) {
@@ -727,10 +784,8 @@ void UsbWorkerTask(void* /*arg*/) {
                 break;
         }
 
-        s_op_in_progress.store(false, std::memory_order_relaxed);
-        // 仅当忙时用户改过期望态才补发启停，避免停用失败后死循环重试。
-        if (s_reconcile_pending.exchange(false, std::memory_order_relaxed)) {
-            PostReconcileLocked();
+        if (!s_gadget_active.load() && SdCardManager::GetInstance().IsMounted()) {
+            SdLogWriter_OnSdMounted();
         }
     }
 }
@@ -743,26 +798,11 @@ UsbVirtualDisk& UsbVirtualDisk::GetInstance() {
 }
 
 void UsbVirtualDisk::Init() {
-    if (s_inited.exchange(true)) {
-        return;
-    }
+    std::lock_guard<std::mutex> lock(s_usb_work_mu);
+    if (s_inited.load()) return;
     RoutePhyToUsj();
-    s_usb_req_queue = xQueueCreate(1, sizeof(UsbReq));
-    if (s_usb_req_queue == nullptr) {
-        ESP_LOGE(TAG, "create usb queue failed");
-        s_inited.store(false);
-        return;
-    }
-    BaseType_t ok =
-        xTaskCreate(UsbWorkerTask, "usb_vd_worker", 12288, nullptr, 6, nullptr);
-    if (ok != pdPASS) {
-        ESP_LOGE(TAG, "create usb worker failed");
-        vQueueDelete(s_usb_req_queue);
-        s_usb_req_queue = nullptr;
-        s_inited.store(false);
-        return;
-    }
-    ESP_LOGI(TAG, "UsbVirtualDisk ready (default USJ)");
+    s_usb_req_queue = xQueueCreateStatic(1, sizeof(UsbReq), s_usb_queue_bytes, &s_usb_queue_storage);
+    s_inited.store(true);
 }
 
 bool UsbVirtualDisk::IsSupported() const {
@@ -787,8 +827,10 @@ UsbVirtualDisk::UiHint UsbVirtualDisk::GetUiHint() const {
 
 void UsbVirtualDisk::Toggle() {
     Init();
+    std::unique_lock<std::mutex> lock(s_usb_work_mu);
     if (s_usb_req_queue == nullptr) {
         SetHint(UiHint::EnableFailed);
+        lock.unlock();
         NotifyUi();
         return;
     }
@@ -804,6 +846,7 @@ void UsbVirtualDisk::Toggle() {
         if (!sd.IsMounted() && !sd.HasCard() &&
             !s_gadget_active.load(std::memory_order_relaxed)) {
             SetHint(UiHint::NoSdCard);
+            lock.unlock();
             NotifyUi();
             return;
         }
@@ -813,20 +856,26 @@ void UsbVirtualDisk::Toggle() {
     if (busy) {
         s_reconcile_pending.store(true, std::memory_order_relaxed);
         SetHint(UiHint::Switching);
+        lock.unlock();
         NotifyUi();
         return;
     }
     SetHint(new_want ? UiHint::Enabling : UiHint::Disabling);
+    if (!PostReconcileLocked()) {
+        s_want_active.store(s_gadget_active.load(), std::memory_order_relaxed);
+        SetHint(new_want ? UiHint::EnableFailed : UiHint::DisableFailed);
+    }
+    lock.unlock();
     NotifyUi();
-    PostReconcileLocked();
 }
 
 void UsbVirtualDisk::DisableIfActive() {
-    Init();
+    std::lock_guard<std::mutex> lock(s_usb_work_mu);
     if (s_usb_req_queue == nullptr) {
         return;
     }
     s_want_active.store(false, std::memory_order_relaxed);
+    s_reconcile_pending.store(false, std::memory_order_relaxed);
     // 已启用，或正在启用/切换：强制停用覆盖队列，离开页面必须恢复 USJ。
     if (!s_gadget_active.load(std::memory_order_relaxed) &&
         !s_op_in_progress.load(std::memory_order_relaxed)) {
@@ -834,7 +883,7 @@ void UsbVirtualDisk::DisableIfActive() {
     }
     ESP_LOGI(TAG, "auto force-disable virtual U-disk (leaving settings)");
     SetHint(UiHint::Disabling);
-    PostGadgetRequest(kReqForceDisableGadget);
+    if (!PostGadgetRequest(kReqForceDisableGadget)) SetHint(UiHint::DisableFailed);
 }
 
 void UsbVirtualDisk::SetUiNotify(UiNotifyFn fn) {
@@ -854,8 +903,6 @@ const char* UsbVirtualDisk::HintText(UiHint hint) {
             return Lang::Strings::SETTINGS_STORAGE_USB_HINT_HOST;
         case UiHint::EnabledLocal:
             return Lang::Strings::SETTINGS_STORAGE_USB_HINT_LOCAL;
-        case UiHint::Disabled:
-            return Lang::Strings::SETTINGS_STORAGE_USB_HINT_DISABLED;
         case UiHint::EnableFailed:
             return Lang::Strings::SETTINGS_STORAGE_USB_HINT_ENABLE_FAIL;
         case UiHint::DisableFailed:
@@ -866,6 +913,7 @@ const char* UsbVirtualDisk::HintText(UiHint hint) {
             return Lang::Strings::SETTINGS_STORAGE_USB_HINT_FORMAT;
         case UiHint::HostBusy:
             return Lang::Strings::SETTINGS_STORAGE_USB_HINT_HOST_BUSY;
+        case UiHint::Disabled:
         case UiHint::Idle:
         default:
             return Lang::Strings::SETTINGS_STORAGE_USB_HINT_IDLE;

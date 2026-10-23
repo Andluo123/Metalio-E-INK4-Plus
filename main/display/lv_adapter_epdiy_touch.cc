@@ -6,6 +6,7 @@
 #include "lv_adapter_epdiy_touch.h"
 
 #include "config.h"
+#include "display_orient.h"
 #include "haptic_feedback.h"
 #include "metalio_touch.h"
 #include "power_policy.h"
@@ -19,9 +20,9 @@
 
 /** @brief 逻辑坐标 → UI：扣 content inset 再加板级微调；越界返回 false */
 static bool MapLogicalToUi(int lx, int ly, int* ux, int* uy) {
-    const int x = lx - DISPLAY_CONTENT_LEFT_INSET + DISPLAY_TOUCH_OFFSET_X;
-    const int y = ly - DISPLAY_CONTENT_TOP_INSET + DISPLAY_TOUCH_OFFSET_Y;
-    if (x < 0 || x >= DISPLAY_CONTENT_W || y < 0 || y >= DISPLAY_CONTENT_H) {
+    int x, y;
+    DisplayUiTouchToLogical(lx + DISPLAY_TOUCH_OFFSET_X, ly + DISPLAY_TOUCH_OFFSET_Y, &x, &y);
+    if (x < 0 || x >= DisplayUiLogW() || y < 0 || y >= DisplayUiLogH()) {
         return false;
     }
     *ux = x;
@@ -84,7 +85,7 @@ static void BeginCoverHold(const char* vk, int raw_x, int raw_y) {
     s_vk_hold_long = false;
     s_vk_hold_long_consumed = false;
     HapticBeginPress();
-    ESP_LOGI(TAG, "cover key [%s] down raw=(%d,%d)", vk, raw_x, raw_y);
+    ESP_LOGD(TAG, "cover key [%s] down raw=(%d,%d)", vk, raw_x, raw_y);
 }
 
 static void OnTouchSample(uint8_t count, int raw_x, int raw_y, int lx, int ly) {
@@ -110,7 +111,7 @@ static void OnTouchSample(uint8_t count, int raw_x, int raw_y, int lx, int ly) {
             const int64_t elapsed_ms = (esp_timer_get_time() - s_vk_hold_down_us) / 1000;
             if (elapsed_ms >= TOUCH_VK_LONG_MS) {
                 s_vk_hold_long = true;
-                ESP_LOGI(TAG, "cover key [%s] long-press", s_vk_hold_name);
+                ESP_LOGD(TAG, "cover key [%s] long-press", s_vk_hold_name);
                 s_vk_hold_long_consumed = VkKey_OnLongPress(s_vk_hold_name);
                 if (s_vk_hold_long_consumed) {
                     HapticPulseIfEnabled();
@@ -133,7 +134,7 @@ static void OnTouchSample(uint8_t count, int raw_x, int raw_y, int lx, int ly) {
         s_ui_finger_down = true;
         HapticBeginPress();
         HapticTryPulseAtUiPoint(static_cast<int16_t>(ux), static_cast<int16_t>(uy));
-        ESP_LOGI(TAG, "touch down ui=%d,%d", ux, uy);
+        ESP_LOGD(TAG, "touch down ui=%d,%d", ux, uy);
     }
 }
 

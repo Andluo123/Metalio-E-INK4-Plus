@@ -1,5 +1,13 @@
+#include "sdkconfig.h"
 #include "ota.h"
+#include "display/epd_flash_guard.h"
+#ifdef CONFIG_BOARD_TYPE_METALIO_E_INK4_PLUS
+#include "boards/common/sensor/pcf8563.h"
+#include "boards/metalio-e-ink4-plus/bus/metalio_i2c1.h"
+#endif
 #include "api_endpoints.h"
+#include "application.h"
+#include "chat_cloud.h"
 #include "api_http.h"
 #include "system_info.h"
 #include "settings.h"
@@ -7,6 +15,7 @@
 
 #include <cJSON.h>
 #include <esp_log.h>
+#include <esp_http_client.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
@@ -19,6 +28,7 @@
 #endif
 
 #include <cstdio>
+#include <esp_heap_caps.h>
 #include <cstring>
 #include <vector>
 #include <sstream>
@@ -26,6 +36,25 @@
 #include <sys/stat.h>
 
 #define TAG "Ota"
+
+namespace {
+template <typename Operation>
+auto WithOtaFlashAccess(Operation operation) {
+    EpdFlashGuard guard;
+#ifdef CONFIG_BOARD_TYPE_METALIO_E_INK4_PLUS
+    // Lock order: waveform/flash gate -> I2C1. The display uses the same order.
+    // Block new touch/gauge/TPS commands only during the actual flash operation,
+    // never during network waits or while posting LVGL callbacks.
+    if (!metalio_i2c1_lock_for_flash(-1)) {
+        return ESP_ERR_NO_MEM;
+    }
+    struct ReleaseI2c {
+        ~ReleaseI2c() { metalio_i2c1_unlock(); }
+    } release_i2c;
+#endif
+    return operation();
+}
+} // namespace
 
 
 Ota::Ota() {
@@ -47,30 +76,8 @@ Ota::~Ota() {
 }
 
 std::string Ota::GetCheckVersionUrl() {
-    // 空白开源版必须强制返回空串，不能继续读取旧 NVS 中残留的 ota_url。
-    if (!api::HasDefaultOtaUrl()) {
-        return std::string();
-    }
-
-    Settings settings("wifi", false);
-    std::string url = settings.GetString("ota_url");
-    if (url.empty()) {
-        return api::kDefaultOtaUrl;
-    }
-
-    // 兼容 UI/串口可能写入空白字符或旧值；只要字符串被视为空，就按默认地址兜底。
-    auto is_blank = [](const std::string& s) {
-        for (unsigned char ch : s) {
-            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
-                return false;
-            }
-        }
-        return true;
-    };
-    if (is_blank(url)) {
-        return std::string();
-    }
-    return url;
+    // Firmware updates always use our own endpoint, regardless of chat provider.
+    return api::HasDefaultOtaUrl() ? api::kDefaultOtaUrl : std::string();
 }
 
 std::unique_ptr<Http> Ota::SetupHttp() {
@@ -83,7 +90,6 @@ std::unique_ptr<Http> Ota::SetupHttp() {
     http->SetHeader("Client-Id", board.GetUuid());
     if (has_serial_number_) {
         http->SetHeader("Serial-Number", serial_number_.c_str());
-        ESP_LOGI(TAG, "Setup HTTP, User-Agent: %s, Serial-Number: %s", user_agent.c_str(), serial_number_.c_str());
     }
     http->SetHeader("User-Agent", user_agent);
     http->SetHeader("Accept-Language", Lang::CODE);
@@ -95,39 +101,93 @@ std::unique_ptr<Http> Ota::SetupHttp() {
  * Specification: https://ccnphfhqs21z.feishu.cn/wiki/FjW6wZmisimNBBkov6OcmfvknVd
  */
 esp_err_t Ota::CheckVersion() {
+    return CheckResponse(false);
+}
+
+esp_err_t Ota::CheckChatConfiguration() {
+    return CheckResponse(true);
+}
+
+esp_err_t Ota::CheckResponse(bool chat_only) {
+    const int64_t begin = esp_timer_get_time();
+    const int64_t deadline = begin + 30000000;
+    esp_err_t result = ESP_FAIL;
+    auto& board = Board::GetInstance();
+    for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+        if (board.IsWifiConfigMode() || Application::GetInstance().IsActivationPollingPaused()) {
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        const int remaining = int((deadline - esp_timer_get_time()) / 1000);
+        if (remaining <= 0) { result = ESP_ERR_TIMEOUT; break; }
+        if (!board.IsNetworkReady() && !board.EnsureNetworkReady(std::min(remaining, 5000))) {
+            result = ESP_ERR_TIMEOUT;
+        } else {
+            result = CheckResponseOnce(chat_only, std::min(deadline, esp_timer_get_time() + int64_t(8000000)));
+        }
+        const bool transient = result == ESP_FAIL || result == ESP_ERR_TIMEOUT || result == ESP_ERR_INVALID_RESPONSE ||
+            result == ESP_ERR_HTTP_CONNECT || result == ESP_ERR_HTTP_WRITE_DATA || result == ESP_ERR_HTTP_FETCH_HEADER ||
+            result == ESP_ERR_HTTP_EAGAIN || result == ESP_ERR_HTTP_CONNECTION_CLOSED || result == ESP_ERR_HTTP_READ_TIMEOUT ||
+            result == 408 || result == 429 || (result >= 500 && result <= 599);
+        if (result == ESP_OK || !transient || attempt == 3) break;
+        const int delay_ms = attempt * 500;
+        if (deadline - esp_timer_get_time() <= int64_t(delay_ms) * 1000) break;
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+    return result;
+}
+
+esp_err_t Ota::CheckResponseOnce(bool chat_only, int64_t deadline_us) {
+
+    chat_only_ = chat_only;
+    has_new_version_ = false;
+    firmware_version_.clear();
+    firmware_url_.clear();
     auto& board = Board::GetInstance();
     auto app_desc = esp_app_get_description();
 
     // Check if there is a new firmware version available
     current_version_ = app_desc->version;
-    ESP_LOGI(TAG, "Current version: %s", current_version_.c_str());
 
-    std::string url = GetCheckVersionUrl();
+    std::string url = chat_only && chat_cloud::UsesXiaozhiProtocol()
+        ? chat_cloud::ChatOtaUrl() : GetCheckVersionUrl();
     if (url.length() < 10) {
         ESP_LOGE(TAG, "Check version URL is not properly set");
         return ESP_ERR_INVALID_ARG;
     }
 
-    auto http = SetupHttp();
-
     std::string data = board.GetSystemInfoJson();
-    std::string method = data.length() > 0 ? "POST" : "GET";
+    std::string method = data.empty() ? "GET" : "POST";
+    esp_err_t result = ESP_OK;
+    int status_code = -1;
+    auto http = SetupHttp();
+    if (!http) return ESP_ERR_NO_MEM;
+    http->SetHeader("Accept", "*/*");
+    http->SetHeader("Connection", "close");
+    http->SetRequestDeadline(deadline_us);
+    const int remaining_ms = std::max(1, int((deadline_us - esp_timer_get_time()) / 1000));
+    http->SetTimeout(remaining_ms);
     http->SetContent(std::move(data));
-
-    if (!http->Open(method, url)) {
-        int last_error = http->GetLastError();
-        ESP_LOGE(TAG, "Failed to open HTTP connection, code=0x%x", last_error);
-        return last_error;
+    if (esp_timer_get_time() >= deadline_us) {
+        result = ESP_ERR_TIMEOUT;
+    } else if (!http->Open(method, url)) {
+        result = esp_timer_get_time() >= deadline_us ? ESP_ERR_TIMEOUT : ESP_FAIL;
+    } else {
+        status_code = http->GetStatusCode();
+        if (status_code <= 0) {
+            result = esp_timer_get_time() >= deadline_us ? ESP_ERR_TIMEOUT : ESP_FAIL;
+        } else {
+            data = http->ReadAll();
+            if (data.empty()) result = esp_timer_get_time() >= deadline_us ? ESP_ERR_TIMEOUT : ESP_ERR_INVALID_RESPONSE;
+        }
     }
-
-    auto status_code = http->GetStatusCode();
+    if (result != ESP_OK) data.clear();
+    http->Close();
+    if (result != ESP_OK) return result;
     if (status_code != 200) {
         ESP_LOGE(TAG, "Failed to check version, status code: %d", status_code);
         return status_code;
     }
-
-    data = http->ReadAll();
-    http->Close();
 
     // Response: { "firmware": { "version": "1.0.0", "url": "http://" } }
     // Parse the JSON response and check if the version is newer
@@ -138,101 +198,117 @@ esp_err_t Ota::CheckVersion() {
         ESP_LOGE(TAG, "Failed to parse JSON response");
         return ESP_ERR_INVALID_RESPONSE;
     }
-
     has_activation_code_ = false;
     has_activation_challenge_ = false;
-    cJSON *activation = cJSON_GetObjectItem(root, "activation");
-    if (cJSON_IsObject(activation)) {
-        cJSON* message = cJSON_GetObjectItem(activation, "message");
-        if (cJSON_IsString(message)) {
-            activation_message_ = message->valuestring;
-        }
-        cJSON* code = cJSON_GetObjectItem(activation, "code");
-        if (cJSON_IsString(code)) {
-            activation_code_ = code->valuestring;
-            has_activation_code_ = true;
-        }
-        cJSON* challenge = cJSON_GetObjectItem(activation, "challenge");
-        if (cJSON_IsString(challenge)) {
-            activation_challenge_ = challenge->valuestring;
-            has_activation_challenge_ = true;
-        }
-        cJSON* timeout_ms = cJSON_GetObjectItem(activation, "timeout_ms");
-        if (cJSON_IsNumber(timeout_ms)) {
-            activation_timeout_ms_ = timeout_ms->valueint;
-        }
-    }
-
-    has_mqtt_config_ = false;
-    cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
-    if (cJSON_IsObject(mqtt)) {
-        Settings settings("mqtt", true);
-        cJSON *item = NULL;
-        cJSON_ArrayForEach(item, mqtt) {
-            if (cJSON_IsString(item)) {
-                if (settings.GetString(item->string) != item->valuestring) {
-                    settings.SetString(item->string, item->valuestring);
-                }
-            } else if (cJSON_IsNumber(item)) {
-                if (settings.GetInt(item->string) != item->valueint) {
-                    settings.SetInt(item->string, item->valueint);
-                }
+    // Firmware checks must never supply AI activation or transport configuration.
+    if (chat_only) {
+        cJSON *activation = cJSON_GetObjectItem(root, "activation");
+        if (cJSON_IsObject(activation)) {
+            cJSON* message = cJSON_GetObjectItem(activation, "message");
+            if (cJSON_IsString(message)) {
+                activation_message_ = message->valuestring;
+            }
+            cJSON* code = cJSON_GetObjectItem(activation, "code");
+            if (cJSON_IsString(code)) {
+                activation_code_ = code->valuestring;
+                has_activation_code_ = true;
+            }
+            cJSON* challenge = cJSON_GetObjectItem(activation, "challenge");
+            if (cJSON_IsString(challenge)) {
+                activation_challenge_ = challenge->valuestring;
+                has_activation_challenge_ = true;
+            }
+            cJSON* timeout_ms = cJSON_GetObjectItem(activation, "timeout_ms");
+            if (cJSON_IsNumber(timeout_ms)) {
+                activation_timeout_ms_ = timeout_ms->valueint;
             }
         }
-        has_mqtt_config_ = true;
-    } else {
-        ESP_LOGI(TAG, "No mqtt section found !");
-    }
 
-    has_websocket_config_ = false;
-    cJSON *websocket = cJSON_GetObjectItem(root, "websocket");
-    if (cJSON_IsObject(websocket)) {
-        Settings settings("websocket", true);
-        cJSON *item = NULL;
-        cJSON_ArrayForEach(item, websocket) {
-            if (cJSON_IsString(item)) {
-                if (settings.GetString(item->string) != item->valuestring) {
-                    settings.SetString(item->string, item->valuestring);
-                }
-            } else if (cJSON_IsNumber(item)) {
-                if (settings.GetInt(item->string) != item->valueint) {
-                    settings.SetInt(item->string, item->valueint);
-                }
+        // Drop obsolete Xiaozhi transport credentials when the server switches transport.
+        if (chat_cloud::UsesXiaozhiProtocol()) {
+            if (!cJSON_IsObject(cJSON_GetObjectItem(root, "websocket"))) {
+                Settings settings(chat_cloud::WebsocketNamespace(), true);
+                settings.EraseAll();
+            }
+            if (!cJSON_IsObject(cJSON_GetObjectItem(root, "mqtt"))) {
+                Settings settings(chat_cloud::MqttNamespace(), true);
+                settings.EraseAll();
             }
         }
-        has_websocket_config_ = true;
-    } else {
-        ESP_LOGI(TAG, "No websocket section found!");
-    }
+        has_mqtt_config_ = false;
+        cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
+        if (cJSON_IsObject(mqtt)) {
+            Settings settings(chat_cloud::MqttNamespace(), true);
+            cJSON *item = NULL;
+            cJSON_ArrayForEach(item, mqtt) {
+                if (cJSON_IsString(item)) {
+                    if (settings.GetString(item->string) != item->valuestring) {
+                        settings.SetString(item->string, item->valuestring);
+                    }
+                } else if (cJSON_IsNumber(item)) {
+                    if (settings.GetInt(item->string) != item->valueint) {
+                        settings.SetInt(item->string, item->valueint);
+                    }
+                }
+            }
+            has_mqtt_config_ = true;
+        }
 
-    has_server_time_ = false;
-    cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
-    if (cJSON_IsObject(server_time)) {
-        cJSON *timestamp = cJSON_GetObjectItem(server_time, "timestamp");
-        cJSON *timezone_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
+        has_websocket_config_ = false;
+        cJSON *websocket = cJSON_GetObjectItem(root, "websocket");
+        if (cJSON_IsObject(websocket)) {
+            Settings settings(chat_cloud::WebsocketNamespace(), true);
+            cJSON *item = NULL;
+            cJSON_ArrayForEach(item, websocket) {
+                if (cJSON_IsString(item)) {
+                    if (settings.GetString(item->string) != item->valuestring) {
+                        settings.SetString(item->string, item->valuestring);
+                    }
+                } else if (cJSON_IsNumber(item)) {
+                    if (settings.GetInt(item->string) != item->valueint) {
+                        settings.SetInt(item->string, item->valueint);
+                    }
+                }
+            }
+            has_websocket_config_ = true;
+        } else {
+            ESP_LOGI(TAG, "No websocket section found!");
+        }
+
+        has_server_time_ = false;
+        cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
+        if (cJSON_IsObject(server_time)) {
+            cJSON *timestamp = cJSON_GetObjectItem(server_time, "timestamp");
+            cJSON *timezone_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
         
-        if (cJSON_IsNumber(timestamp)) {
-            // 设置系统时间
-            struct timeval tv;
-            double ts = timestamp->valuedouble;
+            if (cJSON_IsNumber(timestamp)) {
+                // 设置系统时间
+                struct timeval tv;
+                double ts = timestamp->valuedouble;
             
-            // 如果有时区偏移，计算本地时间
-            if (cJSON_IsNumber(timezone_offset)) {
-                ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+                // 如果有时区偏移，计算本地时间
+                if (cJSON_IsNumber(timezone_offset)) {
+                    ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+                }
+            
+                tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
+                tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
+                has_server_time_ = settimeofday(&tv, NULL) == 0;
+#ifdef CONFIG_BOARD_TYPE_METALIO_E_INK4_PLUS
+                if (has_server_time_ && !Pcf8563::GetInstance().SyncSystemToRtc()) {
+                    ESP_LOGW(TAG, "Server time applied but RTC writeback failed");
+                }
+#endif
             }
-            
-            tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
-            tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
-            settimeofday(&tv, NULL);
-            has_server_time_ = true;
+        } else {
+            ESP_LOGW(TAG, "No server_time section found!");
         }
-    } else {
-        ESP_LOGW(TAG, "No server_time section found!");
-    }
 
+    }
     has_new_version_ = false;
     cJSON *firmware = cJSON_GetObjectItem(root, "firmware");
-    if (cJSON_IsObject(firmware)) {
+    // Only our firmware check can supply an upgrade version and download URL.
+    if (!chat_only && cJSON_IsObject(firmware)) {
         cJSON *version = cJSON_GetObjectItem(firmware, "version");
         if (cJSON_IsString(version)) {
             firmware_version_ = version->valuestring;
@@ -247,12 +323,10 @@ esp_err_t Ota::CheckVersion() {
             has_new_version_ = IsNewVersionAvailable(current_version_, firmware_version_);
             if (has_new_version_) {
                 ESP_LOGI(TAG, "New version available: %s", firmware_version_.c_str());
-            } else {
-                ESP_LOGI(TAG, "Current is the latest version");
             }
             // 忽略服务端 firmware.force：仅按版本比较决定是否提示升级
         }
-    } else {
+    } else if (!chat_only) {
         ESP_LOGW(TAG, "No firmware section found!");
     }
 
@@ -267,7 +341,6 @@ void Ota::MarkCurrentVersionValid() {
         return;
     }
 
-    ESP_LOGI(TAG, "Running partition: %s", partition->label);
     esp_ota_img_states_t state;
     if (esp_ota_get_state_partition(partition, &state) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to get state of partition");
@@ -276,13 +349,20 @@ void Ota::MarkCurrentVersionValid() {
 
     if (state == ESP_OTA_IMG_PENDING_VERIFY) {
         ESP_LOGI(TAG, "Marking firmware as valid");
-        esp_ota_mark_app_valid_cancel_rollback();
+        WithOtaFlashAccess([&]() { return esp_ota_mark_app_valid_cancel_rollback(); });
     }
 }
 
 bool Ota::Upgrade(const std::string& firmware_url) {
-    ESP_LOGD(TAG, "Upgrading firmware from %s", firmware_url.c_str());
     esp_ota_handle_t update_handle = 0;
+    struct AbortIncompleteOta {
+        esp_ota_handle_t& handle;
+        ~AbortIncompleteOta() {
+            if (handle != 0) {
+                WithOtaFlashAccess([&]() { return esp_ota_abort(handle); });
+            }
+        }
+    } abort_incomplete{update_handle};
     auto update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
         ESP_LOGE(TAG, "Failed to get update partition");
@@ -291,7 +371,6 @@ bool Ota::Upgrade(const std::string& firmware_url) {
 
     ESP_LOGI(TAG, "Writing to partition %s at offset 0x%lx", update_partition->label, update_partition->address);
     bool image_header_checked = false;
-    std::string image_header;
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
@@ -300,25 +379,45 @@ bool Ota::Upgrade(const std::string& firmware_url) {
         return false;
     }
 
-    if (http->GetStatusCode() != 200) {
-        ESP_LOGE(TAG, "Failed to get firmware, status code: %d", http->GetStatusCode());
+    const int status = http->GetStatusCode();
+    if (status != 200) {
+        ESP_LOGE(TAG, "Failed to get firmware, status code: %d", status);
         return false;
     }
 
     size_t content_length = http->GetBodyLength();
-    if (content_length == 0) {
-        ESP_LOGE(TAG, "Failed to get content length");
+    if (content_length == 0 || content_length > update_partition->size) {
+        ESP_LOGE(TAG, "Invalid firmware size: %u (partition %lu)",
+                 static_cast<unsigned>(content_length), update_partition->size);
         return false;
     }
 
-    char buffer[512];
+    constexpr size_t kBufferSize = 8192;
+    std::unique_ptr<char, decltype(&heap_caps_free)> buffer(
+        static_cast<char*>(heap_caps_malloc(kBufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+        &heap_caps_free);
+    if (!buffer) {
+        ESP_LOGE(TAG, "Failed to allocate OTA buffer");
+        return false;
+    }
+    size_t buffered = 0;
     size_t total_read = 0, recent_read = 0;
     auto last_calc_time = esp_timer_get_time();
     while (true) {
-        int ret = http->Read(buffer, sizeof(buffer));
+        int ret = http->Read(buffer.get() + buffered, kBufferSize - buffered);
         if (ret < 0) {
             ESP_LOGE(TAG, "Failed to read HTTP data: %s", esp_err_to_name(ret));
             return false;
+        }
+
+        buffered += static_cast<size_t>(ret);
+        if (ret == 0 && image_header_checked && total_read == content_length && buffered > 0) {
+            const auto tail_err = WithOtaFlashAccess([&]() { return esp_ota_write(update_handle, buffer.get(), buffered); });
+            if (tail_err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to write OTA tail: %s", esp_err_to_name(tail_err));
+                return false;
+            }
+            buffered = 0;
         }
 
         // Calculate speed and progress every second
@@ -338,35 +437,53 @@ bool Ota::Upgrade(const std::string& firmware_url) {
             break;
         }
 
-        if (!image_header_checked) {
-            image_header.append(buffer, ret);
-            if (image_header.size() >= sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
-                esp_app_desc_t new_app_info;
-                memcpy(&new_app_info, image_header.data() + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t), sizeof(esp_app_desc_t));
-                
-                auto current_version = esp_app_get_description()->version;
-                ESP_LOGI(TAG, "Current version: %s, New version: %s", current_version, new_app_info.version);
-
-                if (esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle)) {
-                    esp_ota_abort(update_handle);
-                    ESP_LOGE(TAG, "Failed to begin OTA");
-                    return false;
-                }
-
-                image_header_checked = true;
-                std::string().swap(image_header);
-            }
+        if (total_read > content_length) {
+            ESP_LOGE(TAG, "Firmware exceeds advertised length");
+            return false;
         }
-        auto err = esp_ota_write(update_handle, buffer, ret);
+        if (!image_header_checked) {
+            constexpr size_t kHeaderNeed = sizeof(esp_image_header_t) +
+                sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t);
+            if (buffered < kHeaderNeed) {
+                continue; // A TCP read may return less than the complete image header.
+            }
+            esp_image_header_t header{};
+            memcpy(&header, buffer.get(), sizeof(header));
+            esp_app_desc_t new_app_info{};
+            memcpy(&new_app_info, buffer.get() + sizeof(esp_image_header_t) +
+                   sizeof(esp_image_segment_header_t), sizeof(new_app_info));
+            if (header.magic != ESP_IMAGE_HEADER_MAGIC || new_app_info.magic_word != ESP_APP_DESC_MAGIC_WORD) {
+                ESP_LOGE(TAG, "Invalid firmware image header");
+                return false;
+            }
+            // SDK 按固件长度预擦除：对齐区域使用 64 KiB 块，尾部按扇区处理。
+            const auto begin_err = WithOtaFlashAccess([&]() {
+                return esp_ota_begin(update_partition, content_length, &update_handle);
+            });
+            if (begin_err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to begin OTA: %s", esp_err_to_name(begin_err));
+                return false;
+            }
+            image_header_checked = true;
+        }
+        // 复用读取缓冲，攒满后写入；尾部在正常 EOF 时写入。
+        if (buffered < kBufferSize) continue;
+        auto err = WithOtaFlashAccess([&]() { return esp_ota_write(update_handle, buffer.get(), buffered); });
+        buffered = 0;
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to write OTA data: %s", esp_err_to_name(err));
-            esp_ota_abort(update_handle);
             return false;
         }
     }
     http->Close();
 
-    esp_err_t err = esp_ota_end(update_handle);
+    if (!image_header_checked || total_read != content_length) {
+        ESP_LOGE(TAG, "Incomplete firmware: %u/%u", static_cast<unsigned>(total_read),
+                 static_cast<unsigned>(content_length));
+        return false;
+    }
+    esp_err_t err = WithOtaFlashAccess([&]() { return esp_ota_end(update_handle); });
+    update_handle = 0; // esp_ota_end consumes the handle on both success and failure.
     if (err != ESP_OK) {
         if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
             ESP_LOGE(TAG, "Image validation failed, image is corrupted");
@@ -376,7 +493,7 @@ bool Ota::Upgrade(const std::string& firmware_url) {
         return false;
     }
 
-    err = esp_ota_set_boot_partition(update_partition);
+    err = WithOtaFlashAccess([&]() { return esp_ota_set_boot_partition(update_partition); });
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set boot partition: %s", esp_err_to_name(err));
         return false;
@@ -473,7 +590,7 @@ bool Ota::UpgradeFromFile(const std::string& path) {
             ESP_LOGE(TAG, "Unexpected EOF reading firmware (%u/%u)",
                      static_cast<unsigned>(total_read), static_cast<unsigned>(content_length));
             if (update_handle != 0) {
-                esp_ota_abort(update_handle);
+                WithOtaFlashAccess([&]() { return esp_ota_abort(update_handle); });
             }
             fclose(f);
             return false;
@@ -504,21 +621,19 @@ bool Ota::UpgradeFromFile(const std::string& path) {
                    image_header.data() + sizeof(esp_image_header_t) +
                        sizeof(esp_image_segment_header_t),
                    sizeof(esp_app_desc_t));
-            ESP_LOGI(TAG, "Current version: %s, New version: %s",
-                     esp_app_get_description()->version, new_app_info.version);
 
-            if (esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle) !=
+            if (WithOtaFlashAccess([&]() { return esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle); }) !=
                 ESP_OK) {
                 ESP_LOGE(TAG, "Failed to begin OTA");
-                esp_ota_abort(update_handle);
+                WithOtaFlashAccess([&]() { return esp_ota_abort(update_handle); });
                 fclose(f);
                 return false;
             }
 
-            auto err = esp_ota_write(update_handle, image_header.data(), image_header.size());
+            auto err = WithOtaFlashAccess([&]() { return esp_ota_write(update_handle, image_header.data(), image_header.size()); });
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to write OTA header: %s", esp_err_to_name(err));
-                esp_ota_abort(update_handle);
+                WithOtaFlashAccess([&]() { return esp_ota_abort(update_handle); });
                 fclose(f);
                 return false;
             }
@@ -527,10 +642,10 @@ bool Ota::UpgradeFromFile(const std::string& path) {
             continue;
         }
 
-        auto err = esp_ota_write(update_handle, buffer, n);
+        auto err = WithOtaFlashAccess([&]() { return esp_ota_write(update_handle, buffer, n); });
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to write OTA data: %s", esp_err_to_name(err));
-            esp_ota_abort(update_handle);
+            WithOtaFlashAccess([&]() { return esp_ota_abort(update_handle); });
             fclose(f);
             return false;
         }
@@ -542,7 +657,7 @@ bool Ota::UpgradeFromFile(const std::string& path) {
         return false;
     }
 
-    esp_err_t err = esp_ota_end(update_handle);
+    esp_err_t err = WithOtaFlashAccess([&]() { return esp_ota_end(update_handle); });
     if (err != ESP_OK) {
         if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
             ESP_LOGE(TAG, "Image validation failed, image is corrupted");
@@ -552,7 +667,7 @@ bool Ota::UpgradeFromFile(const std::string& path) {
         return false;
     }
 
-    err = esp_ota_set_boot_partition(update_partition);
+    err = WithOtaFlashAccess([&]() { return esp_ota_set_boot_partition(update_partition); });
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set boot partition: %s", esp_err_to_name(err));
         return false;
@@ -622,22 +737,21 @@ std::string Ota::GetActivationPayload() {
     cJSON_free(json_str);
     cJSON_Delete(payload);
 
-    ESP_LOGI(TAG, "Activation payload: %s", json.c_str());
     return json;
 }
 
 esp_err_t Ota::Activate() {
+    if (Application::GetInstance().IsActivationPollingPaused()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!has_activation_challenge_) {
         ESP_LOGW(TAG, "No activation challenge found");
         return ESP_FAIL;
     }
 
-    std::string url = GetCheckVersionUrl();
-    if (url.back() != '/') {
-        url += "/activate";
-    } else {
-        url += "activate";
-    }
+    std::string url = chat_cloud::ActivationUrl(chat_only_ && chat_cloud::UsesXiaozhiProtocol()
+        ? chat_cloud::ChatOtaUrl() : GetCheckVersionUrl());
+    if (url.empty()) { return ESP_ERR_INVALID_ARG; }
 
     auto http = SetupHttp();
 
@@ -650,12 +764,12 @@ esp_err_t Ota::Activate() {
     }
     
     auto status_code = http->GetStatusCode();
+    const auto response_body = http->ReadAll();
     if (status_code == 202) {
         http->Close();
         return ESP_ERR_TIMEOUT;
     }
     if (status_code != 200) {
-        ESP_LOGE(TAG, "Failed to activate, code: %d, body: %s", status_code, http->ReadAll().c_str());
         http->Close();
         return ESP_FAIL;
     }

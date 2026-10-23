@@ -29,7 +29,7 @@ public:
     UsbVirtualDisk(const UsbVirtualDisk&) = delete;
     UsbVirtualDisk& operator=(const UsbVirtualDisk&) = delete;
 
-    // 创建 worker；启动时保持 USJ。可重复调用。
+    /** @brief 初始化请求队列并保持 USJ；业务请求到来时才创建工作任务。 */
     void Init();
 
     bool IsSupported() const;

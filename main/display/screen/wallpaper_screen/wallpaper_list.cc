@@ -1,3 +1,5 @@
+#include "epd_content_policy.h"
+#include "epd_refresh.h"
 #include "wallpaper_screen/wallpaper_list.h"
 #include "wallpaper_screen/wallpaper_screen_priv.h"
 #include "wallpaper_screen/wallpaper_active.h"
@@ -5,6 +7,7 @@
 #include "wallpaper_screen/wallpaper_ui_helpers.h"
 
 #include <lvgl.h>
+#include <atomic>
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -209,18 +212,73 @@ void DetachRasterUsers() {
     }
 }
 
-// 只保留当前页缩略图，翻页时释放其他缓存。
-void ClearOffPageThumbs() {
-    if (Wallpaper_State().list.list_per_page <= 0 || Wallpaper_State().list.thumbs.empty()) {
-        return;
+lv_obj_t* FindCell(int index) {
+    if (Wallpaper_State().ui.list_host == nullptr || !lv_obj_is_valid(Wallpaper_State().ui.list_host)) {
+        return nullptr;
     }
-    const int start = Wallpaper_State().list.list_page * Wallpaper_State().list.list_per_page;
-    const int end = start + Wallpaper_State().list.list_per_page;
-    for (int i = 0; i < static_cast<int>(Wallpaper_State().list.thumbs.size()); ++i) {
-        if (i < start || i >= end) {
-            Wallpaper_State().list.thumbs[static_cast<size_t>(i)].reset();
+    const uint32_t n = lv_obj_get_child_count(Wallpaper_State().ui.list_host);
+    for (uint32_t i = 0; i < n; ++i) {
+        lv_obj_t* cell = lv_obj_get_child(Wallpaper_State().ui.list_host, i);
+        if (cell != nullptr &&
+            static_cast<int>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(cell))) == index) {
+            return cell;
         }
     }
+    return nullptr;
+}
+
+void StripCellThumb(lv_obj_t* cell) {
+    uint32_t i = 0;
+    while (i < lv_obj_get_child_count(cell)) {
+        lv_obj_t* child = lv_obj_get_child(cell, i);
+        if (child != nullptr &&
+            (lv_obj_check_type(child, &lv_image_class) || lv_obj_check_type(child, &lv_label_class))) {
+            lv_obj_delete(child);
+            continue;
+        }
+        ++i;
+    }
+}
+
+void ShowCellStatus(lv_obj_t* cell, const char* text) {
+    lv_obj_t* lbl = lv_label_create(cell);
+    lv_label_set_text(lbl, text);
+    // 布局前单元格尺寸尚未确定，使用网格宽度计算可用区域，避免负宽裁切。
+    lv_obj_set_style_text_font(lbl, Wallpaper_UiFont(), 0);
+    lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(lbl);
+    lv_obj_move_to_index(lbl, 0);
+    lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+}
+
+void PaintCellThumb(int index) {
+    lv_obj_t* cell = FindCell(index);
+    if (cell == nullptr || !lv_obj_is_valid(cell)) {
+        return;
+    }
+    StripCellThumb(cell);
+    if (index < 0 || index >= static_cast<int>(Wallpaper_State().list.thumbs.size())) {
+        ShowCellStatus(cell, Lang::Strings::WALLPAPER_LOADING);
+        return;
+    }
+    reader::RasterImage* img = Wallpaper_State().list.thumbs[static_cast<size_t>(index)].get();
+    if (img == nullptr) {
+        ShowCellStatus(cell, Lang::Strings::WALLPAPER_LOADING);
+        return;
+    }
+    if (img->empty()) {
+        ShowCellStatus(cell, Lang::Strings::WALLPAPER_DECODE_FAIL);
+        return;
+    }
+    img->BindDsc();
+    lv_obj_t* thumb = lv_image_create(cell);
+    lv_image_set_src(thumb, &img->dsc);
+    EpdSetContentRole(thumb, EpdContentRole::WallpaperThumbnail);
+    lv_obj_set_size(thumb, img->width, img->height);
+    lv_obj_center(thumb);
+    lv_obj_move_to_index(thumb, 0);
+    lv_obj_clear_flag(thumb, LV_OBJ_FLAG_CLICKABLE);
 }
 
 // 网格单元格：封面、启用状态角标和多选勾选框。
@@ -244,16 +302,7 @@ lv_obj_t* CreateGridCell(lv_obj_t* parent, int index, lv_coord_t cell_w, lv_coor
     lv_obj_add_event_cb(cell, Wallpaper_OnRowLongPressed, LV_EVENT_LONG_PRESSED,
                         reinterpret_cast<void*>(static_cast<intptr_t>(index)));
 
-    if (index >= 0 && index < static_cast<int>(Wallpaper_State().list.thumbs.size()) &&
-        Wallpaper_State().list.thumbs[static_cast<size_t>(index)] != nullptr &&
-        !Wallpaper_State().list.thumbs[static_cast<size_t>(index)]->empty()) {
-        lv_obj_t* thumb = lv_image_create(cell);
-        lv_image_set_src(thumb, &Wallpaper_State().list.thumbs[static_cast<size_t>(index)]->dsc);
-        lv_obj_set_size(thumb, Wallpaper_State().list.thumbs[static_cast<size_t>(index)]->width,
-                        Wallpaper_State().list.thumbs[static_cast<size_t>(index)]->height);
-        lv_obj_center(thumb);
-        lv_obj_clear_flag(thumb, LV_OBJ_FLAG_CLICKABLE);
-    }
+    PaintCellThumb(index);
 
     if (index >= 0 && index < static_cast<int>(Wallpaper_State().list.files.size())) {
         const char* name = Wallpaper_State().list.files[static_cast<size_t>(index)].name;
@@ -305,7 +354,7 @@ lv_obj_t* CreateGridCell(lv_obj_t* parent, int index, lv_coord_t cell_w, lv_coor
     return cell;
 }
 
-void RebuildListPageInternal(bool schedule_thumbs) {
+void RebuildListPageInternal() {
     if (!Wallpaper_State().screen_alive || Wallpaper_State().ui.list_host == nullptr) {
         return;
     }
@@ -327,6 +376,7 @@ void RebuildListPageInternal(bool schedule_thumbs) {
             lv_label_set_text(Wallpaper_State().ui.page_lbl, "1/1");
         }
         RefreshWpFooterMode();
+        CancelThumbFill();
         return;
     }
     if (Wallpaper_State().list.files.empty()) {
@@ -338,16 +388,13 @@ void RebuildListPageInternal(bool schedule_thumbs) {
             lv_label_set_text(Wallpaper_State().ui.page_lbl, "1/1");
         }
         RefreshWpFooterMode();
+        CancelThumbFill();
         return;
     }
 
     Wallpaper_ClampListPage();
     SyncWpSelectedSize();
-    if (schedule_thumbs) {
-        ClearOffPageThumbs();
-        // 本页同步解码：墨水屏一次刷出封面，避免白格后再二次全刷
-        FillPageThumbsSync(Wallpaper_State().list.list_page);
-    }
+    // 跨页保留已解码缩略图，避免返回上一页时重复解码。
     const lv_coord_t cell_w = Wallpaper_State().list.grid_cell_w;
     const lv_coord_t cover_h = Wallpaper_State().list.grid_cover_h;
     const int start = Wallpaper_State().list.list_page * Wallpaper_State().list.list_per_page;
@@ -361,22 +408,35 @@ void RebuildListPageInternal(bool schedule_thumbs) {
         lv_label_set_text(Wallpaper_State().ui.page_lbl, foot);
     }
     RefreshWpFooterMode();
-    if (schedule_thumbs) {
-        ScheduleThumbFill();  // 已同步填满时为空操作；失败槽位仍可后台补
-    }
+    // 页面帧提交后再启动解码，避免缩略图任务延迟页面清屏。
+    EpdAfterNextSubmit(ScheduleThumbFill);
 }
 
 void RebuildListPage() {
-    RebuildListPageInternal(true);
+    RebuildListPageInternal();
 }
+
+static std::atomic<bool> s_wallpaper_screen_change{false};
 
 void PaintWallpaperList() {
     ESP_LOGI(TAG, "async RebuildListPage page=%d/%d begin", Wallpaper_State().list.list_page + 1, Wallpaper_ListPageCount());
     RebuildListPage();
+    if (s_wallpaper_screen_change.exchange(false)) {
+        Wallpaper_RevealAfterWhite();
+    }
     ESP_LOGI(TAG, "async RebuildListPage done");
 }
 
-void RequestWallpaperListRebuild() {
+void Wallpaper_RevealAfterWhite() {
+    EpdCancelPageTurn();
+    EpdRequestScreenChange();
+    if (Wallpaper_State().ui.screen != nullptr) {
+        lv_obj_invalidate(Wallpaper_State().ui.screen);
+    }
+}
+
+void RequestWallpaperListRebuild(bool screen_change) {
+    if (screen_change) s_wallpaper_screen_change.store(true);
     if (Wallpaper_State().wallpaper_paint.paint == nullptr) {
         Wallpaper_State().wallpaper_paint.paint = PaintWallpaperList;
     }

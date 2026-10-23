@@ -18,14 +18,14 @@
 
 static const char *TAG = "a2ui_img_cache";
 
-/** On-disk envelope — raw A2I1 follows (already server-dithered). */
+/** On-disk envelope — raw A2I1 or A2L8 follows (old entries remain readable). */
 #define A2UI_IMG_CACHE_MAGIC   0x43493241u /* 'A2IC' LE */
 #define A2UI_IMG_CACHE_VERSION 1u
 
 /** Soft caps for one boot session (SD is large; keep cache bounded). */
-#define A2UI_IMG_CACHE_MAX_BLOB        (128 * 1024)
+#define A2UI_IMG_CACHE_MAX_BLOB        (1024 * 1024)
 #define A2UI_IMG_CACHE_MAX_FILES       24
-#define A2UI_IMG_CACHE_MAX_TOTAL_BYTES (2 * 1024 * 1024)
+#define A2UI_IMG_CACHE_MAX_TOTAL_BYTES (4 * 1024 * 1024)
 #define A2UI_IMG_CACHE_PATH_MAX        96
 #define A2UI_IMG_CACHE_FS_SLACK        4096u
 #define A2UI_IMG_CACHE_WRITE_CHUNK     4096u

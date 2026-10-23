@@ -30,9 +30,9 @@ AudioDebugger::AudioDebugger() {
             udp_server_addr_.sin_port = htons(port);
             inet_pton(AF_INET, ip.c_str(), &udp_server_addr_.sin_addr);
             
-            ESP_LOGI(TAG, "Initialized server address: %s", CONFIG_AUDIO_DEBUG_UDP_SERVER);
+            ESP_LOGD(TAG, "Initialized server address: %s", CONFIG_AUDIO_DEBUG_UDP_SERVER);
         } else {
-            ESP_LOGW(TAG, "Invalid server address: %s, should be IP:PORT", CONFIG_AUDIO_DEBUG_UDP_SERVER);
+            ESP_LOGD(TAG, "Invalid server address: %s, should be IP:PORT", CONFIG_AUDIO_DEBUG_UDP_SERVER);
             close(udp_sockfd_);
             udp_sockfd_ = -1;
         }
@@ -57,7 +57,7 @@ void AudioDebugger::Feed(const std::vector<int16_t>& data) {
         ssize_t sent = sendto(udp_sockfd_, data.data(), data.size() * sizeof(int16_t), 0,
                              (struct sockaddr*)&udp_server_addr_, sizeof(udp_server_addr_));
         if (sent < 0) {
-            ESP_LOGW(TAG, "Failed to send audio data to %s: %d", CONFIG_AUDIO_DEBUG_UDP_SERVER, errno);
+            ESP_LOGD(TAG, "Failed to send audio data to %s: %d", CONFIG_AUDIO_DEBUG_UDP_SERVER, errno);
         } else {
             ESP_LOGD(TAG, "Sent %d bytes audio data to %s", sent, CONFIG_AUDIO_DEBUG_UDP_SERVER);
         }

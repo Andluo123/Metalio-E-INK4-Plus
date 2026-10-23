@@ -138,6 +138,50 @@ std::string ReadHttpBodyProgress(Http* http, size_t max_bytes, std::string& err_
     return body;
 }
 
+namespace {
+
+// Only allowlisted format labels enter logs; URLs and their query strings never do.
+const char* ResourceFormatForLog(const std::string& value) {
+    const size_t end = value.find_first_of("?#");
+    const std::string path = value.substr(0, end);
+    const size_t dot = path.find_last_of('.');
+    const std::string ext = dot == std::string::npos ? std::string() : path.substr(dot + 1);
+    const char* known[] = {"A2I1", "A2L8", "PNG", "JPEG", "JPG", "EBOOK_V1",
+                           "EBOOK", "EPUB", "TXT", "PDF", "TTF", "OTF", "WOFF", "WOFF2"};
+    for (const char* label : known) {
+        if (strcasecmp(value.c_str(), label) == 0 || strcasecmp(ext.c_str(), label) == 0)
+            return label;
+    }
+    return "unknown";
+}
+
+std::string ResourceNameForLog(const std::string& name) {
+    // Retain only a basename, without query strings, paths or control characters.
+    std::string result = name.substr(0, name.find_first_of("?#"));
+    const size_t slash = result.find_last_of("/\\");
+    if (slash != std::string::npos) result.erase(0, slash + 1);
+    for (char& c : result) {
+        if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) c = ' ';
+    }
+    return result;
+}
+
+void LogResourceSummary(const cJSON* item, const CloudPushResource& res, size_t index) {
+    const char* type = res.type == PushResourceType::kBook ? "BOOK" :
+                       res.type == PushResourceType::kBadge ? "BADGE" : "FONT";
+    const char* format = ResourceFormatForLog(res.format);
+    if (std::strcmp(format, "unknown") == 0) format = ResourceFormatForLog(res.name);
+    const cJSON* width = cJSON_GetObjectItemCaseSensitive(item, "coverWidth");
+    const cJSON* height = cJSON_GetObjectItemCaseSensitive(item, "coverHeight");
+    const int w = cJSON_IsNumber(width) && width->valueint > 0 ? width->valueint : 0;
+    const int h = cJSON_IsNumber(height) && height->valueint > 0 ? height->valueint : 0;
+    ESP_LOGI(TAG, "list item=%u type=%s name=%s file_format=%s cover_format=%s cover_size=%dx%d",
+             static_cast<unsigned>(index), type, ResourceNameForLog(res.name).c_str(),
+             format, ResourceFormatForLog(res.cover_image_url), w, h);
+}
+
+}  // namespace
+
 bool ParsePushResourceObject(const cJSON* obj, CloudPushResource& out) {
     if (obj == nullptr || !cJSON_IsObject(obj)) {
         return false;
@@ -329,13 +373,15 @@ bool FetchPushResources(std::vector<CloudPushResource>& out, std::string& err_ou
         err_out = Lang::Strings::CLOUD_CONN_FAIL;
         return false;
     }
+    DownloadGate::Binding binding;
     Http* http_raw = http.get();
     if (gate != nullptr) {
-        if (!gate->BindHttp(std::move(http))) {
+        if (!gate->BindHttp(http.get())) {
             err_out = Lang::Strings::CLOUD_CANCELLED;
             return false;
         }
     }
+    binding.gate = gate;
 
     const std::string url = api::PushResourcesNextUrl();
     if (url.empty()) {
@@ -345,14 +391,12 @@ bool FetchPushResources(std::vector<CloudPushResource>& out, std::string& err_ou
     http_raw->SetTimeout(kHttpTimeoutMs);
     api::ApplyCommonHeaders(http_raw);
     http_raw->SetContent(std::string());
-    api::LogHttpRequest(TAG, "POST", url);
     ESP_LOGI(TAG, "push resources: Open begin timeout=%dms", kHttpTimeoutMs);
     if (!http_raw->Open("POST", url)) {
         if (gate != nullptr) {
             gate->CloseHttp();
         }
         err_out = gate != nullptr && gate->IsCancelled() ? Lang::Strings::CLOUD_CANCELLED : Lang::Strings::CLOUD_REQUEST_FAIL;
-        api::LogHttpResponse(TAG, -1, err_out);
         return false;
     }
 
@@ -370,10 +414,10 @@ bool FetchPushResources(std::vector<CloudPushResource>& out, std::string& err_ou
     }
     if (!read_err.empty() || body.empty()) {
         err_out = read_err.empty() ? Lang::Strings::CLOUD_REQUEST_FAIL : read_err;
-        api::LogHttpResponse(TAG, status, err_out);
         return false;
     }
-    api::LogHttpResponse(TAG, status, api::RedactClawUrlsForLog(body));
+    ESP_LOGI(TAG, "list response status=%d bytes=%u", status,
+             static_cast<unsigned>(body.size()));
     if (status < 200 || status >= 300) {
         err_out = Lang::Strings::CLOUD_REQUEST_FAIL;
         return false;
@@ -415,6 +459,7 @@ bool FetchPushResources(std::vector<CloudPushResource>& out, std::string& err_ou
             ESP_LOGW(TAG, "skip invalid push resource item");
             continue;
         }
+        LogResourceSummary(item, res, out.size());
         out.push_back(std::move(res));
     }
     cJSON_Delete(root);

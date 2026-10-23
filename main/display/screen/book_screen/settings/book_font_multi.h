@@ -5,9 +5,11 @@
 
 #include <lvgl.h>
 
-/** @brief 预扫 SD 字库列表，打开设置卡时不必再等「加载中」 */
-void ScanReadFonts();
-/** @brief ---------- TTF 导入转换面板（覆盖设置卡；转换 worker 独立，UI 只轮询） ---------- */
+/** @brief 异步刷新字体列表，先显示容器内加载提示，再启动扫描。 */
+void StartReadFontScan();
+/** @brief 作废字体扫描并清理未发布结果，后台任务自行收尾。 */
+void CancelReadFontScan();
+/** @brief 将字体列表页码定位到当前使用的字体。 */
 void EnsureFontListPageShowsSelection();
 /** @brief 当前选中字体在列表中的下标 */
 int CurrentFontIndex();

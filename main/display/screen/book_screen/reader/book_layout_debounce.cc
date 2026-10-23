@@ -4,6 +4,7 @@
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/book_font_runtime.h"
 #include "book_screen/book_geom.h"
+#include "book_screen/book_nav.h"
 #include "book_screen/reader/book_layout_worker.h"
 #include "book_screen/reader/book_toc_footer.h"
 #include "book_screen/reader/book_reader_body.h"
@@ -16,31 +17,29 @@
 #include "lv_adapter_display.h"
 #include "reader/reader.h"
 #include "screen_common.h"
+#include "epd_refresh.h"
 
 void ApplyReaderLayoutLive(bool reload_font) {
     auto& st = Book_State();
-    if (st.reader.opening.load() || !st.reader.session || !st.reader.session->IsOpen()) {
+    if (st.reader.standby_paused) {
+        st.reader.layout_again = true;
+        st.reader.layout_reload_font = st.reader.layout_reload_font || reload_font;
+        return;
+    }
+    if (st.reader.prefs_reopen_pending || st.reader.opening.load() || !st.reader.session || !st.reader.session->IsOpen()) {
         return;
     }
     if (st.reader.viewport_w <= 0 || st.reader.viewport_h <= 0) {
         return;
     }
     const bool layout_running = st.reader.layout_busy.load();
-    // 换字库与 worker 抢 font_：只记 again；边距/行距仍即时刷预览
-    if (layout_running && reload_font) {
+    // 先停止旧编排，再应用新参数，避免两个后台任务并行或共享 font_ 被释放。
+    if (layout_running || st.reader.chapter_pages_busy.load() || st.reader.page_image_busy.load()) {
         st.reader.layout_again = true;
-        st.reader.layout_reload_font = true;
-        return;
-    }
-    if (layout_running) {
-        st.reader.layout_again = true;
-    }
-    // 章节页表后台正用 font_ 计宽：禁止 ReleaseBookFont，否则 InstrFetchProhibited
-    if (reload_font && st.reader.chapter_pages_busy.load()) {
-        st.reader.layout_again = true;
-        st.reader.layout_reload_font = true;
-        st.reader.chapter_pages_again = true;
+        st.reader.layout_reload_font = st.reader.layout_reload_font || reload_font;
+        st.reader.session->AbortTxtPaginate();
         st.reader.session->InvalidateChapterPageTable();
+        st.reader.page_image_abort.store(true);
         return;
     }
 
@@ -69,16 +68,11 @@ void ApplyReaderLayoutLive(bool reload_font) {
         UpdateReadFooter();
     }
 
-    if (st.reader.session->NeedsTxtIndexRebuild() && st.reader.session->LiveRelayoutPending()) {
+    if (st.reader.session->LiveRelayoutPending()) {
         st.reader.layout_anchor = anchor;
-        if (layout_running) {
-            // worker 结束后用最新锚点/参数再全量扫
-            st.reader.layout_again = true;
-        } else {
-            st.reader.layout_again = false;
-            st.reader.layout_reload_font = false;
-            StartLayoutWorker();
-        }
+        st.reader.layout_again = false;
+        st.reader.layout_reload_font = false;
+        StartLayoutWorker();
     } else if (st.reader.session->NeedsChapterPageRebuild()) {
         StartChapterPageWorker();
     }
@@ -98,7 +92,8 @@ bool IsLayoutHintBusy() {
     if (st.reader.chapter_pages_busy.load() || st.reader.layout_busy.load()) {
         return true;
     }
-    return st.reader.session && st.reader.session->IsOpen() && st.reader.session->LiveRelayoutPending();
+    return st.reader.session && st.reader.session->IsOpen() && st.reader.session->LiveRelayoutPending() &&
+        st.reader.session->Error() == reader::BookReadError::kNone;
 }
 
 void StopLayoutHintTimer() {
@@ -111,14 +106,22 @@ void StopLayoutHintTimer() {
 
 void OnLayoutHintTick(lv_timer_t* /*t*/) {
     auto& st = Book_State();
+    if (st.reader.standby_paused) return;
     if (st.reader.page_label == nullptr || !lv_obj_is_valid(st.reader.page_label)) {
         StopLayoutHintTimer();
         return;
     }
-    if (IsLayoutHintBusy()) {
-        UpdateReadFooter();
-        return;
+    if (TouchUiFingerIsDown() || TouchUiHasPendingEdges() ||
+        s_reader_page_delta.load() != 0 || s_reader_paint.seq.load() != s_reader_paint.done.load()) return;
+    if (EpdGetStats().busy) return;
+    if (st.reader.session && st.reader.session->IsOpen() && !st.reader.opening.load() &&
+        !st.reader.layout_again && !st.reader.prefs_reopen_pending &&
+        st.reader.session->PollLayoutProgress()) {
+        if (st.reader.read_chrome == BookUiState::ReadChrome::kToc) RequestRenderTocList();
+        else if (st.reader.read_chrome == BookUiState::ReadChrome::kSettings) RequestSettingsSheetPaint();
     }
+    // 沉浸阅读时只接收状态，底栏随翻页绘制，避免周期更新另占一次刷屏。
+    if (IsLayoutHintBusy()) return;
     if (esp_timer_get_time() < st.reader.layout_hint_done_until_us) {
         UpdateReadFooter();
         return;
@@ -139,7 +142,7 @@ void EnsureLayoutHintTimer() {
 void MarkLayoutHintBusy() {
     auto& st = Book_State();
     st.reader.layout_hint_done_until_us = 0;
-    StopLayoutHintTimer();
+    EnsureLayoutHintTimer();
     UpdateReadFooter();
 }
 
@@ -171,7 +174,7 @@ void OnLayoutDebounceTimer(lv_timer_t* t) {
 
 void ScheduleLayoutApply(bool reload_font) {
     auto& st = Book_State();
-    if (st.reader.opening.load() || !st.reader.session || !st.reader.session->IsOpen()) {
+    if (st.reader.prefs_reopen_pending || st.reader.opening.load() || !st.reader.session || !st.reader.session->IsOpen()) {
         return;
     }
     // prefs/卡文案已由调用方写好；抬起且停顿后再排版（合并为最后一档）

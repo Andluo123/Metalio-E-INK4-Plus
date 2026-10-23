@@ -26,5 +26,7 @@ idf_component_register(
         "esp_driver_uart"
         "esp_pm"
         "esp-tls"
+        "esp_wifi"
+        "esp_netif"
         "pthread"
 )

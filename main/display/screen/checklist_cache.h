@@ -70,6 +70,9 @@ size_t checklist_cache_copy_all(checklist_cache_item_t* out, size_t max_out);
  */
 size_t checklist_cache_copy_pending(checklist_cache_item_t* out, size_t max_out);
 
+/** @brief 持锁统计指定日期（YYYY-MM-DD）的条目与完成数；无缓存返回 false */
+bool checklist_cache_day_counts(const char* date, size_t* total, size_t* done);
+
 #ifdef __cplusplus
 }
 #endif

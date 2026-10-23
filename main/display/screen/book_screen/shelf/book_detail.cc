@@ -51,7 +51,6 @@ lv_obj_t* CreateDetailScreen(int book_index) {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, Book_ListFont(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    Book_DisableScroll(scr);
     st.detail.detail_scr = scr;
     lv_obj_add_event_cb(
         scr,

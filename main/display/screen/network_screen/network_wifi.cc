@@ -63,6 +63,14 @@ void Network_ReleaseUiKeepNet() {
     Network_State().ui_net_held = false;
 }
 
+static void Network_DestroyOwnedNetif() {
+    // esp_wifi_init 失败时也可能已 create_default_wifi_sta；须用 default 析构卸驱动挂接
+    if (Network_State().netif != nullptr) {
+        esp_netif_destroy_default_wifi(Network_State().netif);
+        Network_State().netif = nullptr;
+    }
+}
+
 bool Network_WifiInitForScreen() {
     if (Network_State().wifi_initialized) {
         return true;
@@ -97,7 +105,13 @@ bool Network_WifiInitForScreen() {
         return false;
     }
 
-    Network_State().netif = esp_netif_create_default_wifi_sta();
+    if (Network_State().netif == nullptr) {
+        if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") != nullptr) {
+            ESP_LOGW(TAG, "default STA already belongs to another client");
+            return false;
+        }
+        Network_State().netif = esp_netif_create_default_wifi_sta();
+    }
     if (Network_State().netif == nullptr) {
         ESP_LOGE(TAG, "create sta netif failed");
         return false;
@@ -108,6 +122,7 @@ bool Network_WifiInitForScreen() {
     err = esp_wifi_init(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(err));
+        Network_DestroyOwnedNetif();
         return false;
     }
 
@@ -116,15 +131,28 @@ bool Network_WifiInitForScreen() {
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &Network_WifiEvtHandler, nullptr,
                                               &Network_State().ip_evt_inst);
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    // 驱动已 init：后续失败走完整 Teardown（含 deinit），勿只毁 netif
     Network_State().wifi_initialized = true;
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_mode: %s", esp_err_to_name(err));
+        Network_WifiTeardownForScreen();
+        return false;
+    }
+    err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_wifi_start: %s", esp_err_to_name(err));
+        Network_WifiTeardownForScreen();
+        return false;
+    }
     ESP_LOGI(TAG, "local STA stack ready");
     return true;
 }
 
 void Network_WifiTeardownForScreen() {
+    // wifi_initialized=false 时仍可能残留 netif（init 中途失败）
     if (!Network_State().wifi_initialized) {
+        Network_DestroyOwnedNetif();
         return;
     }
     esp_wifi_scan_stop();
@@ -139,10 +167,7 @@ void Network_WifiTeardownForScreen() {
     }
     esp_wifi_stop();
     esp_wifi_deinit();
-    if (Network_State().netif != nullptr) {
-        esp_netif_destroy(Network_State().netif);
-        Network_State().netif = nullptr;
-    }
+    Network_DestroyOwnedNetif();
     Network_State().wifi_initialized = false;
     if (Network_State().wifi_station_was_active) {
         WifiStation::GetInstance().Start();

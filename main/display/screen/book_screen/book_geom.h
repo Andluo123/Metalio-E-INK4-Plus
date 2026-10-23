@@ -4,6 +4,9 @@
 
 #include "reader/reader.h"
 
+// Offset from the drawable LVGL area's left edge, in display pixels.
+inline constexpr lv_coord_t kReaderVerticalLeftInset = 10;
+
 /** @brief 设置卡片盖在正文上：关掉即可，不必重绘；目录整页需恢复正文 */
 void SyncReaderAaForImmersion(bool immersive);
 /** @brief 把 NVS 排版偏好绑定到 BookSession */

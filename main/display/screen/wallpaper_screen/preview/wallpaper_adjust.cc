@@ -1,3 +1,4 @@
+#include "epd_content_policy.h"
 #include "wallpaper_screen/preview/wallpaper_adjust.h"
 #include "wallpaper_screen/wallpaper_screen_priv.h"
 #include "wallpaper_screen/wallpaper_ui_helpers.h"
@@ -152,6 +153,7 @@ void BindPreviewRasterToImg() {
     Wallpaper_State().preview.raster->BindDsc();
     lv_image_set_scale(Wallpaper_State().ui.preview_img, LV_SCALE_NONE);
     lv_image_set_src(Wallpaper_State().ui.preview_img, &Wallpaper_State().preview.raster->dsc);
+    EpdSetContentRole(Wallpaper_State().ui.preview_img,EpdContentRole::WallpaperPreview);
     lv_obj_set_size(Wallpaper_State().ui.preview_img, Wallpaper_State().preview.raster->width, Wallpaper_State().preview.raster->height);
     lv_obj_clear_flag(Wallpaper_State().ui.preview_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_center(Wallpaper_State().ui.preview_img);

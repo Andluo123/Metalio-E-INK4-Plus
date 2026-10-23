@@ -18,6 +18,7 @@
 
 #include "assets/lang_config.h"
 #include "haptic_feedback.h"
+#include "epd_refresh.h"
 #include "reader/reader.h"
 #include "screen_common.h"
 
@@ -62,7 +63,7 @@ void EnsureDlProgressPageBuilt() {
 
     st.xfer.dl_title_lbl = lv_label_create(card);
     lv_label_set_text(st.xfer.dl_title_lbl, Lang::Strings::CLOUD_SAVING);
-    lv_obj_set_width(st.xfer.dl_title_lbl, LV_HOR_RES - kDialogLabelMargin);
+    lv_obj_set_width(st.xfer.dl_title_lbl, lv_pct(100));
     lv_obj_set_style_text_align(st.xfer.dl_title_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(st.xfer.dl_title_lbl, Cloud_UiFont(), 0);
     lv_obj_set_style_text_color(st.xfer.dl_title_lbl, lv_color_black(), 0);
@@ -70,18 +71,14 @@ void EnsureDlProgressPageBuilt() {
 
     st.xfer.dl_count_lbl = lv_label_create(card);
     lv_label_set_text(st.xfer.dl_count_lbl, Lang::Strings::CLOUD_SAVED_0_1);
-    lv_obj_set_width(st.xfer.dl_count_lbl, LV_HOR_RES - kDialogLabelMargin);
+    lv_obj_set_width(st.xfer.dl_count_lbl, lv_pct(100));
     lv_obj_set_style_text_align(st.xfer.dl_count_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(st.xfer.dl_count_lbl, Cloud_ItemFont(), 0);
     lv_obj_set_style_text_color(st.xfer.dl_count_lbl, lv_color_black(), 0);
     lv_obj_clear_flag(st.xfer.dl_count_lbl, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_coord_t bar_w = kDlBarW;
-    if (bar_w > LV_HOR_RES - kDialogLabelMargin) {
-        bar_w = LV_HOR_RES - kDialogLabelMargin;
-    }
     st.xfer.dl_bar = lv_bar_create(card);
-    lv_obj_set_size(st.xfer.dl_bar, bar_w, kDlBarH);
+    lv_obj_set_size(st.xfer.dl_bar, lv_pct(100), kDlBarH);
     lv_bar_set_range(st.xfer.dl_bar, 0, 100);
     lv_bar_set_value(st.xfer.dl_bar, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(st.xfer.dl_bar, lv_color_white(), LV_PART_MAIN);
@@ -184,6 +181,7 @@ void ShowDlProgressPage() {
 
 void HideDlProgressPage() {
     auto& st = Cloud_State();
+    const bool was_open = st.xfer.dl_page_open;
     st.xfer.dl_page_open = false;
     st.xfer.dl_shown_percent = -1;
     HapticSetZoneEarlyPulseEnabled(true);
@@ -195,6 +193,11 @@ void HideDlProgressPage() {
     }
     if (st.chrome.page_lbl != nullptr && !st.preview.open) {
         lv_obj_clear_flag(st.chrome.page_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (was_open && ScreenAlive()) {
+        EpdCancelPageTurn();
+        EpdRequestScreenChange();
+        lv_obj_invalidate(st.chrome.screen);
     }
 }
 
@@ -327,7 +330,7 @@ void Cloud_OnDeleteClicked(lv_event_t* /*e*/) {
     ScheduleDeleteItems(std::move(items));
 }
 
-void ShowActionDialog(int cloud_index) {
+static void ShowResourceDialog(int cloud_index, bool conflict) {
     auto& st = Cloud_State();
     if (!ScreenAlive() || st.dialogs.action_mask != nullptr || st.dialogs.dialog_mask != nullptr ||
         st.xfer.download_busy || st.data.delete_busy || SyncBusy()) {
@@ -339,15 +342,25 @@ void ShowActionDialog(int cloud_index) {
 
     const reader::CloudPushResource& item = st.data.items[static_cast<size_t>(cloud_index)];
     const lv_coord_t card_w = LV_HOR_RES - kDialogCardMargin;
-    const lv_coord_t text_w = card_w - kActionDialogPadInset;
+    const lv_coord_t text_w = card_w - 2 * (kDialogCardPadSmall + kRowBorderW);
     // 单行省略书名/文件名，避免 WRAP 顶掉底部按钮
     const std::string short_name = EllipsizeText(item.name, Cloud_UiFont(), text_w);
     char title_buf[192];
     std::snprintf(title_buf, sizeof(title_buf), "「%s」\n%s", short_name.c_str(), item.TypeLabel());
-    st.xfer.action_index = cloud_index;
+    if (conflict) {
+        st.xfer.pending_index = cloud_index;
+        const std::string path = item.LocalPath();
+        const std::string filename = EllipsizeText(path.substr(path.find_last_of('/') + 1),
+                                                  Cloud_UiFont(), text_w);
+        std::snprintf(title_buf, sizeof(title_buf), Lang::Strings::CLOUD_CONFLICT_FMT,
+                      filename.c_str());
+    } else {
+        st.xfer.action_index = cloud_index;
+    }
 
     lv_obj_t* mask = lv_obj_create(st.chrome.screen);
-    st.dialogs.action_mask = mask;
+    if (conflict) st.dialogs.dialog_mask = mask;
+    else st.dialogs.action_mask = mask;
     lv_obj_remove_style_all(mask);
     lv_obj_set_size(mask, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_pos(mask, 0, 0);
@@ -355,11 +368,13 @@ void ShowActionDialog(int cloud_index) {
     lv_obj_clear_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(mask, LV_OBJ_FLAG_CLICKABLE);
     HapticAttachClick(mask);
-    lv_obj_add_event_cb(mask, OnActionCancelClicked, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(mask, conflict ? OnDlProgressCancelClicked : OnActionCancelClicked,
+                        LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t* card = lv_obj_create(mask);
     lv_obj_remove_style_all(card);
-    lv_obj_set_size(card, card_w, kActionDialogCardH);
+    lv_obj_set_size(card, card_w, LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(card, UiSy(144), 0);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -368,7 +383,7 @@ void ShowActionDialog(int cloud_index) {
     lv_obj_set_style_radius(card, kRowRadius, 0);
     lv_obj_set_style_pad_all(card, kDialogCardPadSmall, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(card, kDialogRowGapSmall, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -378,7 +393,7 @@ void ShowActionDialog(int cloud_index) {
 
     lv_obj_t* lbl = lv_label_create(card);
     lv_label_set_text(lbl, title_buf);
-    lv_obj_set_width(lbl, text_w);
+    lv_obj_set_width(lbl, lv_pct(100));
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_max_height(lbl, lv_font_get_line_height(Cloud_UiFont()) * 3, 0);
     lv_obj_set_style_text_font(lbl, Cloud_UiFont(), 0);
@@ -388,8 +403,9 @@ void ShowActionDialog(int cloud_index) {
     lv_obj_t* btn_row = lv_obj_create(card);
     lv_obj_remove_style_all(btn_row);
     lv_obj_set_width(btn_row, lv_pct(100));
-    lv_obj_set_height(btn_row, kActionBtnRowH);
-    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_height(btn_row, conflict ? LV_SIZE_CONTENT : kActionBtnRowH);
+    lv_obj_set_flex_flow(btn_row, conflict ? LV_FLEX_FLOW_COLUMN : LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_row(btn_row, kDialogRowGap, 0);
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
@@ -398,7 +414,7 @@ void ShowActionDialog(int cloud_index) {
     auto make_btn = [&](const char* text, lv_event_cb_t cb) {
         lv_obj_t* btn = lv_obj_create(btn_row);
         lv_obj_remove_style_all(btn);
-        lv_obj_set_size(btn, kActionBtnW, kActionBtnH);
+        lv_obj_set_size(btn, conflict ? text_w : kActionBtnW, kActionBtnH);
         lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_style_border_color(btn, lv_color_black(), 0);
@@ -413,8 +429,37 @@ void ShowActionDialog(int cloud_index) {
         lv_obj_center(bl);
         lv_obj_clear_flag(bl, LV_OBJ_FLAG_CLICKABLE);
     };
-    make_btn(Lang::Strings::COMMON_DELETE, Cloud_OnDeleteClicked);
-    make_btn(Lang::Strings::COMMON_CANCEL, OnActionCancelClicked);
+    if (conflict) {
+        make_btn(Lang::Strings::CLOUD_KEEP_BOTH, [](lv_event_t*) {
+            const int index = Cloud_State().xfer.pending_index;
+            CloseDialog();
+            StartResourceDownload(index, CloudSaveChoice::kKeepBoth);
+        });
+        make_btn(Lang::Strings::CLOUD_REPLACE_FILE, [](lv_event_t*) {
+            const int index = Cloud_State().xfer.pending_index;
+            CloseDialog();
+            StartResourceDownload(index, CloudSaveChoice::kReplace);
+        });
+        make_btn(Lang::Strings::CLOUD_SKIP_FILE, [](lv_event_t*) {
+            const int index = Cloud_State().xfer.pending_index;
+            CloseDialog();
+            StartResourceDownload(index, CloudSaveChoice::kSkip);
+        });
+        make_btn(Lang::Strings::COMMON_CANCEL, OnDlProgressCancelClicked);
+        HapticSetZoneEarlyPulseEnabled(false);
+    } else {
+        make_btn(Lang::Strings::COMMON_DELETE, Cloud_OnDeleteClicked);
+        make_btn(Lang::Strings::COMMON_CANCEL, OnActionCancelClicked);
+    }
+    lv_obj_move_foreground(mask);
+}
+
+void ShowActionDialog(int cloud_index) {
+    ShowResourceDialog(cloud_index, false);
+}
+
+void ShowSaveConflictDialog(int cloud_index) {
+    ShowResourceDialog(cloud_index, true);
 }
 
 void CloseDialog() {
@@ -424,5 +469,62 @@ void CloseDialog() {
     }
     st.dialogs.dialog_mask = nullptr;
     st.xfer.pending_index = -1;
+    HapticSetZoneEarlyPulseEnabled(!st.xfer.dl_page_open);
 }
 
+
+void ShowStorageErrorDialog() {
+    auto& st = Cloud_State();
+    if (!ScreenAlive() || st.dialogs.storage_error_mask != nullptr) return;
+    lv_obj_t* mask = lv_obj_create(st.chrome.screen);
+    st.dialogs.storage_error_mask = mask;
+    lv_obj_remove_style_all(mask);
+    lv_obj_set_size(mask, LV_HOR_RES, LV_VER_RES);
+    ScreenApplyDotBackdrop(mask);
+    lv_obj_clear_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(mask, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(mask);
+
+    lv_obj_t* card = lv_obj_create(mask);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, LV_HOR_RES - kDialogCardMargin, LV_SIZE_CONTENT);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_black(), 0);
+    lv_obj_set_style_border_width(card, kRowBorderW, 0);
+    lv_obj_set_style_radius(card, kRowRadius, 0);
+    lv_obj_set_style_pad_all(card, kDialogCardPad, 0);
+    lv_obj_set_style_pad_row(card, kDialogRowGapSmall, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* text = lv_label_create(card);
+    lv_label_set_text(text, "内存卡状态异常，请重启设备后再试");
+    lv_obj_set_width(text, lv_pct(100));
+    lv_obj_set_style_text_font(text, Cloud_UiFont(), 0);
+    lv_obj_set_style_text_color(text, lv_color_black(), 0);
+    lv_obj_set_style_text_align(text, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t* button = lv_obj_create(card);
+    lv_obj_remove_style_all(button);
+    lv_obj_set_size(button, kCancelBtnW, kCancelBtnH);
+    lv_obj_set_style_bg_color(button, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(button, lv_color_black(), 0);
+    lv_obj_set_style_border_width(button, kRowBorderW, 0);
+    lv_obj_set_style_radius(button, kRowRadius, 0);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+    HapticAttachClick(button);
+    lv_obj_add_event_cb(button, [](lv_event_t* e) {
+        lv_obj_remove_flag(static_cast<lv_obj_t*>(lv_event_get_target(e)), LV_OBJ_FLAG_CLICKABLE);
+        Cloud_RebootAfterStorageError();
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* label = lv_label_create(button);
+    lv_label_set_text(label, "重启");
+    lv_obj_set_style_text_font(label, Cloud_UiFont(), 0);
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);
+    lv_obj_center(label);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
+}

@@ -3,6 +3,20 @@
 #include "fontpack_lvgl.h"
 #include "haptic_feedback.h"
 
+void SettingsStyleBrightnessButton(lv_obj_t* button) {
+    lv_obj_set_size(button, kSettingsBrightnessButtonW, kSettingsBrightnessButtonH);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    lv_obj_set_style_radius(button, kSettingsOptionRadius, 0);
+    lv_obj_set_style_border_width(button, kSettingsBorderW, 0);
+    lv_obj_set_style_border_color(button, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(button, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+    auto* label = lv_obj_get_child(button, 0);
+    lv_obj_set_style_text_font(label, fontpack_lv_font_ui(), 0);
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);
+    lv_obj_center(label);
+}
+
 void SettingsStyleSelectable(lv_obj_t* btn, lv_obj_t* lbl, bool selected) {
     lv_obj_set_style_bg_color(btn, selected ? lv_color_black() : lv_color_white(), 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);

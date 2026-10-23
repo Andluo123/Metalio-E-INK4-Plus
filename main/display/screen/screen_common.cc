@@ -6,6 +6,7 @@
 #include "assets/lang_config.h"
 #include "board.h"
 #include "fontpack_lvgl.h"
+#include "epd_refresh.h"
 #include "haptic_feedback.h"
 #include "lv_adapter_epdiy.h"
 #include "network_screen/network_screen.h"
@@ -22,6 +23,39 @@ LV_FONT_DECLARE(font_awesome_30_1);
 bool ScreenCommon_on_home = true;
 ScreenFactory ScreenCommon_back_stack[kMaxBack] = {};
 int ScreenCommon_back_depth = 0;
+
+namespace {
+lv_timer_t* navigation_retry = nullptr;
+lv_obj_t* navigation_origin = nullptr;
+void (*pending_navigation)(void*) = nullptr;
+
+// Keep navigation on the LVGL thread, without rebuilding a screen while the
+// two LCD feeder tasks are still publishing the previous waveform's rows.
+bool DeferNavigationWhileRefreshing(void (*navigate)(void*)) {
+    if (!EpdGetStats().busy && pending_navigation == nullptr) return false;
+    if (navigation_retry == nullptr) {
+        navigation_retry = lv_timer_create([](lv_timer_t* timer) {
+            if (EpdGetStats().busy) return;
+            auto callback = pending_navigation;
+            auto* origin = navigation_origin;
+            pending_navigation = nullptr;
+            navigation_origin = nullptr;
+            lv_timer_pause(timer);
+            // A different navigation may have completed during the wait.
+            if (callback != nullptr && origin == lv_screen_active()) callback(nullptr);
+        }, 20, nullptr);
+        if (navigation_retry == nullptr) {
+            ESP_LOGW(TAG, "cannot defer navigation while refreshing");
+            return true;
+        }
+    }
+    // Repeated back presses during one waveform produce one navigation.
+    if (pending_navigation != ScreenCommon_GoHomeAsync) pending_navigation = navigate;
+    navigation_origin = lv_screen_active();
+    lv_timer_resume(navigation_retry);
+    return true;
+}
+} // namespace
 
 LVAdapterDisplay* ScreenCommon_GetAdapterDisplay() {
     return LVAdapterDisplay::Instance();
@@ -78,11 +112,13 @@ void ScreenCommon_GoHomeAsync(void* /*user_data*/) {
         ESP_LOGI(TAG, "home ignored (already home)");
         return;
     }
+    if (DeferNavigationWhileRefreshing(ScreenCommon_GoHomeAsync)) return;
     ESP_LOGI(TAG, "-> home (clear back stack depth was %d)", ScreenCommon_back_depth);
     ScreenGoHome();
 }
 
 void ScreenCommon_NavigateBackAsync(void* /*user_data*/) {
+    if (DeferNavigationWhileRefreshing(ScreenCommon_NavigateBackAsync)) return;
     ScreenFactory prev = ScreenCommon_PopBackFactory();
     if (prev != nullptr) {
         ESP_LOGI(TAG, "navigate back -> recreate (stack left=%d)", ScreenCommon_back_depth);
@@ -237,6 +273,55 @@ EpdStatusBar ScreenCreateStatusBar(lv_obj_t* scr) {
     return out;
 }
 
+namespace {
+
+// I1 无真灰阶：弹窗外遮罩用大颗粒网点（16x16 平铺，3x3 黑块）。
+constexpr int kDotBackdropW = 16;
+constexpr int kDotBackdropH = 16;
+constexpr int kDotSize = 3;
+constexpr int kDotPitch = 8;
+uint8_t s_dot_backdrop_l8[kDotBackdropW * kDotBackdropH];
+lv_image_dsc_t s_dot_backdrop_img;
+bool s_dot_backdrop_ready = false;
+
+const lv_image_dsc_t* DotBackdropImg() {
+    if (!s_dot_backdrop_ready) {
+        for (int i = 0; i < kDotBackdropW * kDotBackdropH; ++i) {
+            s_dot_backdrop_l8[i] = 0xFF;
+        }
+        for (int gy = 0; gy < kDotBackdropH; gy += kDotPitch) {
+            const int x0 = ((gy / kDotPitch) & 1) ? (kDotPitch / 2) : 2;
+            for (int gx = x0; gx < kDotBackdropW; gx += kDotPitch) {
+                for (int dy = 0; dy < kDotSize; ++dy) {
+                    for (int dx = 0; dx < kDotSize; ++dx) {
+                        const int x = (gx + dx) % kDotBackdropW;
+                        const int y = (gy + 2 + dy) % kDotBackdropH;
+                        s_dot_backdrop_l8[y * kDotBackdropW + x] = 0x00;
+                    }
+                }
+            }
+        }
+        s_dot_backdrop_img.header.magic = LV_IMAGE_HEADER_MAGIC;
+        s_dot_backdrop_img.header.cf = LV_COLOR_FORMAT_L8;
+        s_dot_backdrop_img.header.flags = 0;
+        s_dot_backdrop_img.header.w = kDotBackdropW;
+        s_dot_backdrop_img.header.h = kDotBackdropH;
+        s_dot_backdrop_img.header.stride = kDotBackdropW;
+        s_dot_backdrop_img.data_size = sizeof(s_dot_backdrop_l8);
+        s_dot_backdrop_img.data = s_dot_backdrop_l8;
+        s_dot_backdrop_ready = true;
+    }
+    return &s_dot_backdrop_img;
+}
+
+}  // namespace
+
 void ScreenApplyDotBackdrop(lv_obj_t* obj) {
-    (void)obj;
+    if (obj == nullptr) {
+        return;
+    }
+    lv_obj_set_style_bg_color(obj, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_image_src(obj, DotBackdropImg(), 0);
+    lv_obj_set_style_bg_image_tiled(obj, true, 0);
 }

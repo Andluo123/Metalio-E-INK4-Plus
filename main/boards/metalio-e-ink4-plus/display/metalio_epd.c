@@ -28,17 +28,17 @@ bool MetalioEpd_Init(void) {
     esp_log_level_set("epd", ESP_LOG_WARN);
     esp_log_level_set("epd_font24", ESP_LOG_WARN);
 #endif
-    ESP_LOGI(TAG, "EPDiy init ED047TC2_1216 VCOM=%d mV", EPD_VCOM_MV);
+    ESP_LOGI(TAG, "EPDiy init E0470A14-AF 34Pin VCOM=%d mV", EPD_VCOM_MV);
 
     const size_t free_int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     const size_t free_dma_before =
         heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
 
-    epd_init(&epd_board_metalio_eink4_plus, &ED047TC2_1216, EPD_LUT_1K);
+    epd_init(&epd_board_metalio_eink4_plus, &E0470A14_AF, EPD_LUT_1K);
     epd_set_vcom(EPD_VCOM_MV);
     // 与 ebook 一致：原生横屏 + 业务侧 logical_to_physical，勿用 INVERTED_PORTRAIT
     epd_set_rotation(EPD_ROT_LANDSCAPE);
-    // MY_WAVEFORM：DU 完备；GC/GL 默认完整 48 相（MY_WAVEFORM_TRIM=1 才裁剪）
+    // 默认均衡完整 GC/GL；设置→屏幕可切换快速裁剪波形，DU 保持完整。
     my_waveform_init();
     s_hl = epd_hl_init(&MY_WAVEFORM);
 

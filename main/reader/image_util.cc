@@ -1,15 +1,16 @@
 #include "image_util.h"
+#include "image_stream.h"
+#include "sd_access.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <unistd.h>
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
-
-#define LODEPNG_NO_COMPILE_CPP
-#include "src/libs/lodepng/lodepng.h"
 
 #ifndef CONFIG_IDF_TARGET_ESP32
 #include "jpg/jpeg_to_image.h"
@@ -19,20 +20,6 @@ namespace reader {
 namespace {
 
 constexpr const char* TAG = "ReaderImg";
-
-constexpr uint8_t kBayer4[4][4] = {
-    {0, 8, 2, 10},
-    {12, 4, 14, 6},
-    {3, 11, 1, 9},
-    {15, 7, 13, 5},
-};
-
-uint8_t GrayToL8Dither(uint8_t gray, int x, int y) {
-    // gray 0=黑 255=白；阈值映射 0..15，低于阈值为黑
-    const int level = (255 - gray) * 16 / 256;  // 黑度
-    const int thr = kBayer4[y & 3][x & 3];
-    return (level > thr) ? 0x00 : 0xFF;
-}
 
 bool LooksLikeJpeg(const uint8_t* data, size_t len) {
     return len >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF;
@@ -81,10 +68,10 @@ bool DecodeA2i1ToL8(const uint8_t* data, size_t len, int max_w, int max_h, Raste
     out.width = static_cast<uint16_t>(dst_w);
     out.height = static_cast<uint16_t>(dst_h);
     for (int y = 0; y < dst_h; ++y) {
-        const int sy = y * src_h / dst_h;
+        const int sy = int64_t(y) * src_h / dst_h;
         const uint8_t* row = bits + static_cast<size_t>(sy) * stride;
         for (int x = 0; x < dst_w; ++x) {
-            const int sx = x * src_w / dst_w;
+            const int sx = int64_t(x) * src_w / dst_w;
             const uint8_t byte = row[sx >> 3];
             const bool white = (byte & (0x80 >> (sx & 7))) != 0;
             out.pixels[static_cast<size_t>(y) * dst_w + x] = white ? 0xFF : 0x00;
@@ -121,52 +108,15 @@ bool DecodeEbgrToL8(const uint8_t* data, size_t len, int max_w, int max_h, Raste
     out.height = static_cast<uint16_t>(dst_h);
     const uint8_t* gray = data + 8;
     for (int y = 0; y < dst_h; ++y) {
-        const int sy = y * src_h / dst_h;
+        const int sy = int64_t(y) * src_h / dst_h;
         for (int x = 0; x < dst_w; ++x) {
-            const int sx = x * src_w / dst_w;
+            const int sx = int64_t(x) * src_w / dst_w;
             const uint8_t g = gray[static_cast<size_t>(sy) * src_w + sx];
-            out.pixels[static_cast<size_t>(y) * dst_w + x] = GrayToL8Dither(g, x, y);
+            out.pixels[static_cast<size_t>(y) * dst_w + x] = g;
         }
     }
     out.BindDsc();
     return true;
-}
-
-void Rgb888ToL8Scaled(const uint8_t* rgba, int src_w, int src_h, bool has_alpha, int max_w, int max_h,
-                      RasterImage& out) {
-    if (src_w <= 0 || src_h <= 0) {
-        out.Reset();
-        return;
-    }
-    int dst_w = src_w;
-    int dst_h = src_h;
-    if (dst_w > max_w || dst_h > max_h) {
-        const float sx = static_cast<float>(max_w) / static_cast<float>(dst_w);
-        const float sy = static_cast<float>(max_h) / static_cast<float>(dst_h);
-        const float s = sx < sy ? sx : sy;
-        dst_w = std::max(1, static_cast<int>(dst_w * s));
-        dst_h = std::max(1, static_cast<int>(dst_h * s));
-    }
-
-    out.pixels.assign(static_cast<size_t>(dst_w) * dst_h, 0xFF);
-    out.width = static_cast<uint16_t>(dst_w);
-    out.height = static_cast<uint16_t>(dst_h);
-
-    const int bpp = has_alpha ? 4 : 3;
-    for (int y = 0; y < dst_h; ++y) {
-        const int sy = y * src_h / dst_h;
-        for (int x = 0; x < dst_w; ++x) {
-            const int sx = x * src_w / dst_w;
-            const uint8_t* p = rgba + (static_cast<size_t>(sy) * src_w + sx) * bpp;
-            uint8_t r = p[0], g = p[1], b = p[2];
-            if (has_alpha && p[3] < 128) {
-                r = g = b = 255;  // 透明当白
-            }
-            const uint8_t gray = static_cast<uint8_t>((r * 30 + g * 59 + b * 11) / 100);
-            out.pixels[static_cast<size_t>(y) * dst_w + x] = GrayToL8Dither(gray, x, y);
-        }
-    }
-    out.BindDsc();
 }
 
 void Rgb565ToL8Scaled(const uint8_t* rgb565, int src_w, int src_h, size_t stride, int max_w, int max_h,
@@ -190,16 +140,16 @@ void Rgb565ToL8Scaled(const uint8_t* rgb565, int src_w, int src_h, size_t stride
     out.height = static_cast<uint16_t>(dst_h);
 
     for (int y = 0; y < dst_h; ++y) {
-        const int sy = y * src_h / dst_h;
+        const int sy = int64_t(y) * src_h / dst_h;
         const uint8_t* row = rgb565 + static_cast<size_t>(sy) * stride;
         for (int x = 0; x < dst_w; ++x) {
-            const int sx = x * src_w / dst_w;
+            const int sx = int64_t(x) * src_w / dst_w;
             const uint16_t pix = static_cast<uint16_t>(row[sx * 2] | (row[sx * 2 + 1] << 8));
             const uint8_t r = static_cast<uint8_t>(((pix >> 11) & 0x1F) * 255 / 31);
             const uint8_t g = static_cast<uint8_t>(((pix >> 5) & 0x3F) * 255 / 63);
             const uint8_t b = static_cast<uint8_t>((pix & 0x1F) * 255 / 31);
             const uint8_t gray = static_cast<uint8_t>((r * 30 + g * 59 + b * 11) / 100);
-            out.pixels[static_cast<size_t>(y) * dst_w + x] = GrayToL8Dither(gray, x, y);
+            out.pixels[static_cast<size_t>(y) * dst_w + x] = gray;
         }
     }
     out.BindDsc();
@@ -207,12 +157,28 @@ void Rgb565ToL8Scaled(const uint8_t* rgb565, int src_w, int src_h, size_t stride
 
 }  // namespace
 
-bool DecodeImageToL8(const uint8_t* data, size_t len, int max_w, int max_h, RasterImage& out) {
+bool DecodeImageToL8(const uint8_t* data, size_t len, int max_w, int max_h, RasterImage& out,
+                     ImageDecodeCancelled cancelled, void* context) try {
     out.Reset();
-    if (data == nullptr || len == 0 || max_w <= 0 || max_h <= 0) {
+    if (cancelled != nullptr && cancelled(context)) return false;
+    const bool original_size = max_w == 0 && max_h == 0;
+    if (data == nullptr || len == 0 || (!original_size && (max_w <= 0 || max_h <= 0))) {
         return false;
     }
+    if (LooksLikePng(data, len)) {
+        return DecodePngMemoryToL8(data, len, max_w, max_h, out, cancelled, context);
+    }
+    if (original_size && !PeekRasterSize(data, len, &max_w, &max_h)) return false;
 
+    if (ValidateA2l8Bytes(data,len)) {
+        const int width=data[4]|(data[5]<<8),height=data[6]|(data[7]<<8);
+        const double scale=std::min({1.0,double(max_w)/width,double(max_h)/height});
+        out.width=std::max(1,int(width*scale)); out.height=std::max(1,int(height*scale));
+        out.pixels.resize(size_t(out.width)*out.height);
+        for(int y=0;y<out.height;++y) for(int x=0;x<out.width;++x)
+            out.pixels[size_t(y)*out.width+x]=data[8+size_t(int64_t(y)*height/out.height)*width+int64_t(x)*width/out.width];
+        out.BindDsc(); return true;
+    }
     if (LooksLikeA2i1(data, len)) {
         return DecodeA2i1ToL8(data, len, max_w, max_h, out);
     }
@@ -220,23 +186,10 @@ bool DecodeImageToL8(const uint8_t* data, size_t len, int max_w, int max_h, Rast
         return DecodeEbgrToL8(data, len, max_w, max_h, out);
     }
 
-    if (LooksLikePng(data, len)) {
-        unsigned char* rgba = nullptr;
-        unsigned w = 0, h = 0;
-        const unsigned err = lodepng_decode32(&rgba, &w, &h, data, len);
-        if (err != 0 || rgba == nullptr) {
-            ESP_LOGW(TAG, "png decode err %u", err);
-            if (rgba) {
-                free(rgba);
-            }
-            return false;
-        }
-        Rgb888ToL8Scaled(rgba, static_cast<int>(w), static_cast<int>(h), true, max_w, max_h, out);
-        free(rgba);
-        return !out.empty();
-    }
-
     if (LooksLikeJpeg(data, len)) {
+        if (IsProgressiveJpeg(data, len)) {
+            return DecodeProgressiveJpeg(data, len, max_w, max_h, out, cancelled, context);
+        }
 #ifndef CONFIG_IDF_TARGET_ESP32
         uint8_t* rgb565 = nullptr;
         size_t out_len = 0, w = 0, h = 0, stride = 0;
@@ -246,8 +199,8 @@ bool DecodeImageToL8(const uint8_t* data, size_t len, int max_w, int max_h, Rast
             ESP_LOGW(TAG, "jpeg decode failed");
             return false;
         }
-        Rgb565ToL8Scaled(rgb565, static_cast<int>(w), static_cast<int>(h), stride, max_w, max_h, out);
-        heap_caps_free(rgb565);
+        std::unique_ptr<uint8_t, decltype(&heap_caps_free)> decoded(rgb565, heap_caps_free);
+        Rgb565ToL8Scaled(decoded.get(), static_cast<int>(w), static_cast<int>(h), stride, max_w, max_h, out);
         return !out.empty();
 #else
         ESP_LOGW(TAG, "jpeg not supported on esp32");
@@ -257,34 +210,63 @@ bool DecodeImageToL8(const uint8_t* data, size_t len, int max_w, int max_h, Rast
 
     ESP_LOGW(TAG, "unknown image format (%u bytes)", static_cast<unsigned>(len));
     return false;
+} catch (const std::bad_alloc&) {
+    out.Reset();
+    ESP_LOGW(TAG, "image decode allocation failed");
+    return false;
 }
 
-bool DecodeImageFileToL8(const char* path, int max_w, int max_h, RasterImage& out) {
+bool DecodeImageFileToL8(const char* path, int max_w, int max_h, RasterImage& out,
+                     ImageDecodeCancelled cancelled, void* context) {
     out.Reset();
+    if (cancelled != nullptr && cancelled(context)) return false;
     if (path == nullptr) {
         return false;
     }
+    const bool original_size = max_w == 0 && max_h == 0;
+    if (!original_size && (max_w <= 0 || max_h <= 0)) return false;
     FILE* fp = std::fopen(path, "rb");
     if (fp == nullptr) {
         return false;
+    }
+    uint8_t signature[8];
+    const size_t signature_size = std::fread(signature, 1, sizeof(signature), fp);
+    if (LooksLikePng(signature, signature_size)) {
+        std::fclose(fp);
+        return DecodePngFileToL8(path, max_w, max_h, out, cancelled, context);
     }
     if (std::fseek(fp, 0, SEEK_END) != 0) {
         std::fclose(fp);
         return false;
     }
     const long sz = std::ftell(fp);
-    if (sz <= 0 || sz > 4 * 1024 * 1024) {
+    if (sz <= 0 || (!original_size && sz > 4 * 1024 * 1024)) {
         std::fclose(fp);
         return false;
     }
     std::rewind(fp);
-    std::vector<uint8_t> buf(static_cast<size_t>(sz));
-    if (std::fread(buf.data(), 1, buf.size(), fp) != buf.size()) {
+    std::unique_ptr<uint8_t, decltype(&heap_caps_free)> buf(
+        static_cast<uint8_t*>(heap_caps_malloc(static_cast<size_t>(sz), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+        heap_caps_free);
+    if (!buf || (cancelled != nullptr && cancelled(context))) {
         std::fclose(fp);
         return false;
     }
+    size_t read = 0;
+    while (read < static_cast<size_t>(sz)) {
+        if (cancelled != nullptr && cancelled(context)) break;
+        const size_t count = std::min<size_t>(16 * 1024, static_cast<size_t>(sz) - read);
+        const size_t n = std::fread(buf.get() + read, 1, count, fp);
+        read += n;
+        if (n != count) break;
+    }
     std::fclose(fp);
-    return DecodeImageToL8(buf.data(), buf.size(), max_w, max_h, out);
+    if (read != static_cast<size_t>(sz)) return false;
+    const bool ok = DecodeImageToL8(buf.get(), static_cast<size_t>(sz), max_w, max_h, out, cancelled, context);
+    if (!ok && (cancelled == nullptr || !cancelled(context))) {
+        ESP_LOGW(TAG, "image decode failed: %s (%ld bytes)", path, sz);
+    }
+    return ok;
 }
 
 bool PeekA2i1Size(const uint8_t* data, size_t len, int* w, int* h) {
@@ -301,21 +283,7 @@ bool PeekA2i1Size(const uint8_t* data, size_t len, int* w, int* h) {
     return true;
 }
 
-bool PeekA2i1FileSize(const char* path, int* w, int* h) {
-    if (path == nullptr || w == nullptr || h == nullptr) {
-        return false;
-    }
-    FILE* fp = std::fopen(path, "rb");
-    if (fp == nullptr) {
-        return false;
-    }
-    uint8_t hdr[20];
-    const size_t n = std::fread(hdr, 1, sizeof(hdr), fp);
-    std::fclose(fp);
-    return PeekA2i1Size(hdr, n, w, h);
-}
-
-bool ScaleRasterToFit(const RasterImage& src, int max_w, int max_h, RasterImage& out) {
+bool ScaleRasterToFit(const RasterImage& src, int max_w, int max_h, RasterImage& out) try {
     if (src.empty() || max_w <= 0 || max_h <= 0) {
         out.Reset();
         return false;
@@ -342,9 +310,9 @@ bool ScaleRasterToFit(const RasterImage& src, int max_w, int max_h, RasterImage&
     tmp.width = static_cast<uint16_t>(dst_w);
     tmp.height = static_cast<uint16_t>(dst_h);
     for (int y = 0; y < dst_h; ++y) {
-        const int sy = y * src.height / dst_h;
+        const int sy = int64_t(y) * src.height / dst_h;
         for (int x = 0; x < dst_w; ++x) {
-            const int sx = x * src.width / dst_w;
+            const int sx = int64_t(x) * src.width / dst_w;
             tmp.pixels[static_cast<size_t>(y) * dst_w + x] =
                 src.pixels[static_cast<size_t>(sy) * src.width + sx];
         }
@@ -352,6 +320,10 @@ bool ScaleRasterToFit(const RasterImage& src, int max_w, int max_h, RasterImage&
     out = std::move(tmp);
     out.BindDsc();
     return !out.empty();
+} catch (const std::bad_alloc&) {
+    out.Reset();
+    ESP_LOGW(TAG, "image scaling allocation failed");
+    return false;
 }
 
 bool ValidateA2i1Bytes(const uint8_t* data, size_t len) {
@@ -372,50 +344,9 @@ bool ValidateA2i1Bytes(const uint8_t* data, size_t len) {
     return len >= need;
 }
 
-bool EncodeL8ToA2i1(const RasterImage& img, std::vector<uint8_t>& out) {
-    out.clear();
-    if (img.empty() || img.width == 0 || img.height == 0) {
-        return false;
-    }
-    const int w = img.width;
-    const int h = img.height;
-    const int stride = (w + 7) / 8;
-    const size_t bitmap_bytes = static_cast<size_t>(stride) * static_cast<size_t>(h);
-    out.assign(20 + bitmap_bytes, 0);
-    out[0] = 'A';
-    out[1] = '2';
-    out[2] = 'I';
-    out[3] = '1';
-    out[4] = static_cast<uint8_t>(w & 0xFF);
-    out[5] = static_cast<uint8_t>((w >> 8) & 0xFF);
-    out[6] = static_cast<uint8_t>(h & 0xFF);
-    out[7] = static_cast<uint8_t>((h >> 8) & 0xFF);
-    out[8] = static_cast<uint8_t>(stride & 0xFF);
-    out[9] = static_cast<uint8_t>((stride >> 8) & 0xFF);
-    // LVGL I1 palette：index0 黑、index1 白（ARGB8888）
-    out[12] = 0xFF;
-    out[13] = 0x00;
-    out[14] = 0x00;
-    out[15] = 0x00;
-    out[16] = 0xFF;
-    out[17] = 0xFF;
-    out[18] = 0xFF;
-    out[19] = 0xFF;
-
-    uint8_t* bits = out.data() + 20;
-    for (int y = 0; y < h; ++y) {
-        const uint8_t* row = img.pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(w);
-        for (int x = 0; x < w; ++x) {
-            if (row[x] >= 0x80) {
-                bits[static_cast<size_t>(y) * static_cast<size_t>(stride) + (x >> 3)] |=
-                    static_cast<uint8_t>(0x80 >> (x & 7));
-            }
-        }
-    }
-    return true;
-}
-
 bool WriteFileAtomic(const char* path, const uint8_t* data, size_t len) {
+    sd_access::Transaction transaction;
+    if (!transaction) return false;
     if (path == nullptr || path[0] == '\0' || data == nullptr || len == 0) {
         return false;
     }
@@ -445,4 +376,69 @@ bool WriteFileAtomic(const char* path, const uint8_t* data, size_t len) {
     return true;
 }
 
-}  // namespace reader
+bool ValidateA2l8Bytes(const uint8_t* data,size_t len) {
+    if(!data || len<8 || std::memcmp(data,"A2L8",4)) return false;
+    const unsigned width=data[4]|(unsigned(data[5])<<8),height=data[6]|(unsigned(data[7])<<8);
+    return width && height && size_t(width)*height<=len-8;
+}
+bool EncodeL8ToA2l8(const RasterImage& image,std::vector<uint8_t>& out) {
+    out.clear();
+    const size_t pixels=size_t(image.width)*image.height;
+    if(!pixels || image.pixels.size()<pixels) return false;
+    out.resize(8+pixels);
+    std::memcpy(out.data(),"A2L8",4);
+    out[4]=image.width&255;out[5]=image.width>>8;
+    out[6]=image.height&255;out[7]=image.height>>8;
+    std::memcpy(out.data()+8,image.pixels.data(),pixels);
+    return true;
+}
+bool PeekRasterSize(const uint8_t* data,size_t len,int* width,int* height) {
+    if(!data || !width || !height) return false;
+    if(len>=8 && (!std::memcmp(data,"A2L8",4) || !std::memcmp(data,"EBGR",4))) {
+        *width=data[4]|(data[5]<<8);*height=data[6]|(data[7]<<8);
+        return *width>0 && *height>0;
+    }
+    if(PeekA2i1Size(data,len,width,height)) return true;
+    if(len>=24 && LooksLikePng(data,len)) {
+        const auto be32=[](const uint8_t* p) { return unsigned(p[0])<<24|unsigned(p[1])<<16|unsigned(p[2])<<8|p[3]; };
+        const unsigned w=be32(data+16),h=be32(data+20);
+        if(!w || !h || w>65535 || h>65535) return false;
+        *width=w;*height=h;return true;
+    }
+    if(LooksLikeJpeg(data,len)) {
+        size_t pos=2;
+        while(pos+3<len) {
+            if(data[pos++]!=255) return false;
+            while(pos<len && data[pos]==255) ++pos;
+            if(pos>=len) return false;
+            const unsigned marker=data[pos++];
+            if(marker==0xd9 || marker==0xda) return false;
+            if(marker==0x01 || (marker>=0xd0 && marker<=0xd7)) continue;
+            if(pos+2>len) return false;
+            const unsigned size=(unsigned(data[pos])<<8)|data[pos+1];
+            if(size<2 || size>len-pos) return false;
+            if((marker>=0xc0 && marker<=0xc3) || (marker>=0xc5 && marker<=0xc7) ||
+               (marker>=0xc9 && marker<=0xcb) || (marker>=0xcd && marker<=0xcf)) {
+                if(size<8) return false;
+                *height=(data[pos+3]<<8)|data[pos+4];*width=(data[pos+5]<<8)|data[pos+6];
+                return *width>0 && *height>0;
+            }
+            pos+=size;
+        }
+    }
+    return false;
+}
+bool PeekRasterFileSize(const char* path,int* width,int* height) {
+    if(!path) return false;
+    FILE* file=std::fopen(path,"rb"); if(!file) return false;
+    // Pixel envelopes and PNG keep dimensions in the first 24 bytes.
+    uint8_t header[24];const size_t count=std::fread(header,1,sizeof(header),file);
+    if(PeekRasterSize(header,count,width,height)) { std::fclose(file);return true; }
+    if(std::fseek(file,0,SEEK_END)) { std::fclose(file);return false; }
+    const long size=std::ftell(file);
+    if(size<=0 || size>4*1024*1024) { std::fclose(file);return false; }
+    std::rewind(file);std::vector<uint8_t> data(size);
+    const bool read=std::fread(data.data(),1,data.size(),file)==data.size();
+    std::fclose(file);return read && PeekRasterSize(data.data(),data.size(),width,height);
+}
+}

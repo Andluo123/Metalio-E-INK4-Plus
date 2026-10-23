@@ -1,6 +1,8 @@
+#include "epd_content_policy.h"
 #pragma GCC optimize("O1")
 
 #include "book_screen/reader/book_reader_body.h"
+#include "book_screen/reader/book_auto_turn.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/shelf/book_detail.h"
 #include "book_screen/settings/book_font_multi.h"
@@ -17,6 +19,8 @@
 #include "book_screen/reader/book_reader_overlay.h"
 
 #include <lvgl.h>
+#include "src/misc/cache/instance/lv_image_cache.h"
+#include "src/misc/cache/instance/lv_image_header_cache.h"
 #include <memory>
 #include <utility>
 #include <esp_log.h>
@@ -121,13 +125,39 @@ void AttachReaderUnderline(lv_obj_t* label, int mode) {
     lv_obj_add_event_cb(label, OnReaderUnderlineDraw, LV_EVENT_DRAW_MAIN_END, nullptr);
 }
 
+static uint8_t ReadingBackgroundPixel(int mode, int x, int y, int left, int width, int height) {
+    if (x < left || x >= left + width || y < 0 || y >= height) return 255;
+    x -= left;
+    constexpr int pitch = 32; // Shared grid cell and dot spacing in display pixels.
+    if (mode == 2) {
+        const int dot_x = x % pitch, dot_y = y % pitch;
+        // I1 output thresholds gray to black/white. A 4x4 checker keeps the dot
+        // footprint while reducing ink coverage to 50% for a lighter appearance.
+        return (dot_x < 4 && dot_y < 4 && ((dot_x + dot_y) % 2 == 0)) ? 0 : 255;
+    }
+    if (mode == 1) {
+        const bool vertical = x % pitch == 0 || x == width - 1;
+        const bool horizontal = y % pitch == 0 || y == height - 1;
+        // Close the grid at the viewport edges even when its size is not a multiple of 32.
+        const bool corner = (x == 0 || x == width - 1) && (y == 0 || y == height - 1);
+        return ((vertical && y % 3 == 0) || (horizontal && x % 3 == 0) || corner) ? 0 : 255;
+    }
+    return 255;
+}
 void RenderReaderPage() {
+    if (Book_State().reader.standby_paused) return;
+    // Start a fresh interval after every render, including manual turns and layout changes.
+    struct AutoTurnResetOnExit { ~AutoTurnResetOnExit() {
+        if (ReaderAutoTurnEnabled()) ResetReaderAutoTurnDeadline();
+    } } auto_turn_reset;
     ApplyReaderPageDelta();
     auto& st = Book_State();
     if (st.reader.content == nullptr || !st.reader.session) {
         s_reader_first_paint = false;
         return;
     }
+    // Loading/errors/TOC stay binary; opt into text gray only when a page exists.
+    EpdSetContentRole(st.reader.content,EpdContentRole::Monochrome);
     st.reader.open_bar = nullptr;
     st.reader.open_pct_lbl = nullptr;
     if (st.reader.read_chrome == BookUiState::ReadChrome::kToc) {
@@ -165,11 +195,15 @@ void RenderReaderPage() {
     }
 
     CancelPageImageLoad();
-    lv_obj_clean(st.reader.content);
-    Book_DisableScroll(st.reader.content);
-    AttachReadBodyInput(st.reader.content);
-
     const reader::Page* page = st.reader.session->CurrentPageData();
+    const bool reuse_raster = page && !page_images && BookReaderPrefsBackground() == 0 &&
+        reader::PageIsTextOnly(*page) && st.reader.text_raster_image &&
+        lv_obj_is_valid(st.reader.text_raster_image) && lv_obj_get_child_count(st.reader.content) == 1;
+    if (!reuse_raster) {
+        lv_obj_clean(st.reader.content);
+        Book_DisableScroll(st.reader.content);
+        AttachReadBodyInput(st.reader.content);
+    }
     if (page == nullptr) {
         FinishReaderFirstPaintGate();
         Book_ShowMessage(st.reader.content, Lang::Strings::BOOK_PAGE_LOAD_FAILED);
@@ -180,11 +214,39 @@ void RenderReaderPage() {
         return;
     }
 
+    EpdSetContentRole(st.reader.content,!page_images && BookReaderPrefsAntialias()
+        ? EpdContentRole::ReaderAntialias : EpdContentRole::Monochrome);
     PrewarmPageFont(page);
 
     const lv_font_t* book_font = BookFont();
     const lv_coord_t max_w = page_images ? LV_HOR_RES : ReadContentWidth();
-    const lv_coord_t content_h = lv_obj_get_height(st.reader.content);
+    const lv_coord_t content_h = st.reader.viewport_h;
+    const int background = page_images ? 0 : BookReaderPrefsBackground();
+    const int background_width = ReadContentWidth();
+    const int background_left = st.reader.session->VerticalWriting()
+        ? kReaderVerticalLeftInset : (LV_HOR_RES - background_width) / 2;
+    const int background_height = std::max<int>(0, std::min<int>(content_h,
+        LV_VER_RES - BookReaderPrefsMarginTop() - BookReaderPrefsMarginBottom()));
+    if (st.reader.background_layer && lv_obj_is_valid(st.reader.background_layer)) lv_obj_delete(st.reader.background_layer);
+    st.reader.background_layer = nullptr;
+    if (st.reader.footer_host) lv_obj_set_style_bg_opa(st.reader.footer_host, background ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+    if (background && background_height > 0) {
+        auto* image = new reader::RasterImage();
+        image->width = LV_HOR_RES; image->height = background_height;
+        image->pixels.resize(static_cast<size_t>(image->width) * image->height);
+        for (int y=0; y<image->height; ++y) for (int x=0; x<image->width; ++x)
+            image->pixels[y*image->width+x] = ReadingBackgroundPixel(background,x,y,background_left,background_width,background_height);
+        image->BindDsc();
+        auto* slot = lv_obj_create(st.reader.read_scr);
+        lv_obj_remove_style_all(slot);
+        lv_obj_set_size(slot, image->width, image->height);
+        lv_obj_set_pos(slot, 0, BookReaderPrefsMarginTop());
+        st.reader.background_layer = slot;
+        lv_obj_move_background(slot);
+        lv_obj_clear_flag(slot, LV_OBJ_FLAG_CLICKABLE);
+        Book_DisableScroll(slot);
+        AttachPageImageToSlot(slot, image, false);
+    }
     const lv_coord_t line_gap = st.reader.session->LineGap();
     const lv_coord_t para_gap = st.reader.session->ParaGap();
 
@@ -192,6 +254,7 @@ void RenderReaderPage() {
     if (!page_images && book_font != nullptr && reader::PageIsTextOnly(*page) && content_h > 40 &&
         max_w > 40) {
         const int64_t t0 = esp_timer_get_time();
+        const bool vertical = st.reader.session->VerticalWriting();
         lv_coord_t block_w = 0;
         for (const auto& item : page->items) {
             if (item.kind != reader::ContentKind::kText || item.text.empty()) {
@@ -209,11 +272,13 @@ void RenderReaderPage() {
             }
         }
         lv_coord_t col_w = max_w;
-        if (block_w > 40 && block_w < max_w) {
+        if (!vertical && block_w > 40 && block_w < max_w) {
             col_w = block_w;
         }
-        const lv_coord_t col_x = static_cast<lv_coord_t>((LV_HOR_RES - col_w) / 2);
-        int ink_h = reader::EstimatePageTextHeight(*page, book_font, line_gap, para_gap, content_h);
+        // Vertical text starts after the fixed drawable-area left gutter.
+        const lv_coord_t col_x = vertical ? kReaderVerticalLeftInset
+            : static_cast<lv_coord_t>((LV_HOR_RES - col_w) / 2);
+        int ink_h = vertical ? content_h : reader::EstimatePageTextHeight(*page, book_font, line_gap, para_gap, content_h);
         if (ink_h < 8) {
             ink_h = 8;
         }
@@ -221,22 +286,54 @@ void RenderReaderPage() {
             ink_h = content_h;
         }
 
-        auto* heap_img = new reader::RasterImage();
-        if (reader::RasterPageTextToL8(*page, book_font, line_gap, para_gap, col_w, ink_h,
-                                       BookReaderPrefsUnderlineMode(), *heap_img) &&
+        auto* heap_img = reuse_raster
+            ? static_cast<reader::RasterImage*>(lv_obj_get_user_data(st.reader.text_raster_image))
+            : new reader::RasterImage();
+        if (reuse_raster) {
+            lv_image_cache_drop(&heap_img->dsc);
+            lv_image_header_cache_drop(&heap_img->dsc);
+        }
+        const bool raster_ok = vertical
+            ? reader::RasterPageVerticalTextToL8(*page, book_font, line_gap, para_gap, col_w, ink_h,
+                                                BookReaderPrefsUnderlineMode(), *heap_img, BookReaderPrefsAntialias() != 0)
+            : reader::RasterPageTextToL8(*page, book_font, line_gap, para_gap, col_w, ink_h,
+                                        BookReaderPrefsUnderlineMode(), *heap_img, BookReaderPrefsAntialias() != 0);
+        if (raster_ok &&
             !heap_img->empty()) {
-            lv_obj_t* col = lv_obj_create(st.reader.content);
-            lv_obj_remove_style_all(col);
+            if (background) {
+                for (int y=0; y<heap_img->height; ++y) for (int x=0; x<heap_img->width; ++x) {
+                    auto& pixel = heap_img->pixels[y*heap_img->width+x];
+                    if (pixel == 255) pixel = ReadingBackgroundPixel(background, col_x+x, y, background_left, background_width, background_height);
+                }
+            }
+            lv_obj_t* slot = reuse_raster ? lv_obj_get_parent(st.reader.text_raster_image) : nullptr;
+            lv_obj_t* col = reuse_raster ? lv_obj_get_parent(slot) : lv_obj_create(st.reader.content);
+            if (!reuse_raster) lv_obj_remove_style_all(col);
             lv_obj_set_size(col, col_w, ink_h);
             lv_obj_set_pos(col, col_x, 0);
             lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE);
             Book_DisableScroll(col);
 
-            lv_obj_t* slot = lv_obj_create(col);
-            lv_obj_remove_style_all(slot);
+            if (!reuse_raster) {
+                slot = lv_obj_create(col);
+                lv_obj_remove_style_all(slot);
+            }
             lv_obj_set_size(slot, col_w, ink_h);
             lv_obj_clear_flag(slot, LV_OBJ_FLAG_CLICKABLE);
-            AttachPageImageToSlot(slot, heap_img, false);
+            if (reuse_raster) {
+                heap_img->BindDsc();
+                lv_image_set_src(st.reader.text_raster_image, &heap_img->dsc);
+                lv_obj_invalidate(st.reader.text_raster_image);
+            } else {
+                AttachPageImageToSlot(slot, heap_img, false);
+                st.reader.text_raster_image = lv_obj_get_child(slot, 0);
+                lv_obj_add_event_cb(st.reader.text_raster_image, [](lv_event_t* event) {
+                    auto& image = Book_State().reader.text_raster_image;
+                    if (image == lv_event_get_target(event)) image = nullptr;
+                }, LV_EVENT_DELETE, nullptr);
+            }
+            EpdSetContentRole(st.reader.text_raster_image,BookReaderPrefsAntialias()
+                ? EpdContentRole::ReaderAntialias : EpdContentRole::Monochrome);
             heap_img = nullptr;
 
             UpdateReadFooter();
@@ -250,11 +347,18 @@ void RenderReaderPage() {
                      static_cast<long long>((esp_timer_get_time() - t0) / 1000));
             return;
         }
-        delete heap_img;
+        if (reuse_raster) {
+            lv_obj_clean(st.reader.content); // Image DELETE owns heap_img.
+            AttachReadBodyInput(st.reader.content);
+        } else delete heap_img;
         ESP_LOGW(TAG, "RenderReaderPage raster fail → label path");
     }
 
     // LVGL label/插图路径
+    if (reuse_raster && st.reader.text_raster_image) {
+        lv_obj_clean(st.reader.content);
+        AttachReadBodyInput(st.reader.content);
+    }
     // 按本页实际行宽收栏：行未撑满视口时居中整栏，避免满宽 label 左齐造成右空
     lv_coord_t block_w = 0;
     if (!page_images && book_font != nullptr) {
@@ -353,9 +457,6 @@ lv_obj_t* CreateReaderScreen(const reader::BookInfo& info) {
     // 硬护栏：layout/open worker 仍用旧 session 时禁止 make_unique 拆掉（UAF）
     if (ReaderWorkersBusy()) {
         WarnReaderWorkersBusy("CreateReaderScreen");
-        if (st.shelf.selected >= 0 && st.shelf.selected < static_cast<int>(st.shelf.books.size())) {
-            return CreateDetailScreen(st.shelf.selected);
-        }
         return BookScreen::Create();
     }
     if (st.reader.deferred_cleanup) {
@@ -363,26 +464,21 @@ lv_obj_t* CreateReaderScreen(const reader::BookInfo& info) {
     }
     s_reader_first_paint = true;
     DisplayUiSetOrient(BookReaderPrefsOrient());
-    if (auto* disp = LVAdapterDisplay::Instance()) {
-        disp->RequestFullOnNextCommit();
-    }
     // 仅打开正文时加载 SD 字体；界面控件用固件字
     EnsureBookFont();
-    // 预扫 SD 字库列表，打开设置卡时不必再等「加载中」
-    ScanReadFonts();
-    EnsureFontListPageShowsSelection();
+    CancelReadFontScan();
     // 换新 session 前停旧 timer/墙钟，避免回调 UAF 或漏写本段秒数
     EndReadingTimeTracking();
     st.reader.session = std::make_unique<reader::BookSession>();
     BindSessionLayoutPrefs(*st.reader.session);
     st.reader.opening_format = info.format;
 
+    st.reader.background_layer = nullptr;
     lv_obj_t* scr = lv_obj_create(nullptr);
     lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, Book_ListFont(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    Book_DisableScroll(scr);
 
     EpdStatusBar status = ScreenCreateStatusBar(scr);
     st.reader.status_bar = status.bar;
@@ -403,7 +499,7 @@ lv_obj_t* CreateReaderScreen(const reader::BookInfo& info) {
 
     lv_obj_t* body = lv_obj_create(scr);
     lv_obj_remove_style_all(body);
-    lv_obj_set_size(body, LV_HOR_RES, LV_VER_RES - kFooterH);
+    lv_obj_set_size(body, LV_HOR_RES, LV_VER_RES - ReaderFooterHeight());
     lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
     Book_DisableScroll(body);
@@ -412,7 +508,7 @@ lv_obj_t* CreateReaderScreen(const reader::BookInfo& info) {
     st.reader.read_chrome = BookUiState::ReadChrome::kReading;
     st.reader.toc_list_page = 0;
 
-    // 顶部悬浮设置卡片（默认隐藏；点中列「菜单」分区唤出，盖在正文上）
+    // 底部阅读浮层（默认隐藏；菜单打开后显示时长页）
     lv_obj_t* sheet = lv_obj_create(scr);
     st.settings.settings_sheet = sheet;
     lv_obj_remove_style_all(sheet);
@@ -438,7 +534,7 @@ lv_obj_t* CreateReaderScreen(const reader::BookInfo& info) {
     // 底栏白底槽：正文不侵入；相对槽底上留与面板 BOTTOM_INSET 一致
     lv_obj_t* foot_host = lv_obj_create(scr);
     lv_obj_remove_style_all(foot_host);
-    lv_obj_set_size(foot_host, LV_HOR_RES, kFooterH);
+    lv_obj_set_size(foot_host, LV_HOR_RES, ReaderFooterHeight());
     lv_obj_align(foot_host, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(foot_host, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(foot_host, LV_OPA_COVER, 0);
@@ -460,6 +556,8 @@ lv_obj_t* CreateReaderScreen(const reader::BookInfo& info) {
 
     ShowOpenProgress(0);
     st.reader.read_scr = scr;
+    st.settings.reader_light_panel = nullptr;
+    st.settings.reader_light_page = false;
     ApplyReaderPageGeometry(ReaderGeomMode::kImmersive);
     ApplyReaderChromeSize();
     SyncFooterClockTimer();

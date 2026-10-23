@@ -3,6 +3,10 @@
 #include <esp_crt_bundle.h>
 #include <cstring>
 #include <unistd.h>
+#include <algorithm>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <esp_timer.h>
 
 static const char *TAG = "EspSsl";
 
@@ -33,6 +37,16 @@ bool EspSsl::Connect(const std::string& host, int port) {
 
     esp_tls_cfg_t cfg = {};
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    if (request_deadline_us_) {
+        const int64_t remaining_ms = (request_deadline_us_ - esp_timer_get_time()) / 1000;
+        if (remaining_ms <= 0) {
+            last_error_ = ETIMEDOUT;
+            esp_tls_conn_destroy(tls_client_);
+            tls_client_ = nullptr;
+            return false;
+        }
+        cfg.timeout_ms = int(remaining_ms);
+    }
 
     int ret = esp_tls_conn_new_sync(host.c_str(), host.length(), port, &cfg, tls_client_);
     if (ret != 1) {
@@ -41,7 +55,6 @@ bool EspSsl::Connect(const std::string& host, int port) {
             int error_code, error_flags;
             esp_err_t err = esp_tls_get_and_clear_last_error(last_error, &error_code, &error_flags);
             last_error_ = err;
-            ESP_LOGD(TAG, "Failed to connect to %s:%d, code=0x%x", host.c_str(), port, err);
         } else {
             last_error_ = -1;
             ESP_LOGE(TAG, "Failed to get error handle");
@@ -98,7 +111,12 @@ int EspSsl::Send(const std::string& data) {
     const char* data_ptr = data.data();
     
     while (total_sent < data_size) {
-        int ret = esp_tls_conn_write(tls_client_, data_ptr + total_sent, data_size - total_sent);
+        if (request_deadline_us_ && esp_timer_get_time() >= request_deadline_us_) {
+            last_error_ = ETIMEDOUT;
+            return -1;
+        }
+        const size_t write_size = data_size - total_sent;
+        int ret = esp_tls_conn_write(tls_client_, data_ptr + total_sent, write_size);
 
         if (ret == ESP_TLS_ERR_SSL_WANT_WRITE) {
             continue;

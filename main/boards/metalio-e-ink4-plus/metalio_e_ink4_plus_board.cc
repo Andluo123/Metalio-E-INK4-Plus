@@ -1,9 +1,9 @@
 /**
  * @file metalio_e_ink4_plus_board.cc
- * @brief Metalio E-Ink4-Plus：WifiBoard + BH1098 音频 + EPDiy
+ * @brief Metalio E-Ink4-Plus：DualNetworkBoard + BH1098 音频 + EPDiy
  */
 
-#include "wifi_board.h"
+#include "dual_network_board.h"
 
 #include "bt_audio_codec.h"
 #include "bq27220_gauge.h"
@@ -23,6 +23,7 @@
 #include "metalio_vibe.h"
 #include "power_policy.h"
 #include "settings.h"
+#include "wallpaper_screen/wallpaper_active.h"
 
 #include <esp_log.h>
 
@@ -50,9 +51,10 @@ void ApplySavedFrontlight() {
 
 } // namespace
 
-class MetalioEInk4PlusBoard : public WifiBoard {
+class MetalioEInk4PlusBoard : public DualNetworkBoard {
 public:
-    MetalioEInk4PlusBoard() {
+    MetalioEInk4PlusBoard()
+        : DualNetworkBoard(NT26_TX_PIN, NT26_RX_PIN, NT26_MRDY_PIN, NT26_SRDY_PIN, 0) {
         if (!MetalioEpd_Init()) {
             ESP_LOGE(TAG, "epd init fail");
             return;
@@ -73,8 +75,9 @@ public:
 
         MetalioVibe_Init();
         MetalioSd_Init();
+        // SD 挂载后补齐本地壁纸缓存，必须早于电源键开放待机入口。
+        Wallpaper_HydrateFromNvsNow();
         MetalioKeys_Init();
-        MetalioAudio_Init(); // UART + AT 模式1（I2S 在 GetAudioCodec）
 
         MetalioPeriph_StartSystemMonitor();
         PowerPolicy::GetInstance().Init(this);
@@ -82,6 +85,7 @@ public:
         if (display_ != nullptr) {
             MetalioDisplay_SetSystemReady(display_);
         }
+        MetalioAudio_Init();
         ESP_LOGI(TAG, "board ready display=%s sd=%s gauge=%s",
                  display_ ? "ok" : "FAIL", MetalioSd_Ok() ? "ok" : "FAIL",
                  Bq27220Gauge::GetInstance().IsReady() ? "ok" : "N/A");
@@ -95,7 +99,7 @@ public:
         return display_;
     }
 
-    /** @brief 首次调用时创建 duplex I2S */
+    /** @brief 返回板级音频实例，硬件资源在进入音频功能时按需申请 */
     AudioCodec* GetAudioCodec() override {
         static BTAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
                                               AUDIO_I2S_BCLK, AUDIO_I2S_WS, AUDIO_I2S_DOUT,
@@ -107,8 +111,8 @@ public:
         return Bq27220Gauge::GetInstance().GetBatteryLevel(level, charging, discharging);
     }
 
-    void PulseVibration() override {
-        MetalioVibe_Pulse();
+    void PulseVibration(int duration_ms = 50) override {
+        MetalioVibe_PulseFor(duration_ms);
     }
 
     void SetVibration(bool on) override {

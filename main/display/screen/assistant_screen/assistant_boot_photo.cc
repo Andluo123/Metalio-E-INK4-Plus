@@ -30,7 +30,7 @@
 
 
 static constexpr const char* TAG = "AsstBootPhoto";
-/** JPEG→L8 + 可选 A2I1 cache；栈放 SPIRAM，避免内部 RAM 碎片导致偶发 create 失败 */
+/** JPEG→L8 + 可选 A2L8 cache；栈放 SPIRAM，避免内部 RAM 碎片导致偶发 create 失败 */
 static constexpr uint32_t kWorkerStack = 16 * 1024;
 static constexpr UBaseType_t kWorkerPrio = 5;
 static constexpr BaseType_t kWorkerCore = 0;
@@ -96,9 +96,6 @@ static bool UploadOriginalJpeg(const uint8_t* jpeg, size_t jpeg_len) {
     http->SetHeader("Transfer-Encoding", "chunked");
     http->SetTimeout(30000);
 
-    api::LogHttpBinaryRequest(TAG, "POST", url, jpeg_len, "vision/upload");
-    ESP_LOGI(TAG, "upload original JPEG %u bytes -> vision/upload Device-Id=%s",
-             (unsigned)jpeg_len, api::DeviceId().c_str());
 
     if (!http->Open("POST", url)) {
         ESP_LOGW(TAG, "upload open failed err=0x%x", http->GetLastError());
@@ -138,7 +135,6 @@ static bool UploadOriginalJpeg(const uint8_t* jpeg, size_t jpeg_len) {
     const int status = http->GetStatusCode();
     std::string resp = http->ReadAll();
     http->Close();
-    api::LogHttpResponse(TAG, status, resp);
 
     if (status < 200 || status >= 300) {
         ESP_LOGW(TAG, "upload failed status=%d", status);
@@ -162,19 +158,17 @@ static bool PublishL8(const reader::RasterImage& raster, uint32_t seq, char* url
     }
 
     if (a2ui_img_cache_is_ready()) {
-        std::vector<uint8_t> a2i1;
-        if (reader::EncodeL8ToA2i1(raster, a2i1) && !a2i1.empty() &&
-            a2i1.size() <= static_cast<size_t>(64 * 1024)) {
-            const esp_err_t cerr = a2ui_img_cache_store(url_out, a2i1.data(), a2i1.size());
+        std::vector<uint8_t> encoded;
+        if (reader::EncodeL8ToA2l8(raster, encoded) && !encoded.empty() &&
+            encoded.size() <= static_cast<size_t>(400 * 1024)) {
+            const esp_err_t cerr = a2ui_img_cache_store(url_out, encoded.data(), encoded.size());
             if (cerr != ESP_OK) {
                 ESP_LOGW(TAG, "cache store soft-fail: %s", esp_err_to_name(cerr));
             }
         } else {
-            ESP_LOGW(TAG, "skip A2I1 cache encode");
+            ESP_LOGW(TAG, "skip gray cache encode");
         }
     }
-    ESP_LOGI(TAG, "published %s L8 %ux%u", url_out, (unsigned)raster.width,
-             (unsigned)raster.height);
     return true;
 }
 

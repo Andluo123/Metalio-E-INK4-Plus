@@ -10,9 +10,10 @@ extern "C" {
 
 enum {
     kDisplayUiPortrait = 0,  // 竖屏（逻辑 DISPLAY_CONTENT_W×H，已扣 inset）
-    kDisplayUiLandLeft = 1,  // 左横（暂未启用）
+    kDisplayUiLandLeft = 1,  // 左横
     kDisplayUiLandRight = 2, // 右横
-    kDisplayUiOrientCount = 3,
+    kDisplayUiPortraitDown = 3, // 倒置竖屏，保持旧方向数值兼容
+    kDisplayUiOrientCount = 4,
 };
 
 /**
@@ -26,6 +27,12 @@ void DisplayUiBind(lv_display_t* disp, int panel_w, int panel_h);
  * @note 须在 LVGL 任务或已持 adapter 锁时调用
  */
 bool DisplayUiSetOrient(int orient);
+
+/**
+ * @brief 切换全屏绘制，待机与关机画面不使用普通 UI 内缩
+ * @note 须在 LVGL 任务或已持 adapter 锁时调用
+ */
+void DisplayUiSetFullScreen(bool full_screen);
 
 /** @brief 当前 UI 方向 */
 int DisplayUiGetOrient(void);
@@ -45,7 +52,7 @@ int DisplayUiLogH(void);
 void DisplayUiLogicalToPanel(int lx, int ly, int* px, int* py);
 
 /**
- * @brief CST816S 原生竖屏坐标 → 当前逻辑坐标（盖板键仍用原生坐标命中）
+ * @brief 触摸驱动归一化的原生竖屏坐标 → 当前逻辑坐标（盖板键仍用原生坐标命中）
  */
 void DisplayUiTouchToLogical(int tx, int ty, int* lx, int* ly);
 

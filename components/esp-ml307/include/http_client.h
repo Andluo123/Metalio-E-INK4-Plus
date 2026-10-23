@@ -6,6 +6,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 
+#include <atomic>
 #include <map>
 #include <string>
 #include <functional>
@@ -29,10 +30,15 @@ public:
     ~HttpClient();
 
     void SetTimeout(int timeout_ms) override;
+    /** @brief 设置本次请求的启动后绝对截止时间，单位微秒，零表示不限制。 */
+    void SetRequestDeadline(int64_t deadline_us) override {
+        request_deadline_us_ = deadline_us;
+    }
     void SetHeader(const std::string& key, const std::string& value) override;
     void SetContent(std::string&& content) override;
     bool Open(const std::string& method, const std::string& url) override;
     void Close() override;
+    void Cancel() override;
     int Read(char* buffer, size_t buffer_size) override;
     int Write(const char* buffer, size_t buffer_size) override;
     
@@ -84,6 +90,7 @@ private:
             : original_key(key), value(val) {}
     };
 
+    std::atomic<bool> cancelled_{false};
     NetworkInterface* network_;
     int connect_id_;
     EventGroupHandle_t event_group_handle_;
@@ -99,6 +106,8 @@ private:
     
     int status_code_ = -1;
     int timeout_ms_ = 30000;
+    int64_t request_deadline_us_ = 0;
+    int RemainingTimeoutMs() const;
     std::string rx_buffer_;
     std::map<std::string, HeaderEntry> headers_;  // key为小写，用于快速查找
     std::string url_;

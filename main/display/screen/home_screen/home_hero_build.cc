@@ -17,8 +17,14 @@ void HomeHero_OnSlashGapDraw(lv_event_t* e) {
     }
     lv_area_t a;
     lv_obj_get_content_coords(obj, &a);
-    // 斜线居中于时宽，长度适中、斜率缓于竖线
-    const lv_coord_t mid_x = (a.x1 + a.x2) / 2;
+    // 按实际数字宽度取两行中心的中点，保留小时偏左、分钟偏右的错位。
+    lv_point_t hour_size;
+    lv_point_t minute_size;
+    lv_text_get_size(&hour_size, lv_label_get_text(HomeHero_State().hour_lbl),
+                     HomeHero_SlashTimeFont(), 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_text_get_size(&minute_size, lv_label_get_text(HomeHero_State().minute_lbl),
+                     HomeHero_SlashTimeFont(), 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    const lv_coord_t mid_x = a.x1 + (hour_size.x + minute_size.x) / 4 + kSlashMinuteNudgeX / 2;
     lv_draw_line_dsc_t dsc;
     lv_draw_line_dsc_init(&dsc);
     dsc.color = lv_color_black();
@@ -172,7 +178,7 @@ void HomeHero_BuildSlashUi(lv_obj_t* parent, lv_coord_t y_offset) {
     lv_obj_remove_style_all(box);
     lv_obj_set_width(box, LV_HOR_RES - 2 * kSlashSidePad);
     lv_obj_set_height(box, LV_SIZE_CONTENT);
-    lv_obj_align(box, LV_ALIGN_TOP_MID, 0, y_offset + kHeroPadTop);
+    lv_obj_align(box, LV_ALIGN_TOP_MID, 0, y_offset + kSlashPadTop);
     lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
     lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
     // 底对齐：日期块落在分针一带，星期一行才看得见
@@ -200,6 +206,7 @@ void HomeHero_BuildSlashUi(lv_obj_t* parent, lv_coord_t y_offset) {
     HomeHero_StyleSlashTimeLabel(HomeHero_State().hour_lbl);
 
     lv_obj_t* slash_gap = lv_obj_create(time_col);
+    HomeHero_State().slash_gap = slash_gap;
     lv_obj_remove_style_all(slash_gap);
     lv_obj_set_size(slash_gap, kSlashTimeW, kSlashSlashGapH);
     lv_obj_set_style_bg_opa(slash_gap, LV_OPA_TRANSP, 0);

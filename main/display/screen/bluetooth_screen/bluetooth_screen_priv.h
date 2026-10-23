@@ -11,7 +11,6 @@
 
 constexpr const char* TAG = "BtScreen";
 constexpr int kAddrHexLen = 12; // 地址十六进制长度
-constexpr bool kBtPowerResetSupported = false; // 是否支持断电复位
 
 enum class BtMode : uint8_t {
     kNone = 0, // 未选

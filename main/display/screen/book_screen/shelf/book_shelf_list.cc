@@ -238,7 +238,7 @@ void SetShelfViewMode(int view) {
         UpdateShelfTitleLabel();
     }
     RefreshShelfViewToggleUi();
-    RequestRenderBookshelfPage();
+    RequestRenderBookshelfPage(true);
 }
 
 void OnShelfViewCoverClicked(lv_event_t* /*e*/) {

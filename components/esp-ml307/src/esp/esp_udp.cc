@@ -52,7 +52,7 @@ bool EspUdp::Connect(const std::string& host, int port) {
     int ret = connect(udp_fd_, (struct sockaddr*)&server_addr, sizeof(server_addr));
     if (ret < 0) {
         last_error_ = errno;
-        ESP_LOGE(TAG, "Failed to connect to %s:%d", host.c_str(), port);
+
         close(udp_fd_);
         udp_fd_ = -1;
         return false;

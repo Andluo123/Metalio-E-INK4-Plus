@@ -1,10 +1,13 @@
 /**
  * @file lv_adapter_epdiy.cc
- * @brief LVGL9 I1 真刷 → EPDiy；开机加载 HomeScreen
+ * @brief LVGL9 L8 灰度渲染 → EPDiy；开机加载 HomeScreen
  */
 
 #include "lv_adapter_epdiy.h"
-
+#include "epd_refresh.h"
+#include "epd_prepare.h"
+#include "epd_content_policy.h"
+ 
 #include "lv_adapter_epdiy_touch.h"
 
 #include "application.h"
@@ -20,6 +23,9 @@
 #include "epd_font24.h" // EPD_LOGICAL_W/H、epd_logical_to_physical
 #include "epd_highlevel.h"
 #include "epdiy.h"
+extern "C" {
+#include "output_lcd/lcd_driver.h"
+}
 #include "fontpack_lvgl.h"
 #include "frontlight.h"
 #include "home_screen/home_screen.h"
@@ -32,6 +38,13 @@
 #include "power_policy.h"
 #include "screen_common.h"
 #include "standby_screen/standby_screen.h"
+#include "standby_screen/standby_wallpaper.h"
+
+namespace {
+bool BlitL8ToEpdFullScreen(const reader::RasterImage& img);
+}
+#include "book_screen/book_screen.h"
+#include "vk_key_handler.h"
 #include "book_screen/reader/book_open_worker.h"
 #include "book_screen/reader/book_reader_prefs.h"
 #include "book_screen/settings/book_tap_zones.h"
@@ -53,6 +66,7 @@
 #include <mmap_generate_resources.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -60,21 +74,28 @@
 #include <font_awesome.h>
 #include <vector>
 
+extern "C" void* __wrap_lv_malloc_core(size_t size) {
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+extern "C" void* __wrap_lv_realloc_core(void* memory, size_t size) {
+    return heap_caps_realloc(memory, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
 #define TAG "lv_epdiy"
 
-static constexpr int kPartialBeforeFull = 5; // 局刷累计后 GC16 清残影（原 10 偏疏）
 static constexpr int kEpdTempC = 25;
-static int s_partial_count = 0;
 static std::atomic<bool> s_force_full{false};
 static std::atomic<bool> s_stream_paint{false};
 static std::atomic<bool> s_freeze_updates{false};
 static std::atomic<bool> s_defer_standby_commit{false}; // 进待机先攒 FB，Park 再一次全刷上屏
 static std::atomic<bool> s_restore_frontlight_after_commit{false}; // 退出待机：底层上墨后再开前光
-static bool s_fb_white_for_force = false;
 static SemaphoreHandle_t s_lvgl_mux = nullptr;
 
 static mmap_assets_handle_t s_resources = nullptr;
 static lv_display_t* s_disp = nullptr;
+static uint8_t* s_draw_buffer = nullptr;
+static size_t s_draw_buffer_bytes = 0;
 static LvAdapterEpdiy* s_instance = nullptr;
 
 LvAdapterEpdiy* LvAdapterEpdiy::Instance() {
@@ -129,49 +150,60 @@ static void epd_panel_exit() {
     Display::SetPanelBusy(false);
 }
 
-static void epd_commit_update(EpdiyHighlevelState* hl, bool force_full) {
-    if (hl == nullptr) {
-        return;
-    }
-    // 流式对话：只走 DU，避免每 10 帧 GC16 全刷风暴
-    const bool stream = s_stream_paint.load();
-    const bool full = force_full || (!stream && s_partial_count >= kPartialBeforeFull);
-    const int64_t t0 = esp_timer_get_time();
-    epd_panel_enter();
-    epd_poweron();
-    taskYIELD();
-    if (full) {
-        epd_hl_update_screen_from_white(hl, MODE_GC16, kEpdTempC);
-        s_partial_count = 0;
-    } else {
-        epd_hl_update_screen(hl, MODE_GL16, kEpdTempC);
-        if (!stream) {
-            s_partial_count += 1;
-        }
-    }
-    epd_poweroff();
-    epd_panel_exit();
-    if (full) {
-        ESP_LOGI(TAG, "commit GC16 partial=%d/%d stream=%d cost=%lldms", s_partial_count,
-                 kPartialBeforeFull, stream ? 1 : 0,
-                 (long long)((esp_timer_get_time() - t0) / 1000));
-    } else {
-        ESP_LOGI(TAG, "commit GL16 partial=%d/%d stream=%d cost=%lldms", s_partial_count,
-                 kPartialBeforeFull, stream ? 1 : 0,
-                 (long long)((esp_timer_get_time() - t0) / 1000));
-    }
+static void epd_commit_update(EpdiyHighlevelState*, bool force_full) {
+    EpdSubmit(force_full, s_stream_paint.load(),
+              s_restore_frontlight_after_commit.exchange(false));
 }
 
 static uint32_t lv_tick_cb(void) {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-/**
- * LVGL I1（1=白）→ EPDiy FB；逻辑竖屏 + 内容区 inset。
- *
- * PARTIAL：px_map 仅含本脏区，buf 原点=(area.x1,area.y1)，stride 按 area 宽；
- * 误用全屏绝对 y / disp_w stride 会在中部局刷时拉成横线，底边脏区写成黑带。
- */
+// Display resolution already excludes the panel's reserved border. Apply the
+// same drawable bounds to every screen and overlay, including direct loads.
+static void ConstrainDrawableRoot(lv_obj_t* root, int width, int height) {
+    if (root == nullptr) return;
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(root, 0, 0);
+    lv_obj_set_size(root, width, height);
+}
+
+static void drawable_bounds_cb(lv_event_t* event) {
+    auto* disp = static_cast<lv_display_t*>(lv_event_get_target(event));
+    const int width = lv_display_get_horizontal_resolution(disp);
+    const int height = lv_display_get_vertical_resolution(disp);
+    lv_obj_t* screen = lv_event_get_code(event) == LV_EVENT_SCREEN_LOAD_START
+        ? static_cast<lv_obj_t*>(lv_event_get_param(event)) : lv_display_get_screen_active(disp);
+    ConstrainDrawableRoot(screen, width, height);
+    ConstrainDrawableRoot(lv_display_get_layer_top(disp), width, height);
+    ConstrainDrawableRoot(lv_display_get_layer_sys(disp), width, height);
+    if (lv_event_get_code(event) == LV_EVENT_RESOLUTION_CHANGED) {
+        // 全屏背景退出后清除边缘，防止旧像素残留在普通 UI 的内缩区。
+        if (uint8_t* fb = EpdRenderBuffer()) {
+            memset(fb, 0xFF, static_cast<size_t>(epd_width() / 2) * epd_height());
+        }
+        if (screen != nullptr) lv_obj_invalidate(screen);
+    }
+}
+
+// LVGL owns the complete L8 result, including clipping, masks and layer blending.
+// PARTIAL buffers start at area.x1/y1; only convert pixels inside this dirty area.
+static void blit_l8_area_to_epdiy(const uint8_t* pixels, const lv_area_t* area, uint8_t* fb,
+                                 int disp_w, int disp_h) {
+    if (!pixels || !area || !fb || disp_w <= 0 || disp_h <= 0) return;
+    const int x1 = std::max<int>(area->x1, 0), y1 = std::max<int>(area->y1, 0);
+    const int x2 = std::min<int>(area->x2, disp_w - 1), y2 = std::min<int>(area->y2, disp_h - 1);
+    if (x1 > x2 || y1 > y2) return;
+    const int stride = lv_draw_buf_width_to_stride(lv_area_get_width(area), LV_COLOR_FORMAT_L8);
+    int px0, py0, px1, py1, px2, py2;
+    DisplayUiLogicalToPanel(x1, y1, &px0, &py0);
+    DisplayUiLogicalToPanel(x1 + 1, y1, &px1, &py1);
+    DisplayUiLogicalToPanel(x1, y1 + 1, &px2, &py2);
+    EpdBlitL8(fb, pixels, stride, area->x1, area->y1, x1, y1, x2, y2,
+              epd_width(), epd_height(), px0, py0, px1-px0, py1-py0, px2-px0, py2-py0);
+}
+
 static void blit_i1_area_to_epdiy(const uint8_t* px_map, const lv_area_t* area, uint8_t* fb,
                                   int disp_w, int disp_h) {
     if (px_map == nullptr || area == nullptr || fb == nullptr || disp_w <= 0 || disp_h <= 0) {
@@ -201,42 +233,24 @@ static void blit_i1_area_to_epdiy(const uint8_t* px_map, const lv_area_t* area, 
     const uint32_t pal_bytes =
         LV_COLOR_INDEXED_PALETTE_SIZE(LV_COLOR_FORMAT_I1) * (uint32_t)sizeof(lv_color32_t);
     // PARTIAL reshape：stride 对应该脏区宽度，不是全屏 disp_w
-    const uint32_t stride = lv_draw_buf_width_to_stride((uint32_t)area_w, LV_COLOR_FORMAT_I1);
+    const uint32_t stride = lv_draw_buf_width_to_stride((uint32_t)(area->x2-area->x1+1), LV_COLOR_FORMAT_I1);
     const uint8_t* bits = px_map + pal_bytes;
-    const int left = DISPLAY_CONTENT_LEFT_INSET;
-    const int top = DISPLAY_CONTENT_TOP_INSET;
     const int fb_w = epd_width();
     const int fb_h = epd_height();
     const int64_t t0 = esp_timer_get_time();
 
     // 底边/非整屏局刷：打一次关键日志，便于对照「横线 / 底黑条」
     if (y1 > 0 || y2 < disp_h - 1 || x1 > 0 || x2 < disp_w - 1) {
-        ESP_LOGI(TAG, "blit partial area=%d,%d-%d,%d aw=%d ah=%d stride=%u disp=%dx%d", x1, y1, x2,
+        ESP_LOGD(TAG, "blit partial area=%d,%d-%d,%d aw=%d ah=%d stride=%u disp=%dx%d", x1, y1, x2,
                  y2, area_w, area_h, (unsigned)stride, disp_w, disp_h);
     }
 
-    for (int ly = y1; ly <= y2; ++ly) {
-        const uint8_t* row = bits + (size_t)(ly - y1) * stride;
-        // logical→physical: xP=yL+top（落在 native 宽 1216，上下留白）
-        const int px = ly + top;
-        if (px < 0 || px >= fb_w) {
-            continue;
-        }
-        for (int lx = x1; lx <= x2; ++lx) {
-            const int bx = lx - x1; // 行内相对列
-            const uint8_t byte = row[bx >> 3];
-            const uint8_t bit = (byte >> (7 - (bx & 7))) & 1;
-            const uint8_t color = bit ? 0xFF : 0x00;
-            const int py = EPD_LOGICAL_W - 1 - (lx + left);
-            if (py < 0 || py >= fb_h) {
-                continue;
-            }
-            FbPutNative(fb, px, py, color, fb_w);
-        }
-        if ((ly & 63) == 0) {
-            taskYIELD();
-        }
-    }
+    int px0,py0,px1,py1,px2,py2;
+    DisplayUiLogicalToPanel(x1,y1,&px0,&py0);
+    DisplayUiLogicalToPanel(x1+1,y1,&px1,&py1);
+    DisplayUiLogicalToPanel(x1,y1+1,&px2,&py2);
+    EpdBlitI1(fb,bits,stride,area->x1,area->y1,x1,y1,x2,y2,fb_w,fb_h,
+              px0,py0,px1-px0,py1-py0,px2-px0,py2-py0);
     ESP_LOGD(TAG, "blit area %d,%d-%d,%d cost=%lldms", x1, y1, x2, y2,
              (long long)((esp_timer_get_time() - t0) / 1000));
 }
@@ -247,7 +261,7 @@ static void flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map)
         return;
     }
     EpdiyHighlevelState* hl = MetalioEpd_Hl();
-    uint8_t* fb = hl != nullptr ? epd_hl_get_framebuffer(hl) : nullptr;
+    uint8_t* fb = EpdRenderBuffer();
     if (fb == nullptr || px_map == nullptr || area == nullptr) {
         lv_display_flush_ready(disp);
         return;
@@ -255,29 +269,21 @@ static void flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map)
 
     const int disp_w = (int)lv_display_get_horizontal_resolution(disp);
     const int disp_h = (int)lv_display_get_vertical_resolution(disp);
-    // force/GC16：先抹白再叠脏区；普通 PARTIAL 仍叠上一帧（翻页）
-    if (s_force_full.load(std::memory_order_relaxed) && !s_fb_white_for_force) {
-        epd_hl_set_all_white(hl);
-        s_fb_white_for_force = true;
-        ESP_LOGI(TAG, "force-full: FB wiped white before blit (inset T%d B%d L%d R%d)",
-                 DISPLAY_CONTENT_TOP_INSET, DISPLAY_CONTENT_BOTTOM_INSET, DISPLAY_CONTENT_LEFT_INSET,
-                 DISPLAY_CONTENT_RIGHT_INSET);
-    }
-    blit_i1_area_to_epdiy(px_map, area, fb, disp_w, disp_h);
+    // Full refresh drives every pixel, but preserves the complete rendered target.
+    // A partial invalidation must never erase the rest of the framebuffer.
+    if(lv_display_get_color_format(disp)==LV_COLOR_FORMAT_I1)
+        blit_i1_area_to_epdiy(px_map,area,fb,disp_w,disp_h);
+    else blit_l8_area_to_epdiy(px_map,area,fb,disp_w,disp_h);
 
     if (lv_display_flush_is_last(disp)) {
         const int64_t t0 = esp_timer_get_time();
         const bool force = s_force_full.exchange(false);
-        ESP_LOGI(TAG, "flush last area=%d,%d-%d,%d force=%d defer=%d", area->x1, area->y1, area->x2,
+        ESP_LOGD(TAG, "flush last area=%d,%d-%d,%d force=%d defer=%d", area->x1, area->y1, area->x2,
                  area->y2, force ? 1 : 0, s_defer_standby_commit.load() ? 1 : 0);
         // 进待机：只把 LVGL 叠进 FB，不上墨；由 Park 一次 GC16 带出待机画面
         if (!s_defer_standby_commit.load(std::memory_order_relaxed)) {
             epd_commit_update(hl, force);
-            if (s_restore_frontlight_after_commit.exchange(false, std::memory_order_relaxed)) {
-                Frontlight::GetInstance().RestoreBrightness();
-            }
         }
-        s_fb_white_for_force = false;
         StandbyScreen::NotifyFlushCompleted();
         ESP_LOGD(TAG, "commit cost=%lldms", (long long)((esp_timer_get_time() - t0) / 1000));
     }
@@ -306,25 +312,42 @@ bool LvAdapterEpdiy::Init() {
     width_ = DISPLAY_CONTENT_W;
     height_ = DISPLAY_CONTENT_H;
 
-    EpdiyHighlevelState* hl = MetalioEpd_Hl();
     epd_panel_enter();
     epd_poweron();
-    epd_fullclear(hl, kEpdTempC);
+    assert(epd_lcd_white_border_pixels()==DISPLAY_WHITE_BORDER_PIXELS);
+    epd_lcd_prime_white_border(true);
+    const auto clear_result = epd_clear_checked();
+    epd_lcd_prime_white_border(false);
     epd_poweroff();
     epd_panel_exit();
-    s_partial_count = 0;
+    if (clear_result != EPD_DRAW_SUCCESS) {
+        ESP_LOGE(TAG, "startup panel clear failed: 0x%x", (unsigned)clear_result);
+        return false;
+    }
 
+    if (!EpdRefreshInit()) {
+        ESP_LOGE(TAG, "refresh worker/buffers unavailable");
+        return false;
+    }
     lv_init();
+    if(!EpdContentBlendInit()) return false;
     lv_tick_set_cb(lv_tick_cb);
-
     s_disp = lv_display_create(width_, height_);
+    lv_display_add_event_cb(s_disp, drawable_bounds_cb, LV_EVENT_SCREEN_LOAD_START, nullptr);
+    lv_display_add_event_cb(s_disp, drawable_bounds_cb, LV_EVENT_RESOLUTION_CHANGED, nullptr);
     lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_I1);
     DisplayUiBind(s_disp, epd_width(), epd_height());
 
-    const uint32_t stride = lv_draw_buf_width_to_stride((uint32_t)width_, LV_COLOR_FORMAT_I1);
-    const uint32_t pal_bytes =
-        LV_COLOR_INDEXED_PALETTE_SIZE(LV_COLOR_FORMAT_I1) * (uint32_t)sizeof(lv_color32_t);
-    const size_t buf_size = (size_t)pal_bytes + (size_t)stride * (size_t)height_;
+    // A bounded stripe works in either orientation. LVGL renders larger dirty
+    // areas in chunks; no full-screen shadow/coverage buffer is needed.
+    constexpr uint32_t kDrawRows = 64;
+    const uint32_t max_stride = lv_draw_buf_width_to_stride(
+        std::max(DISPLAY_WIDTH, DISPLAY_HEIGHT), LV_COLOR_FORMAT_L8);
+    const size_t binary_bytes=LV_COLOR_INDEXED_PALETTE_SIZE(LV_COLOR_FORMAT_I1)*sizeof(lv_color32_t)+
+        std::max(size_t(lv_draw_buf_width_to_stride(DISPLAY_WIDTH,LV_COLOR_FORMAT_I1))*DISPLAY_HEIGHT,
+                 size_t(lv_draw_buf_width_to_stride(DISPLAY_HEIGHT,LV_COLOR_FORMAT_I1))*DISPLAY_WIDTH);
+    // Retain a full I1 frame for fast ordinary pages; gray reuses this allocation.
+    const size_t buf_size=std::max<size_t>(binary_bytes,size_t(max_stride)*size_t(kDrawRows));
     uint8_t* buf1 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buf1 == nullptr) {
         buf1 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -333,9 +356,25 @@ bool LvAdapterEpdiy::Init() {
         ESP_LOGE(TAG, "no draw buffer %u", (unsigned)buf_size);
         return false;
     }
+    s_draw_buffer=buf1; s_draw_buffer_bytes=buf_size;
     lv_display_set_buffers(s_disp, buf1, nullptr, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_add_event_cb(s_disp,[](lv_event_t* event) {
+        auto* display=static_cast<lv_display_t*>(lv_event_get_target(event));
+        auto* root=lv_display_get_screen_active(display);
+        if(!root) return;
+        lv_obj_update_layout(root);
+        lv_obj_update_layout(lv_display_get_layer_top(display));
+        lv_obj_update_layout(lv_display_get_layer_sys(display));
+        const auto format=EpdVisibleContentNeedsGray(display) ? LV_COLOR_FORMAT_L8 : LV_COLOR_FORMAT_I1;
+        if(format==lv_display_get_color_format(display)) return;
+        lv_display_set_color_format(display,format);
+        lv_display_set_buffers(display,s_draw_buffer,nullptr,s_draw_buffer_bytes,LV_DISPLAY_RENDER_MODE_PARTIAL);
+        lv_obj_invalidate(root);
+        lv_obj_invalidate(lv_display_get_layer_top(display));
+        lv_obj_invalidate(lv_display_get_layer_sys(display));
+        ESP_LOGI(TAG,"content render format=%s",format==LV_COLOR_FORMAT_I1 ? "I1" : "L8");
+    },LV_EVENT_REFR_START,nullptr);
     lv_display_set_flush_cb(s_disp, flush_cb);
-
     lv_indev_t* indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, LvAdapterEpdiy_TouchReadCb);
@@ -440,7 +479,7 @@ static void PollBootKey() {
 }
 
 static bool SideKeysBlocked() {
-    return OtaUpgradeScreen::IsActive() || OtaConfirmDialog::IsActive();
+    return StandbyScreen::IsActive() || OtaUpgradeScreen::IsActive() || OtaConfirmDialog::IsActive();
 }
 
 static void ApplyVolumeDelta(int delta) {
@@ -486,14 +525,15 @@ static void ApplyVolumeAbsolute(int volume, const char* note) {
     }
 }
 
-// MetalioKeys index：0=BOOT 1=音量+ 2=音量- 3=电源；长按阈值同盖板虚拟键（电源长按走 TakeShutdownPulse）
-static bool s_side_prev_down[4] = {};
-static int64_t s_side_down_us[4] = {};
-static bool s_side_long_fired[4] = {};
+// 音量键沿状态；BOOT 和 POWER 由各自的分发路径处理。
+static bool s_side_prev_down[3] = {};
+static int64_t s_side_down_us[3] = {};
+static bool s_side_long_fired[3] = {};
 static bool s_side_synced = false;
 
-static void PollOneSideKey(int index, uint32_t long_ms, void (*on_click)(), void (*on_long)()) {
-    if (index < 0 || index >= 4) {
+static void PollOneSideKey(int index, uint32_t long_ms, void (*on_click)(), void (*on_long)(),
+                           void (*on_up)()) {
+    if (index < 1 || index > 2) {
         return;
     }
 
@@ -514,28 +554,55 @@ static void PollOneSideKey(int index, uint32_t long_ms, void (*on_click)(), void
         if (!s_side_long_fired[index] && !SideKeysBlocked() && on_click != nullptr) {
             on_click();
         }
+        // 阅读连翻：长按后松手须停定时器（短按无 repeat 时 OnPressUp 为空操作）
+        if (!SideKeysBlocked() && on_up != nullptr) {
+            on_up();
+        }
     }
     s_side_prev_down[index] = down;
 }
 
+// 正文沉浸：音量+=上一页、音量-=下一页（含长按连翻）；目录/设置浮层及其余页仍调音量
 static void OnVolUpClick() {
+    if (BookScreen::IsReadingActive()) {
+        VkKey_Dispatch("vk_prev");
+        return;
+    }
     ApplyVolumeDelta(10);
 }
 static void OnVolUpLong() {
+    if (BookScreen::IsReadingActive()) {
+        VkKey_OnLongPress("vk_prev");
+        return;
+    }
     ApplyVolumeAbsolute(100, Lang::Strings::MAX_VOLUME);
 }
+static void OnVolUpUp() {
+    if (BookScreen::IsReadingActive()) {
+        VkKey_OnPressUp("vk_prev");
+    }
+}
 static void OnVolDownClick() {
+    if (BookScreen::IsReadingActive()) {
+        VkKey_Dispatch("vk_next");
+        return;
+    }
     ApplyVolumeDelta(-10);
 }
 static void OnVolDownLong() {
+    if (BookScreen::IsReadingActive()) {
+        VkKey_OnLongPress("vk_next");
+        return;
+    }
     ApplyVolumeAbsolute(0, Lang::Strings::MUTED);
+}
+static void OnVolDownUp() {
+    if (BookScreen::IsReadingActive()) {
+        VkKey_OnPressUp("vk_next");
+    }
 }
 static void OnPowerClick() {
     PowerKey_OnClick();
-}
-static void OnPowerLong() {
-    // 硬件关机脉冲由 DisplayTickTask 里 TakeShutdownPulse 触发；此处仅记日志/策略钩子
-    PowerKey_OnLongPress();
 }
 
 static void PollSideKeys() {
@@ -545,10 +612,9 @@ static void PollSideKeys() {
         return;
     }
     if (!s_side_synced) {
-        // 恢复瞬间若键仍按着：吞掉本段手势（长按/短按都不当新事件）。
-        // 切勿把 down_us 置 0：否则下一拍 (now-0)≥阈值，电源短按会被当成已满 3s 关机。
+        // 恢复时吞掉仍按住的音量键手势，避免产生假单击或长按。
         const int64_t now = esp_timer_get_time();
-        for (int i = 1; i <= 3; ++i) {
+        for (int i = 1; i <= 2; ++i) {
             const bool down = MetalioKeys_IsDown(i);
             s_side_prev_down[i] = down;
             s_side_long_fired[i] = down;
@@ -557,10 +623,13 @@ static void PollSideKeys() {
         s_side_synced = true;
         return;
     }
-    PollOneSideKey(1, TOUCH_VK_LONG_MS, OnVolUpClick, OnVolUpLong);
-    PollOneSideKey(2, TOUCH_VK_LONG_MS, OnVolDownClick, OnVolDownLong);
-    // 电源长按阈值与 MetalioKeys 内脉冲一致，避免短按误触
-    PollOneSideKey(3, POWER_LONG_PRESS_MS, OnPowerClick, OnPowerLong);
+    PollOneSideKey(1, TOUCH_VK_LONG_MS, OnVolUpClick, OnVolUpLong, OnVolUpUp);
+    PollOneSideKey(2, TOUCH_VK_LONG_MS, OnVolDownClick, OnVolDownLong, OnVolDownUp);
+    // POWER clicks are latched by the sampling task. During standby the LP
+    // task is the sole consumer, including the interval blocked by Park FULL.
+    if (!StandbyScreen::IsActive() && MetalioKeys_TakePowerClick()) {
+        OnPowerClick();
+    }
 }
 
 void LvAdapterEpdiy::Tick() {
@@ -568,8 +637,9 @@ void LvAdapterEpdiy::Tick() {
         return;
     }
     if (Lock(50)) {
-        // OpenDone 无锁投递：先于 timer_handler，避免整屏 I1 占锁时回调永远进不来
+        // OpenDone 无锁投递：先于 timer_handler，避免整屏绘制占锁时回调永远进不来
         BookDrainPendingOpenDone();
+        BookScreen::PollStandbyWork();
         const int64_t t0 = esp_timer_get_time();
         lv_timer_handler();
         const int64_t dt = esp_timer_get_time() - t0;
@@ -585,7 +655,7 @@ void LvAdapterEpdiy::Tick() {
 }
 
 void LvAdapterEpdiy::SetSystemReady() {
-    SetStatus(Lang::Strings::STANDBY);
+    SetStatus("");
 }
 
 void LvAdapterEpdiy::RequestFullOnNextCommit() {
@@ -598,21 +668,17 @@ void LvAdapterEpdiy::FullRefresh() {
     }
     s_stream_paint.store(false);
     s_force_full.store(true);
-    lv_obj_t* scr = lv_screen_active();
-    if (scr != nullptr) {
-        lv_obj_invalidate(scr);
-    }
     if (Lock(1000)) {
+        lv_obj_t* scr = lv_screen_active();
+        if (scr != nullptr) lv_obj_invalidate(scr);
         lv_refr_now(s_disp);
         Unlock();
     }
 }
 
 void LvAdapterEpdiy::SetStreamPaintMode(bool on) {
-    s_stream_paint.store(on);
-    if (!on) {
-        s_force_full.store(true);
-    }
+    const bool was_on=s_stream_paint.exchange(on);
+    if (was_on && !on) EpdRequestScreenChange();
 }
 
 void LvAdapterEpdiy::FreezeFlush(bool on) {
@@ -620,6 +686,7 @@ void LvAdapterEpdiy::FreezeFlush(bool on) {
 }
 
 void LvAdapterEpdiy::BeginStandbyEnterPaint() {
+    EpdSuspendTestsForStandby();
     s_stream_paint.store(false);
     s_defer_standby_commit.store(true, std::memory_order_relaxed);
     RequestFullOnNextCommit();
@@ -629,7 +696,30 @@ void LvAdapterEpdiy::BeginStandbyEnterPaint() {
 void LvAdapterEpdiy::ParkEpdForStandby() {
     s_defer_standby_commit.store(false, std::memory_order_relaxed);
     SetStreamPaintMode(false);
-    FullRefresh();
+    if (const auto* wallpaper = StandbyWallpaper_DecodedImage()) {
+        // No LVGL redraw may overwrite the direct framebuffer before Park.
+        FreezeFlush(true);
+        BlitL8ToEpdFullScreen(*wallpaper);
+    } else {
+        FullRefresh();
+    }
+    // Stop further UI submissions before waiting: otherwise status updates may
+    // start another waveform between the wait completing and hardware shutdown.
+    FreezeFlush(true);
+    uint32_t sequence = EpdGetStats().submitted;
+    bool painted = EpdWait(sequence);
+    for (int attempt = 0; !painted && attempt < 2; ++attempt) {
+        ESP_LOGW(TAG, "standby FULL recovery %d (err=0x%x)", attempt + 1,
+                 EpdGetStats().last_error);
+        // Driver marks the physical baseline unknown on failure and clears it
+        // before retrying this complete framebuffer. LVGL remains frozen.
+        sequence = EpdSubmit(true);
+        painted = EpdWait(sequence);
+    }
+    if (!painted) {
+        ESP_LOGE(TAG, "standby FULL recovery failed");
+        return;
+    }
     // 待机画面已上墨后再关前光，避免关得过早还看得见底层页
     Frontlight::GetInstance().ForceAllLow();
     FreezeFlush(true);
@@ -637,6 +727,9 @@ void LvAdapterEpdiy::ParkEpdForStandby() {
 }
 
 void LvAdapterEpdiy::WakeEpdFromStandby() {
+    // Wake UI refreshes before the EPD commit that turns the light back on.
+    // Populate its target now so sliders never render the standby-only zero.
+    Frontlight::GetInstance().PrepareBrightnessRestore();
     s_defer_standby_commit.store(false, std::memory_order_relaxed);
     FreezeFlush(false);
     SetStreamPaintMode(false);
@@ -660,20 +753,24 @@ void LvAdapterEpdiy::ResumeStandbyBackgroundWork() {
 
 namespace {
 
-/** L8（0=黑 255=白）→ EPDiy FB，在内容区内居中；逻辑竖屏映射同 blit_i1 */
-bool BlitL8ToEpdContent(const reader::RasterImage& img) {
+// L8 背景在完整面板区域等比居中，不使用普通 UI 内缩。
+bool BlitL8ToEpdFullScreen(const reader::RasterImage& img) {
     EpdiyHighlevelState* hl = MetalioEpd_Hl();
-    uint8_t* fb = hl != nullptr ? epd_hl_get_framebuffer(hl) : nullptr;
+    uint8_t* fb = EpdRenderBuffer();
     if (fb == nullptr || img.empty()) {
         return false;
     }
-    epd_hl_set_all_white(hl);
-    const int max_w = DISPLAY_CONTENT_W;
-    const int max_h = DISPLAY_CONTENT_H;
-    const int draw_w = img.width < max_w ? img.width : max_w;
-    const int draw_h = img.height < max_h ? img.height : max_h;
-    const int left = DISPLAY_CONTENT_LEFT_INSET + (max_w - draw_w) / 2;
-    const int top = DISPLAY_CONTENT_TOP_INSET + (max_h - draw_h) / 2;
+    memset(fb, 0xFF, static_cast<size_t>(epd_width()/2)*epd_height());
+    const int max_w = DISPLAY_WIDTH;
+    const int max_h = DISPLAY_HEIGHT;
+    const double scale = std::min({1.0, double(max_w) / img.width, double(max_h) / img.height});
+    const int draw_w = std::max(1, int(img.width * scale));
+    const int draw_h = std::max(1, int(img.height * scale));
+    const int left = (max_w - draw_w) / 2;
+    const int top = (max_h - draw_h) / 2;
+    ESP_LOGI(TAG, "wallpaper framebuffer: panel=%dx%d image=%ux%u draw=%dx%d at=(%d,%d)",
+             max_w, max_h, static_cast<unsigned>(img.width), static_cast<unsigned>(img.height),
+             draw_w, draw_h, left, top);
     const int fb_w = epd_width();
     const int fb_h = epd_height();
     for (int ly = 0; ly < draw_h; ++ly) {
@@ -681,13 +778,13 @@ bool BlitL8ToEpdContent(const reader::RasterImage& img) {
         if (px < 0 || px >= fb_w) {
             continue;
         }
-        const uint8_t* row = img.pixels.data() + static_cast<size_t>(ly) * img.width;
+        const uint8_t* row = img.pixels.data() + static_cast<size_t>(ly * img.height / draw_h) * img.width;
         for (int lx = 0; lx < draw_w; ++lx) {
             const int py = EPD_LOGICAL_W - 1 - (lx + left);
             if (py < 0 || py >= fb_h) {
                 continue;
             }
-            FbPutNative(fb, px, py, row[lx], fb_w);
+            FbPutNative(fb, px, py, row[lx * img.width / draw_w], fb_w);
         }
         if ((ly & 63) == 0) {
             taskYIELD();
@@ -703,7 +800,7 @@ bool TryDecodeShutdownFromSd(reader::RasterImage& out) {
         ESP_LOGI(TAG, "shutdown img: no NVS shutdown file");
         return false;
     }
-    if (!reader::DecodeImageFileToL8(path, DISPLAY_CONTENT_W, DISPLAY_CONTENT_H, out) ||
+    if (!reader::DecodeImageFileToL8(path, 0, 0, out) ||
         out.empty()) {
         ESP_LOGW(TAG, "shutdown img: SD decode fail %s", path);
         return false;
@@ -713,6 +810,20 @@ bool TryDecodeShutdownFromSd(reader::RasterImage& out) {
 }
 
 bool TryDecodeShutdownBuiltin(reader::RasterImage& out) {
+    // 中英文默认图随应用固件更新，不依赖 resources 分区升级。
+    extern const uint8_t zh_start[] asm("_binary_bg_shutdown_zh_a2i1_start");
+    extern const uint8_t zh_end[] asm("_binary_bg_shutdown_zh_a2i1_end");
+    extern const uint8_t en_start[] asm("_binary_bg_shutdown_en_a2i1_start");
+    extern const uint8_t en_end[] asm("_binary_bg_shutdown_en_a2i1_end");
+    const bool is_zh = std::strcmp(Lang::CODE, "zh-CN") == 0;
+    const uint8_t* start = is_zh ? zh_start : en_start;
+    const uint8_t* end = is_zh ? zh_end : en_end;
+    if (reader::DecodeImageToL8(start, static_cast<size_t>(end - start),
+                              0, 0, out) && !out.empty()) {
+        ESP_LOGI(TAG, "shutdown img: embedded %s %dx%d", Lang::CODE, out.width, out.height);
+        return true;
+    }
+    ESP_LOGW(TAG, "shutdown img: embedded %s decode fail", Lang::CODE);
     if (s_resources == nullptr) {
         ESP_LOGW(TAG, "shutdown img: built-in missing (no mmap)");
         return false;
@@ -731,7 +842,7 @@ bool TryDecodeShutdownBuiltin(reader::RasterImage& out) {
         p += 2;
         n -= 2;
     }
-    if (!reader::DecodeImageToL8(p, n, DISPLAY_CONTENT_W, DISPLAY_CONTENT_H, out) || out.empty()) {
+    if (!reader::DecodeImageToL8(p, n, 0, 0, out) || out.empty()) {
         ESP_LOGW(TAG, "shutdown img: built-in decode fail");
         return false;
     }
@@ -776,6 +887,8 @@ void LvAdapterEpdiy::ShowPoweredOffScreen() {
     s_stream_paint.store(false);
 
     DisplayLockGuard lock(this);
+    DisplayUiSetFullScreen(true);
+    DisplayUiSetOrient(kDisplayUiPortrait);
     BindStatusWidgets(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 
     reader::RasterImage img;
@@ -785,7 +898,7 @@ void LvAdapterEpdiy::ShowPoweredOffScreen() {
     }
 
     if (have_img) {
-        if (!BlitL8ToEpdContent(img)) {
+        if (!BlitL8ToEpdFullScreen(img)) {
             have_img = false;
         }
     }
@@ -794,6 +907,7 @@ void LvAdapterEpdiy::ShowPoweredOffScreen() {
         ShowPoweredOffTextFallback();
     }
 
+    if (!EpdWait(EpdGetStats().submitted)) ESP_LOGE(TAG, "shutdown frame failed");
     FreezeFlush(true);
     ESP_LOGI(TAG, "powered-off screen shown (a2i1=%d)", have_img ? 1 : 0);
 }
@@ -938,6 +1052,9 @@ void LvAdapterEpdiy::SetStatus(const char* status) {
     if (status_label_ == nullptr) {
         return;
     }
+    if (network_busy_status_) {
+        std::snprintf(status_before_network_, sizeof(status_before_network_), "%s", status ? status : "");
+    }
     ApplyStatusTextLocked(status);
     lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
     if (notification_label_ != nullptr) {
@@ -969,6 +1086,9 @@ void LvAdapterEpdiy::ShowNotification(const char* notification, int duration_ms)
 }
 
 void LvAdapterEpdiy::UpdateStatusBar(bool update_all) {
+    // Background boot/network callbacks must not lazily initialize I2S while
+    // standby owns and may power down the peripherals.
+    if (StandbyScreen::IsActive()) return;
     auto& app = Application::GetInstance();
     auto& board = Board::GetInstance();
 
@@ -1003,7 +1123,15 @@ void LvAdapterEpdiy::UpdateStatusBar(bool update_all) {
     }
 
     DisplayLockGuard lock(this);
+    if (wifi_busy == nullptr && network_busy_status_) {
+        network_busy_status_ = false;
+        ApplyStatusTextLocked(status_before_network_);
+    }
     if (wifi_busy != nullptr && status_label_ != nullptr) {
+        if (!network_busy_status_) {
+            std::snprintf(status_before_network_, sizeof(status_before_network_), "%s", status_body_cache_);
+            network_busy_status_ = true;
+        }
         ApplyStatusTextLocked(wifi_busy);
         if (!AssistantScreen::IsPttWaveVisible()) {
             if (lv_obj_has_flag(status_label_, LV_OBJ_FLAG_HIDDEN)) {
@@ -1043,6 +1171,13 @@ void LvAdapterEpdiy::UpdateStatusBar(bool update_all) {
     bool charging = false;
     bool discharging = false;
     if (board.GetBatteryLevel(level, charging, discharging)) {
+        const int64_t tick = esp_timer_get_time();
+        if (level != battery_candidate_) {
+            battery_candidate_ = level;
+            battery_candidate_since_ = tick;
+        }
+        if (battery_level_cache_ >= 0 && std::abs(level-battery_level_cache_) < 2 &&
+            tick-battery_candidate_since_ < 30000000) level = battery_level_cache_;
         const char* icon = FONT_AWESOME_BATTERY_FULL;
         if (charging) {
             icon = FONT_AWESOME_BATTERY_BOLT;

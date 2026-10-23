@@ -47,6 +47,7 @@ struct ScreenPaintCoalesce {
     std::atomic<bool> queued{false};
     void (*paint)() = nullptr;
     void* defer_timer = nullptr;
+    bool defer_while_epd_busy = false;
 };
 
 /** @brief 合并多次重绘请求 */
@@ -56,5 +57,5 @@ void ScreenPaintCoalesceRequestDebounced(ScreenPaintCoalesce* c, uint64_t delay_
 /** @brief 重置合并重绘状态 */
 void ScreenPaintCoalesceReset(ScreenPaintCoalesce* c);
 
-/** @brief 为对象应用点状装饰底纹 */
+/** @brief 应用网点背景样式；尺寸与位置由调用方布局管理，全局显示入口负责边界裁剪 */
 void ScreenApplyDotBackdrop(lv_obj_t* obj);

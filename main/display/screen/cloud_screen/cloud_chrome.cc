@@ -4,14 +4,30 @@
 #include "cloud_screen/cloud_list.h"
 #include "cloud_screen/cloud_ui_helpers.h"
 #include "cloud_screen/preview/cloud_wallpaper_preview.h"
+#include "cloud_screen/ap/ap_qr.h"
+#include "cloud_screen/ap/ap_transfer.h"
 
 #include <lvgl.h>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <mutex>
+#include <esp_log.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <freertos/idf_additions.h>
+#include <esp_heap_caps.h>
 
+#include "wifi_station.h"
+
+#include "application.h"
 #include "assets/lang_config.h"
 #include "board.h"
+#include "fontpack_lvgl.h"
 #include "haptic_feedback.h"
+#include "settings_storage_tab.h"
 
 void ScheduleUserCloudSync() {
     auto& st = Cloud_State();
@@ -30,6 +46,358 @@ void ScheduleUserCloudSync() {
     ScheduleNetPrepAndFetch();
 }
 
+void ShowObj(lv_obj_t* obj, bool on) {
+    if (obj == nullptr) {
+        return;
+    }
+    if (on) {
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void ShowAppBody(bool on) {
+    auto& st = Cloud_State();
+    ShowObj(st.chrome.header_row, on);
+    ShowObj(st.chrome.filter_row, on);
+    ShowObj(st.chrome.list_body, on);
+    ShowObj(st.chrome.footer, on);
+    ShowObj(st.chrome.page_lbl, on);
+}
+
+void PaintApPanel(const ApTransferInfo& info) {
+    auto& st = Cloud_State();
+    if (st.chrome.ap_ssid_lbl != nullptr) {
+        char line[64];
+        std::snprintf(line, sizeof(line), Lang::Strings::CLOUD_AP_SSID_FMT, info.ssid);
+        lv_label_set_text(st.chrome.ap_ssid_lbl, line);
+    }
+    if (st.chrome.ap_url_lbl != nullptr) {
+        lv_label_set_text(st.chrome.ap_url_lbl, info.url);
+    }
+    if (st.chrome.ap_status_lbl != nullptr) {
+        ShowObj(st.chrome.ap_status_lbl, false);
+    }
+    char wifi_qr[64];
+    std::snprintf(wifi_qr, sizeof(wifi_qr), "WIFI:T:nopass;S:%s;;", info.ssid);
+    ApQrPaint(st.chrome.ap_qr_wifi, wifi_qr);
+    ApQrPaint(st.chrome.ap_qr_url, info.url);
+}
+
+void LeaveUsbMode() {
+    SettingsStorageTab_Reset();
+    auto& st = Cloud_State();
+    if (st.chrome.usb_panel != nullptr) {
+        lv_obj_clean(st.chrome.usb_panel);
+    }
+}
+
+namespace {
+
+constexpr uint32_t kRadioStack = 8192;
+constexpr int kRadioClosed = -1;
+constexpr int kRadioStandby = -2;
+#if CONFIG_SPIRAM && CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+constexpr uint32_t kRadioMemoryCaps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+#else
+constexpr uint32_t kRadioMemoryCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+#endif
+constexpr int kWifiWaitMs = 30000; // DHCP 常在 8s 边界才到，提前判失败会和状态栏相反
+constexpr int kWifiPollMs = 200;
+
+std::atomic<uint32_t> s_radio_gen{0};
+std::atomic<int> s_radio_mode{kRadioClosed};
+bool s_radio_stop_pending = false; // 受工作锁保护，快速重进也必须先完成旧服务清理
+TaskHandle_t s_radio_task = nullptr;
+std::mutex s_radio_work_mu;
+StaticSemaphore_t s_radio_ui_storage;
+SemaphoreHandle_t s_radio_ui_mu = nullptr;
+bool s_ap_standby_held = false;
+bool s_activation_held = false;
+
+void HoldApStandby() {
+    if (s_ap_standby_held) {
+        return;
+    }
+    PowerPolicy::GetInstance().Acquire(PowerNeed::StandbyInhibit);
+    s_ap_standby_held = true;
+}
+
+void ReleaseApStandby() {
+    if (!s_ap_standby_held) {
+        return;
+    }
+    PowerPolicy::GetInstance().Release(PowerNeed::StandbyInhibit);
+    s_ap_standby_held = false;
+}
+
+void HoldActivationPause() {
+    if (s_activation_held) {
+        return;
+    }
+    Application::GetInstance().PauseActivationPolling();
+    s_activation_held = true;
+}
+
+void ReleaseActivationPause() {
+    if (!s_activation_held) {
+        return;
+    }
+    Application::GetInstance().ResumeActivationPolling();
+    s_activation_held = false;
+}
+
+struct RadioResult {
+    uint32_t gen = 0;
+    int mode = -1;
+    bool ok = false;
+    const char* fail = nullptr;
+    ApTransferInfo info{};
+};
+
+RadioResult s_radio_result;
+
+void SetRadioStatus(const char* text) {
+    auto& st = Cloud_State();
+    if (st.chrome.radio_status_lbl == nullptr) {
+        return;
+    }
+    const bool on = text != nullptr && text[0] != '\0';
+    if (on) {
+        lv_label_set_text(st.chrome.radio_status_lbl, text);
+        lv_obj_align(st.chrome.radio_status_lbl, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_move_foreground(st.chrome.radio_status_lbl);
+    }
+    ShowObj(st.chrome.radio_status_lbl, on);
+}
+
+void ApplyRadioResult(void* /*user*/) {
+    if (s_radio_ui_mu == nullptr) {
+        return;
+    }
+    RadioResult local;
+    xSemaphoreTake(s_radio_ui_mu, portMAX_DELAY);
+    local = s_radio_result;
+    xSemaphoreGive(s_radio_ui_mu);
+    if (local.gen != s_radio_gen.load() || !ScreenAlive()) {
+        return;
+    }
+    auto& st = Cloud_State();
+    if (st.data.mode != local.mode) {
+        return;
+    }
+    if (local.mode == kCloudModeAp) {
+        if (!local.ok) {
+            ShowObj(st.chrome.ap_panel, false);
+            const char* fail = local.fail != nullptr ? local.fail : Lang::Strings::CLOUD_AP_FAIL;
+            SetRadioStatus(fail);
+            return;
+        }
+        PaintApPanel(local.info);
+        ShowObj(st.chrome.ap_panel, true);
+        SetRadioStatus(nullptr);
+        return;
+    }
+    if (local.mode != kCloudModeApp) {
+        return;
+    }
+    if (!local.ok) {
+        ShowAppBody(false);
+        const char* fail = local.fail != nullptr ? local.fail : Lang::Strings::CLOUD_WIFI_FAIL;
+        SetRadioStatus(fail);
+        return;
+    }
+    SetRadioStatus(nullptr);
+    ShowAppBody(true);
+    if (!st.data.fetch_done && !st.data.loading && !st.data.waiting_net) {
+        ScheduleUserCloudSync();
+    } else {
+        RenderListPage();
+    }
+}
+
+void PostRadioResult(uint32_t gen, int mode, bool ok, const char* fail, const ApTransferInfo* info) {
+    if (gen != s_radio_gen.load() || s_radio_ui_mu == nullptr) {
+        return;
+    }
+    xSemaphoreTake(s_radio_ui_mu, portMAX_DELAY);
+    s_radio_result.gen = gen;
+    s_radio_result.mode = mode;
+    s_radio_result.ok = ok;
+    s_radio_result.fail = fail;
+    s_radio_result.info = info != nullptr ? *info : ApTransferInfo{};
+    xSemaphoreGive(s_radio_ui_mu);
+    if (!ScreenLvAsync(ApplyRadioResult, nullptr)) {
+        ESP_LOGW(TAG, "radio ui post failed");
+    }
+}
+
+void RadioTask(void* /*arg*/) {
+    for (;;) {
+        uint32_t gen;
+        int mode;
+        bool stop_pending;
+        {
+            std::lock_guard<std::mutex> lock(s_radio_work_mu);
+            gen = s_radio_gen.load();
+            mode = s_radio_mode.load();
+            stop_pending = s_radio_stop_pending;
+            s_radio_stop_pending = false;
+        }
+        if (stop_pending) {
+            ApTransferStop(mode != kCloudModeUsb && mode != kRadioStandby);
+        }
+        if (s_radio_gen.load() != gen) continue;
+        if (mode == kCloudModeAp) {
+            ApTransferInfo info{};
+            const bool ok = ApTransferStart(&info);
+            PostRadioResult(gen, mode, ok, info.fail, &info);
+        } else if (mode == kCloudModeApp) {
+            if (!stop_pending) ApTransferStop(true);
+            bool connected = false;
+            int waited = 0;
+            while (s_radio_gen.load() == gen) {
+                auto& sta = WifiStation::GetInstance();
+                if (sta.IsConnected()) {
+                    connected = true;
+                    break;
+                }
+                // 射频没拉起来才是失败。还在关联或等 IP 时继续等。
+                if (!sta.IsLinkInProgress() && waited >= kWifiPollMs) {
+                    break;
+                }
+                if (waited >= kWifiWaitMs) {
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(kWifiPollMs));
+                waited += kWifiPollMs;
+            }
+            if (!connected && s_radio_gen.load() == gen) {
+                connected = WifiStation::GetInstance().IsConnected();
+            }
+            if (s_radio_gen.load() == gen) {
+                PostRadioResult(gen, mode, connected,
+                                connected ? nullptr : Lang::Strings::CLOUD_WIFI_FAIL, nullptr);
+            }
+            // 超时后 IP 仍可能到。到了就换成列表，避免顶部已连上、中间仍是失败。
+            if (!connected) {
+                while (s_radio_gen.load() == gen &&
+                       !WifiStation::GetInstance().IsConnected()) {
+                    vTaskDelay(pdMS_TO_TICKS(kWifiPollMs));
+                }
+                if (s_radio_gen.load() == gen && WifiStation::GetInstance().IsConnected()) {
+                    PostRadioResult(gen, mode, true, nullptr, nullptr);
+                }
+            }
+        } else if (mode == kCloudModeUsb && !stop_pending) {
+            ApTransferStop(false);
+        }
+        bool retire;
+        {
+            std::lock_guard<std::mutex> lock(s_radio_work_mu);
+            retire = s_radio_gen.load() == gen && mode < 0;
+            if (retire) s_radio_task = nullptr;
+        }
+        if (retire) {
+            vTaskDeleteWithCaps(nullptr);
+            return;
+        }
+        // 页面拥有任务期间保留通知等待，退出无需再分配清理任务。
+        while (s_radio_gen.load() == gen) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+    }
+}
+
+void KickRadio(int mode) {
+    std::lock_guard<std::mutex> lock(s_radio_work_mu);
+    if (s_radio_ui_mu == nullptr) {
+        s_radio_ui_mu = xSemaphoreCreateMutexStatic(&s_radio_ui_storage);
+    }
+    s_radio_mode.store(mode);
+    s_radio_gen.fetch_add(1);
+    if (mode < 0) {
+        ApTransferRequestStop(mode == kRadioStandby);
+        s_radio_stop_pending = s_radio_task != nullptr || s_radio_stop_pending;
+    }
+    if (s_radio_task != nullptr) {
+        xTaskNotifyGive(s_radio_task);
+    } else if (mode >= 0) {
+        if (xTaskCreatePinnedToCoreWithCaps(RadioTask, "cloud_radio", kRadioStack, nullptr,
+                                           tskIDLE_PRIORITY + 2, &s_radio_task, 0,
+                                           kRadioMemoryCaps) != pdPASS) {
+            s_radio_task = nullptr;
+            ESP_LOGW(TAG, "cloud_radio create failed");
+            SetRadioStatus(mode == kCloudModeAp ? Lang::Strings::CLOUD_AP_FAIL :
+                                                Lang::Strings::CLOUD_WIFI_FAIL);
+        }
+    }
+}
+
+}  // namespace
+
+void CloudRadioAbandon() {
+    KickRadio(kRadioClosed);
+    ReleaseApStandby();
+    ReleaseActivationPause();
+}
+
+void ParkApForStandby() {
+    auto& st = Cloud_State();
+    if (st.chrome.screen == nullptr || st.data.mode != kCloudModeAp) {
+        return;
+    }
+    // 待机先阻止旧启动继续接收请求，关闭和任务回收仍由射频任务完成。
+    KickRadio(kRadioStandby);
+}
+
+void ReloadApAfterStandby() {
+    auto& st = Cloud_State();
+    if (st.chrome.screen == nullptr || st.data.mode != kCloudModeAp) {
+        ApTransferAllowStart();
+        return;
+    }
+    ApTransferAllowStart();
+    EnterCloudMode(kCloudModeAp);
+}
+
+void EnterCloudMode(int mode) {
+    auto& st = Cloud_State();
+    const int prev = st.data.mode;
+    if (prev == kCloudModeUsb && mode != kCloudModeUsb) {
+        LeaveUsbMode();
+    }
+    st.data.mode = mode;
+    ShowAppBody(false);
+    ShowObj(st.chrome.ap_panel, false);
+    ShowObj(st.chrome.usb_panel, mode == kCloudModeUsb);
+    RefreshTabUi();
+    if (mode == kCloudModeApp) {
+        ReleaseActivationPause();
+    } else {
+        HoldActivationPause();
+    }
+    if (mode == kCloudModeAp) {
+        HoldApStandby();
+        SetRadioStatus(Lang::Strings::CLOUD_AP_OPENING);
+        KickRadio(mode);
+        return;
+    }
+    ReleaseApStandby();
+    if (mode == kCloudModeUsb) {
+        SetRadioStatus(nullptr);
+        if (st.chrome.usb_panel != nullptr && prev != kCloudModeUsb) {
+            lv_obj_clean(st.chrome.usb_panel);
+            SettingsStorageTab_Build(st.chrome.usb_panel);
+        }
+        KickRadio(mode);
+        return;
+    }
+    SetRadioStatus(Lang::Strings::CLOUD_WIFI_CONNECTING);
+    KickRadio(mode);
+}
+
 void OnTabClicked(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
         return;
@@ -41,13 +409,29 @@ void OnTabClicked(lv_event_t* e) {
         return;
     }
     const int tab = static_cast<int>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e)));
-    if (tab < 0 || tab >= kTabCount || tab == st.data.filter_tab) {
+    if (tab < 0 || tab >= kTabCount || tab == st.data.mode) {
         return;
     }
-    // 多选跨 Tab 保留选中；仅换筛选与列表
+    EnterCloudMode(tab);
+}
+
+void OnFilterClicked(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    auto& st = Cloud_State();
+    if (st.data.mode != kCloudModeApp || st.xfer.dl_page_open || st.preview.open ||
+        st.dialogs.dialog_mask != nullptr || st.dialogs.action_mask != nullptr) {
+        return;
+    }
+    const int tab = static_cast<int>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e)));
+    if (tab < 0 || tab >= kFilterTabCount || tab == st.data.filter_tab) {
+        return;
+    }
     st.data.filter_tab = tab;
     st.data.page = 0;
-    RefreshTabUi();
+    RefreshFilterUi();
+    RefreshSectionTitle();
     RenderListPage();
 }
 
@@ -106,6 +490,7 @@ void BuildCloudMainChrome(lv_obj_t* scr, lv_coord_t status_height) {
     lv_obj_align(body, LV_ALIGN_TOP_MID, 0, status_height);
     lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(body, kPad, 0);
+    lv_obj_set_style_pad_bottom(body, UiSy(4), 0);
     lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(body, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(body, kRowGap, 0);
@@ -130,13 +515,13 @@ void BuildCloudMainChrome(lv_obj_t* scr, lv_coord_t status_height) {
     lv_obj_set_style_pad_column(tab_row, 0, 0);
     Cloud_DisableScroll(tab_row);
     lv_obj_clear_flag(tab_row, LV_OBJ_FLAG_CLICKABLE);
-    MakeTabBtn(tab_row, Lang::Strings::CLOUD_TAB_ALL, 0);
-    MakeTabBtn(tab_row, Lang::Strings::CLOUD_TAB_WALLPAPER, 1);
-    MakeTabBtn(tab_row, Lang::Strings::CLOUD_TAB_BOOK, 2);
-    MakeTabBtn(tab_row, Lang::Strings::CLOUD_TAB_FONT, 3);
+    MakeTabBtn(tab_row, Lang::Strings::CLOUD_TAB_APP, kCloudModeApp);
+    MakeTabBtn(tab_row, Lang::Strings::CLOUD_TAB_AP, kCloudModeAp);
+    MakeTabBtn(tab_row, Lang::Strings::CLOUD_TAB_USB, kCloudModeUsb);
     RefreshTabUi();
 
     lv_obj_t* header_row = lv_obj_create(body);
+    st.chrome.header_row = header_row;
     lv_obj_remove_style_all(header_row);
     lv_obj_set_width(header_row, Cloud_ContentWidth());
     lv_obj_set_height(header_row, kHeaderH);
@@ -179,8 +564,9 @@ void BuildCloudMainChrome(lv_obj_t* scr, lv_coord_t status_height) {
     lv_obj_clear_flag(st.chrome.status_lbl, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(st.chrome.status_lbl, LV_OBJ_FLAG_HIDDEN);
 
-    // 细外框：包住列表 + 刷新；页码贴底在框外
+    // 细外框三种传输方式共用；App 时框内是列表和刷新，页码贴底在框外
     lv_obj_t* list_frame = lv_obj_create(body);
+    st.chrome.list_frame = list_frame;
     lv_obj_remove_style_all(list_frame);
     lv_obj_set_width(list_frame, Cloud_ContentWidth());
     lv_obj_set_flex_grow(list_frame, 1);
@@ -197,9 +583,49 @@ void BuildCloudMainChrome(lv_obj_t* scr, lv_coord_t status_height) {
     Cloud_DisableScroll(list_frame);
     lv_obj_clear_flag(list_frame, LV_OBJ_FLAG_CLICKABLE);
 
+    lv_obj_t* filter_row = lv_obj_create(list_frame);
+    st.chrome.filter_row = filter_row;
+    lv_obj_remove_style_all(filter_row);
+    lv_obj_set_width(filter_row, lv_pct(100));
+    lv_obj_set_height(filter_row, kFilterH);
+    lv_obj_set_style_border_side(filter_row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(filter_row, kSyncDividerW, 0);
+    lv_obj_set_style_border_color(filter_row, lv_color_black(), 0);
+    lv_obj_set_flex_flow(filter_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(filter_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    Cloud_DisableScroll(filter_row);
+    lv_obj_clear_flag(filter_row, LV_OBJ_FLAG_CLICKABLE);
+    const char* filter_names[kFilterTabCount] = {
+        Lang::Strings::CLOUD_TAB_ALL,
+        Lang::Strings::CLOUD_TAB_WALLPAPER,
+        Lang::Strings::CLOUD_TAB_BOOK,
+        Lang::Strings::CLOUD_TAB_FONT,
+    };
+    for (int i = 0; i < kFilterTabCount; ++i) {
+        lv_obj_t* btn = lv_obj_create(filter_row);
+        lv_obj_remove_style_all(btn);
+        lv_obj_set_flex_grow(btn, 1);
+        lv_obj_set_height(btn, lv_pct(100));
+        Cloud_DisableScroll(btn);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        HapticAttachClick(btn);
+        lv_obj_add_event_cb(btn, OnFilterClicked, LV_EVENT_CLICKED,
+                            reinterpret_cast<void*>(static_cast<intptr_t>(i)));
+        lv_obj_t* lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, filter_names[i]);
+        lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
+        lv_obj_center(lbl);
+        lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+        st.chrome.filter_btns[i] = btn;
+        st.chrome.filter_lbls[i] = lbl;
+    }
+    RefreshFilterUi();
+
     lv_obj_t* list_body = lv_obj_create(list_frame);
     lv_obj_remove_style_all(list_body);
     lv_obj_set_width(list_body, lv_pct(100));
+    lv_obj_set_style_pad_top(list_body, 2, 0);
     lv_obj_set_flex_grow(list_body, 1);
     Cloud_DisableScroll(list_body);
     st.chrome.list_body = list_body;
@@ -326,6 +752,118 @@ void BuildCloudMainChrome(lv_obj_t* scr, lv_coord_t status_height) {
     lv_obj_align(st.chrome.page_lbl, LV_ALIGN_BOTTOM_MID, 0, -kPageLblBottom);
     lv_obj_clear_flag(st.chrome.page_lbl, LV_OBJ_FLAG_CLICKABLE);
     Cloud_DisableScroll(st.chrome.page_lbl);
+
+    st.chrome.radio_status_lbl = lv_label_create(list_frame);
+    lv_label_set_text(st.chrome.radio_status_lbl, "");
+    lv_label_set_long_mode(st.chrome.radio_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(st.chrome.radio_status_lbl, Cloud_ContentWidth() - kListFramePad * 2);
+    lv_obj_set_style_text_align(st.chrome.radio_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(st.chrome.radio_status_lbl, Cloud_UiFont(), 0);
+    lv_obj_set_style_text_color(st.chrome.radio_status_lbl, lv_color_black(), 0);
+    lv_obj_add_flag(st.chrome.radio_status_lbl, LV_OBJ_FLAG_FLOATING);
+    lv_obj_align(st.chrome.radio_status_lbl, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(st.chrome.radio_status_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(st.chrome.radio_status_lbl, LV_OBJ_FLAG_HIDDEN);
+    Cloud_DisableScroll(st.chrome.radio_status_lbl);
+
+    // 热点 / U 盘都画在列表外框里，三种传输方式外框位置一致
+    lv_obj_t* ap_panel = lv_obj_create(list_frame);
+    st.chrome.ap_panel = ap_panel;
+    lv_obj_remove_style_all(ap_panel);
+    lv_obj_set_width(ap_panel, lv_pct(100));
+    lv_obj_set_flex_grow(ap_panel, 1);
+    lv_obj_set_flex_flow(ap_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ap_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ap_panel, 0, 0);
+    Cloud_DisableScroll(ap_panel);
+    lv_obj_add_flag(ap_panel, LV_OBJ_FLAG_HIDDEN);
+
+    auto make_step = [](lv_obj_t* parent) {
+        lv_obj_t* half = lv_obj_create(parent);
+        lv_obj_remove_style_all(half);
+        lv_obj_set_width(half, lv_pct(100));
+        lv_obj_set_flex_grow(half, 1);
+        lv_obj_set_flex_flow(half, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(half, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(half, kRowGap, 0);
+        Cloud_DisableScroll(half);
+        lv_obj_clear_flag(half, LV_OBJ_FLAG_CLICKABLE);
+        return half;
+    };
+    auto add_center = [](lv_obj_t* parent, const char* text, bool bold) {
+        lv_obj_t* lbl = lv_label_create(parent);
+        lv_label_set_text(lbl, text);
+        lv_obj_set_width(lbl, lv_pct(100));
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+        const lv_font_t* font = Cloud_UiFont();
+        if (bold) {
+            const lv_font_t* heavy = fontpack_lv_font_get(30, 4);
+            if (heavy != nullptr) {
+                font = heavy;
+            }
+        }
+        lv_obj_set_style_text_font(lbl, font, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
+        lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+        return lbl;
+    };
+    auto add_qr = [](lv_obj_t* parent) {
+        lv_obj_t* box = lv_obj_create(parent);
+        lv_obj_remove_style_all(box);
+        const int box_side = kApQrSide + kApQrPad * 2 + kApQrBorder * 2;
+        lv_obj_set_size(box, box_side, box_side);
+        lv_obj_set_style_bg_color(box, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(box, kApQrRadius, 0);
+        lv_obj_set_style_clip_corner(box, true, 0);
+        lv_obj_set_style_border_width(box, kApQrBorder, 0);
+        lv_obj_set_style_border_color(box, lv_color_black(), 0);
+        lv_obj_set_style_border_opa(box, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_side(box, LV_BORDER_SIDE_FULL, 0);
+        lv_obj_set_style_pad_all(box, kApQrPad, 0);
+        lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
+        Cloud_DisableScroll(box);
+        lv_obj_t* qr = lv_canvas_create(box);
+        lv_obj_set_size(qr, kApQrSide, kApQrSide);
+        lv_obj_set_style_bg_color(qr, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(qr, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(qr, LV_OBJ_FLAG_CLICKABLE);
+        return qr;
+    };
+    lv_obj_t* ap_top = make_step(ap_panel);
+    lv_obj_set_style_pad_top(ap_top, kListFramePad, 0);
+    add_center(ap_top, Lang::Strings::CLOUD_AP_STEP1, true);
+    add_center(ap_top, Lang::Strings::CLOUD_AP_JOIN, false);
+    st.chrome.ap_qr_wifi = add_qr(ap_top);
+    st.chrome.ap_ssid_lbl = add_center(ap_top, "", false);
+    st.chrome.ap_status_lbl = add_center(ap_top, "", false);
+    lv_obj_add_flag(st.chrome.ap_status_lbl, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t* ap_bot = make_step(ap_panel);
+    lv_obj_set_style_border_side(ap_bot, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_border_width(ap_bot, kSyncDividerW, 0);
+    lv_obj_set_style_border_color(ap_bot, lv_color_black(), 0);
+    lv_obj_set_style_pad_top(ap_bot, kListFramePad * 2, 0);
+    add_center(ap_bot, Lang::Strings::CLOUD_AP_STEP2, true);
+    add_center(ap_bot, Lang::Strings::CLOUD_AP_OPEN, false);
+    st.chrome.ap_url_lbl = add_center(ap_bot, "", false);
+    add_center(ap_bot, Lang::Strings::CLOUD_AP_HINT, false);
+    st.chrome.ap_qr_url = add_qr(ap_bot);
+
+    lv_obj_t* usb_panel = lv_obj_create(list_frame);
+    st.chrome.usb_panel = usb_panel;
+    lv_obj_remove_style_all(usb_panel);
+    lv_obj_set_width(usb_panel, lv_pct(100));
+    lv_obj_set_flex_grow(usb_panel, 1);
+    lv_obj_set_flex_flow(usb_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(usb_panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(usb_panel, kPreviewGap, 0);
+    lv_obj_set_style_pad_hor(usb_panel, UiSx(24), 0);
+    Cloud_DisableScroll(usb_panel);
+    lv_obj_add_flag(usb_panel, LV_OBJ_FLAG_HIDDEN);
 
     // 固定 6 条/页（Tab+标题后列表区刚好可排下）
     st.data.page_size = 6;

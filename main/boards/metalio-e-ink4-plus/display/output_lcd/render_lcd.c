@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../output_common/render_method.h"
@@ -14,6 +15,7 @@
 #include "../epd_internals.h"
 #include "../output_common/line_queue.h"
 #include "../output_common/lut.h"
+#include "../output_common/spatial_wipe.h"
 #include "../output_common/render_context.h"
 #include "epd_board.h"
 #include "epdiy.h"
@@ -23,6 +25,22 @@
 // declare vector optimized line mask application.
 void epd_apply_line_mask_VE(uint8_t* line, const uint8_t* mask, int mask_len);
 
+static void IRAM_ATTR record_underflow(RenderContext_t* ctx,int reason,int thread) {
+    if(!ctx->fault_reason) {
+        ctx->fault_phase=ctx->current_frame+1;
+        ctx->fault_line=ctx->lines_consumed;
+        ctx->fault_thread=thread;
+        ctx->fault_ready=ctx->lines_consumed<ctx->lines_total ?
+            __atomic_load_n(&ctx->line_ready[ctx->lines_consumed],__ATOMIC_ACQUIRE) : -1;
+        for(int i=0;i<NUM_RENDER_THREADS;++i) {
+            ctx->fault_write[i]=atomic_load_explicit(&ctx->line_queues[i].current,memory_order_acquire);
+            ctx->fault_read[i]=atomic_load_explicit(&ctx->line_queues[i].last,memory_order_acquire);
+        }
+        ctx->fault_reason=reason;
+    }
+    ctx->error|=EPD_DRAW_EMPTY_LINE_QUEUE;
+}
+
 __attribute__((optimize("O3"))) static bool IRAM_ATTR
 retrieve_line_isr(RenderContext_t* ctx, uint8_t* buf) {
     if (ctx->lines_consumed >= ctx->lines_total) {
@@ -31,8 +49,11 @@ retrieve_line_isr(RenderContext_t* ctx, uint8_t* buf) {
     int thread = ctx->line_threads[ctx->lines_consumed];
     BaseType_t awoken = pdFALSE;
 
-    if (thread >= NUM_RENDER_THREADS) {
-        ctx->error |= EPD_DRAW_EMPTY_LINE_QUEUE;
+    // Queue commit is the authoritative release/acquire publication. A producer
+    // can be preempted AFTER lq_commit but BEFORE publishing line_ready. That
+    // separate flag is useful for prefill, but cannot reject a readable queue.
+    if (thread < 0 || thread >= NUM_RENDER_THREADS) {
+        record_underflow(ctx,1,thread);
         memset(buf, 0x00, ctx->display_width / 4);
         ctx->lines_consumed += 1;
         return awoken;
@@ -41,7 +62,7 @@ retrieve_line_isr(RenderContext_t* ctx, uint8_t* buf) {
     LineQueue_t* lq = &ctx->line_queues[thread];
 
     if (lq_read(lq, buf) != 0) {
-        ctx->error |= EPD_DRAW_EMPTY_LINE_QUEUE;
+        record_underflow(ctx,2,thread);
         memset(buf, 0x00, ctx->display_width / 4);
     }
 
@@ -59,7 +80,7 @@ static void IRAM_ATTR handle_lcd_frame_done(RenderContext_t* ctx) {
 
     // 扫描先于供数结束时置错，禁止残留行进入下一相位
     if (ctx->lines_consumed < ctx->lines_total) {
-        ctx->error |= EPD_DRAW_EMPTY_LINE_QUEUE;
+        record_underflow(ctx,3,-1);
     }
 
     BaseType_t task_awoken = pdFALSE;
@@ -72,6 +93,48 @@ static void IRAM_ATTR handle_lcd_frame_done(RenderContext_t* ctx) {
 #ifndef EPD_MIN_PHASE_US
 #define EPD_MIN_PHASE_US 12000
 #endif
+static int s_prefill_lines = 192;
+static StaticSemaphore_t s_scan_lock_storage;
+static SemaphoreHandle_t s_scan_lock;
+
+// Serialize only task-side start/stop. Never hold an interrupt-disabled lock
+// while starting the LCD or waiting for a feeder on the other core.
+static void scan_lock(void) {
+    if (xSemaphoreTake(s_scan_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGE("epd_lcd", "scan start/stop did not quiesce");
+        abort();
+    }
+}
+
+static void cancel_scan(RenderContext_t* ctx) {
+    atomic_store_explicit(&ctx->feed_cancelled, true, memory_order_release);
+    scan_lock();
+    epd_lcd_line_source_cb(NULL, NULL);
+    // abort_frame uses the ISR finish path. Suppress its callback here: the
+    // update task must not execute handle_lcd_frame_done/FromISR APIs.
+    epd_lcd_frame_done_cb(NULL, NULL);
+    epd_lcd_abort_frame();
+    xSemaphoreGive(s_scan_lock);
+}
+
+static bool start_scan(RenderContext_t* ctx) {
+    scan_lock();
+    if (atomic_load_explicit(&ctx->feed_cancelled, memory_order_acquire)) {
+        xSemaphoreGive(s_scan_lock);
+        return false;
+    }
+    epd_lcd_line_source_cb((line_cb_func_t)&retrieve_line_isr, ctx);
+    epd_lcd_start_frame();
+    xSemaphoreGive(s_scan_lock);
+    return true;
+}
+
+static int last_phase_average, last_phase_minimum, last_phase_maximum;
+void epd_lcd_get_timing(int* average,int* minimum,int* maximum) {
+    *average=__atomic_load_n(&last_phase_average,__ATOMIC_RELAXED);
+    *minimum=__atomic_load_n(&last_phase_minimum,__ATOMIC_RELAXED);
+    *maximum=__atomic_load_n(&last_phase_maximum,__ATOMIC_RELAXED);
+}
 
 static void pace_phase(int64_t phase_start_us) {
     for (;;) {
@@ -83,13 +146,31 @@ static void pace_phase(int64_t phase_start_us) {
 }
 
 void lcd_do_update(RenderContext_t* ctx) {
+    if (s_scan_lock == NULL) {
+        s_scan_lock = xSemaphoreCreateMutexStatic(&s_scan_lock_storage);
+        assert(s_scan_lock != NULL);
+    }
+    const int64_t cycle_start=esp_timer_get_time();
+    int64_t previous_phase_start=0, period_total=0;
+    int period_min=INT32_MAX, period_max=0, periods=0;
+    int completed_frames=0;
+    ctx->fault_reason=0;
     epd_set_mode(1);
     ESP_LOGD("epd_lcd", "update %d frames, lines=%d (stream pace=%dus)", ctx->cycle_frames,
              ctx->lines_total, EPD_MIN_PHASE_US);
 
     for (uint8_t k = 0; k < ctx->cycle_frames; k++) {
+        const int64_t phase_start=esp_timer_get_time();
+        if (previous_phase_start) {
+            const int period=(int)(phase_start-previous_phase_start);
+            if (period<period_min) period_min=period;
+            if (period>period_max) period_max=period;
+            period_total+=period; ++periods;
+        }
+        previous_phase_start=phase_start;
         epd_lcd_frame_done_cb((frame_done_func_t)handle_lcd_frame_done, ctx);
         prepare_context_for_next_frame(ctx);
+        atomic_store_explicit(&ctx->feed_cancelled, false, memory_order_release);
 
         const int64_t t0 = esp_timer_get_time();
 
@@ -97,22 +178,29 @@ void lcd_do_update(RenderContext_t* ctx) {
         xTaskNotifyGive(ctx->feed_tasks[!xPortGetCoreID()]);
         xTaskNotifyGive(ctx->feed_tasks[xPortGetCoreID()]);
 
-        if (xSemaphoreTake(ctx->frame_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        if (xSemaphoreTake(ctx->frame_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
             ESP_LOGE("epd_lcd", "LCD frame %d/%d timeout", k + 1, ctx->cycle_frames);
             ctx->error |= EPD_DRAW_EMPTY_LINE_QUEUE;
-            epd_lcd_line_source_cb(NULL, NULL);
-            epd_lcd_abort_frame();
+            cancel_scan(ctx);
             xSemaphoreTake(ctx->frame_done, 0);
         }
 
         for (int i = 0; i < NUM_RENDER_THREADS; i++) {
-            if (xSemaphoreTake(ctx->feed_done_smphr[i], pdMS_TO_TICKS(15000)) != pdTRUE) {
+            if (xSemaphoreTake(ctx->feed_done_smphr[i], pdMS_TO_TICKS(2000)) != pdTRUE) {
                 ESP_LOGE("epd_lcd", "feed %d timeout @frame %d", i, k);
                 ctx->error |= EPD_DRAW_EMPTY_LINE_QUEUE;
+                cancel_scan(ctx);
+                // Do not return to render.c, reset queues or free LUTs while
+                // this feeder can still touch them. Cancellation normally
+                // completes at its next row/queue check; a stuck task is fatal.
+                if (xSemaphoreTake(ctx->feed_done_smphr[i], pdMS_TO_TICKS(2000)) != pdTRUE) {
+                    ESP_LOGE("epd_lcd", "feed %d failed to stop; retaining live buffers", i);
+                    abort();
+                }
             }
         }
 
-        pace_phase(t0);
+        pace_phase(phase_start);
 
         const int64_t period_us = esp_timer_get_time() - t0;
         if ((k & 3) == 0 || k + 1 == ctx->cycle_frames) {
@@ -121,12 +209,22 @@ void lcd_do_update(RenderContext_t* ctx) {
         }
 
         if (ctx->error) {
+            cancel_scan(ctx);
+            if(ctx->fault_reason) {
+                int eof_gap=0,eof_work=0;
+                epd_lcd_get_stream_stats(&eof_gap,&eof_work);
+                ESP_LOGE("epd_lcd","stream fault reason=%d phase=%d/%d line=%d/%d owner=%d ready=%d q0=%d/%d q1=%d/%d prefill=%d eof_gap=%dus eof_work=%dus",
+                    ctx->fault_reason,ctx->fault_phase,ctx->cycle_frames,ctx->fault_line,ctx->lines_total,
+                    ctx->fault_thread,ctx->fault_ready,ctx->fault_write[0],ctx->fault_read[0],
+                    ctx->fault_write[1],ctx->fault_read[1],s_prefill_lines,eof_gap,eof_work);
+            }
             for (int i = 0; i < NUM_RENDER_THREADS; i++) {
                 lq_reset(&ctx->line_queues[i]);
             }
             break;
         }
 
+        ++completed_frames;
         ctx->current_frame++;
     }
 
@@ -134,6 +232,14 @@ void lcd_do_update(RenderContext_t* ctx) {
     epd_lcd_frame_done_cb(NULL, NULL);
 
     epd_set_mode(0);
+    if (periods) {
+        __atomic_store_n(&last_phase_average,(int)(period_total/periods),__ATOMIC_RELAXED);
+        __atomic_store_n(&last_phase_minimum,period_min,__ATOMIC_RELAXED);
+        __atomic_store_n(&last_phase_maximum,period_max,__ATOMIC_RELAXED);
+        ESP_LOGI("EpdTiming","phase cadence us: avg=%d min=%d max=%d frames=%d completed=%d cycle=%dms",
+        (int)(period_total/periods),period_min,period_max,ctx->cycle_frames,
+        completed_frames,(int)((esp_timer_get_time()-cycle_start)/1000));
+    }
 }
 
 __attribute__((optimize("O3"))) static bool IRAM_ATTR
@@ -188,6 +294,8 @@ static void push_pixels_populate_line(RenderContext_t* ctx, int color) {
 }
 
 void epd_push_pixels_lcd(RenderContext_t* ctx, short time, int color) {
+    xSemaphoreTake(ctx->frame_done, 0);
+    ctx->fault_reason = 0;
     ctx->current_frame = 0;
     ctx->lines_total = ctx->display_height;
     ctx->lines_consumed = 0;
@@ -200,8 +308,19 @@ void epd_push_pixels_lcd(RenderContext_t* ctx, short time, int color) {
 
     epd_set_mode(1);
     epd_lcd_start_frame();
-    xSemaphoreTake(ctx->frame_done, portMAX_DELAY);
+    if (xSemaphoreTake(ctx->frame_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ctx->error |= EPD_DRAW_EMPTY_LINE_QUEUE;
+        epd_lcd_line_source_cb(NULL, NULL);
+        epd_lcd_frame_done_cb(NULL, NULL);
+        epd_lcd_abort_frame();
+        ESP_LOGE("epd_lcd", "clear scan timed out");
+    }
     epd_set_mode(0);
+
+    if (ctx->error) {
+        ESP_LOGE("epd_lcd", "clear scan failed reason=%d line=%d/%d", ctx->fault_reason,
+                 ctx->lines_consumed, ctx->lines_total);
+    }
 
     free(ctx->static_line_buffer);
     ctx->static_line_buffer = NULL;
@@ -210,12 +329,12 @@ void epd_push_pixels_lcd(RenderContext_t* ctx, short time, int color) {
 #define int_min(a, b) (((a) < (b)) ? (a) : (b))
 
 // 预填够 bounce 再开扫；太少易欠载，太多则短队列在开扫前会堵死
-static int s_prefill_lines = 127;
-
+// S31 uses C LUT feeding instead of Pico's Xtensa SIMD. The 64-line profile
+// underruns during concurrent audio. Alternate producers to prefill 192 rows
+// without exceeding either existing 127-slot queue.
 __attribute__((optimize("O3"))) void IRAM_ATTR
 lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
     assert(ctx->lut_lookup_func != NULL);
-    uint8_t* input_line = ctx->feed_line_buffers[thread_id];
 
     LineQueue_t* lq = &ctx->line_queues[thread_id];
     int l = 0;
@@ -225,9 +344,6 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
         return;
     }
 
-    // line must be able to hold 2-pixel-per-byte or 1-pixel-per-byte data
-    memset(input_line, 0x00, ctx->display_width);
-
     EpdRect area = ctx->area;
     int min_y, max_y, bytes_per_line, _ppB;
     const uint8_t* ptr_start;
@@ -235,15 +351,30 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
 
     assert(area.width == ctx->display_width && area.x == 0 && !ctx->error);
 
-    const int trigger_line = int_min(s_prefill_lines, max_y - min_y);
+    const int trigger_line = int_min(s_prefill_lines, ctx->lines_total-1);
 
-    while (l = atomic_fetch_add(&ctx->lines_prepared, 1), l < ctx->lines_total) {
+    // Fixed ownership bounds each producer to half the prefill. With dynamic
+    // claims one core can fill its 127-slot queue before a larger prefill starts.
+    for (l=thread_id; l<ctx->lines_total; l+=NUM_RENDER_THREADS) {
+        if (atomic_load_explicit(&ctx->feed_cancelled, memory_order_acquire)) return;
         ctx->line_threads[l] = (uint8_t)thread_id;
 
         // 预填够行后开扫，随后边扫边喂
-        if (l - min_y == trigger_line) {
-            epd_lcd_line_source_cb((line_cb_func_t)&retrieve_line_isr, ctx);
-            epd_lcd_start_frame();
+        if (l == trigger_line) {
+            // Claimed rows are not necessarily committed: the other core may
+            // still own an early row. Start scanning only when the entire
+            // prefill prefix is ready, not when a producer claims row 127.
+            const int64_t ready_deadline=esp_timer_get_time()+2000000;
+            for (int row=0;row<l;++row) {
+                while (!__atomic_load_n(&ctx->line_ready[row],__ATOMIC_ACQUIRE)) {
+                    if (atomic_load_explicit(&ctx->feed_cancelled, memory_order_acquire)
+                        || ctx->error || esp_timer_get_time()>ready_deadline) {
+                        ctx->error|=EPD_DRAW_EMPTY_LINE_QUEUE; return;
+                    }
+                    vTaskDelay(0);
+                }
+            }
+            if (!start_scan(ctx)) return;
         }
 
         if (l < min_y || l >= max_y
@@ -251,8 +382,8 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
             uint8_t* buf = NULL;
             int wait_iters = 0;
             while (buf == NULL) {
-                if (ctx->error & EPD_DRAW_EMPTY_LINE_QUEUE) {
-                    lq_reset(lq);
+                if (atomic_load_explicit(&ctx->feed_cancelled, memory_order_acquire)
+                    || (ctx->error & EPD_DRAW_EMPTY_LINE_QUEUE)) {
                     return;
                 }
                 buf = lq_current(lq);
@@ -262,12 +393,12 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
                 vTaskDelay(0);
                 if (++wait_iters > 30000) {
                     ctx->error |= EPD_DRAW_EMPTY_LINE_QUEUE;
-                    lq_reset(lq);
                     return;
                 }
             }
             memset(buf, 0x00, lq->element_size);
             lq_commit(lq);
+            __atomic_store_n(&ctx->line_ready[l],1,__ATOMIC_RELEASE);
             continue;
         }
 
@@ -280,8 +411,8 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
         uint8_t* buf = NULL;
         int wait_iters = 0;
         while (buf == NULL) {
-            if (ctx->error & EPD_DRAW_EMPTY_LINE_QUEUE) {
-                lq_reset(lq);
+            if (atomic_load_explicit(&ctx->feed_cancelled, memory_order_acquire)
+                || (ctx->error & EPD_DRAW_EMPTY_LINE_QUEUE)) {
                 return;
             }
             buf = lq_current(lq);
@@ -291,14 +422,16 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
             vTaskDelay(0);
             if (++wait_iters > 30000) {
                 ctx->error |= EPD_DRAW_EMPTY_LINE_QUEUE;
-                lq_reset(lq);
                 return;
             }
         }
 
-        ctx->lut_lookup_func(lp, buf, ctx->conversion_lut, ctx->display_width);
+        if(ctx->spatial_luts) epd_spatial_line((const uint8_t*)lp,buf,ctx->display_width,
+            ctx->spatial_luts,ctx->spatial_bands,ctx->spatial_by_y,l);
+        else ctx->lut_lookup_func(lp, buf, ctx->conversion_lut, ctx->display_width);
         epd_apply_line_mask_VE(buf, ctx->line_mask, ctx->display_width / 4);
         lq_commit(lq);
+        __atomic_store_n(&ctx->line_ready[l],1,__ATOMIC_RELEASE);
     }
 }
 

@@ -1,6 +1,8 @@
+#include "epd_content_policy.h"
 #include "book_screen/shelf/book_bookshelf.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/cover/book_cover_cell.h"
+#include "book_screen/cover/book_cover_geometry.h"
 #include "book_screen/cover/book_cover_workers.h"
 #include "book_screen/book_font_runtime.h"
 #include "book_screen/book_geom.h"
@@ -12,11 +14,15 @@
 #include "book_screen/settings/book_ttf_panel.h"
 #include "book_screen/book_vk.h"
 #include "book_screen/book_nav.h"
+#include "display_orient.h"
 #include "book_screen/settings/book_settings_sheet.h"
+#include "book_screen/settings/book_font_multi.h"
 
 #include <lvgl.h>
+#include "src/misc/cache/instance/lv_image_cache.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 #include "assets/lang_config.h"
 #include "SdCardManager.hpp"
@@ -26,6 +32,48 @@
 #include "reader/book_library.h"
 #include "screen_common.h"
 #include "vk_key_handler.h"
+
+namespace {
+constexpr lv_coord_t kShelfBaseDepth=UiSx(12);
+constexpr lv_coord_t kShelfBaseTop=UiSy(18);
+static lv_coord_t ShelfSideInset() { return std::max<lv_coord_t>(kShelfBaseDepth,kShelfCoverCheckSize/2); }
+static lv_coord_t ShelfColumnGap() { return std::max<lv_coord_t>(kShelfColGap,kShelfCoverCheckSize/2+UiSx(4)); }
+static lv_coord_t ShelfBookWidth() {
+    return (Book_ContentWidth()-2*ShelfSideInset()-ShelfColumnGap()*(kShelfCols-1))/kShelfCols;
+}
+static lv_coord_t ShelfBaseFrontHeight() {
+    return Book_ItemFont()->line_height+UiSy(14);
+}
+// Native L8 image: LVGL owns its clipping, stacking and gray blending.
+static std::vector<uint8_t> shelf_base_pixels;
+static lv_image_dsc_t shelf_base_image{};
+static void PrepareShelfBase(int width) {
+    lv_image_cache_drop(&shelf_base_image);
+    const int front=ShelfBaseFrontHeight(),height=kShelfBaseTop+front;
+    shelf_base_pixels.assign(width*height,255);
+    for(int y=0;y<height;++y) {
+        const int shift=y<kShelfBaseTop?kShelfBaseDepth*(kShelfBaseTop-1-y)/std::max<int>(1,kShelfBaseTop-1):0;
+        const int bottom=height-kShelfBaseTop;
+        const int end_shift=y>=bottom?kShelfBaseDepth*(y-bottom)/std::max<int>(1,kShelfBaseTop-1):0;
+        const int left=y<kShelfBaseTop?shift:0;
+        const int face_right=width-kShelfBaseDepth-1+shift;
+        for(int x=left;x<width-end_shift;++x)
+            shelf_base_pixels[y*width+x]=x>face_right?0:(y<kShelfBaseTop?85:119);
+    }
+    shelf_base_image={};shelf_base_image.header.magic=LV_IMAGE_HEADER_MAGIC;
+    shelf_base_image.header.cf=LV_COLOR_FORMAT_L8;
+    shelf_base_image.header.w=width;shelf_base_image.header.h=height;
+    shelf_base_image.header.stride=width;
+    shelf_base_image.data_size=shelf_base_pixels.size();shelf_base_image.data=shelf_base_pixels.data();
+}
+static void CreateShelfBase(lv_obj_t* row,int cover_h) {
+    auto* base=lv_image_create(row);lv_image_set_src(base,&shelf_base_image);
+    EpdSetContentRole(base,EpdContentRole::Shelf);
+    lv_obj_set_pos(base,0,cover_h+UiSy(6)-kShelfBaseTop);
+    lv_obj_clear_flag(base,LV_OBJ_FLAG_CLICKABLE);
+}
+
+} // namespace
 
 void RenderBookshelfPage() {
     auto& st = Book_State();
@@ -40,7 +88,7 @@ void RenderBookshelfPage() {
     }
 
     lv_obj_set_style_layout(st.shelf.list_body, LV_LAYOUT_FLEX, 0);
-    lv_obj_set_flex_flow(st.shelf.list_body, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_flow(st.shelf.list_body, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(st.shelf.list_body, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(st.shelf.list_body, kShelfRowGap, 0);
@@ -65,16 +113,33 @@ void RenderBookshelfPage() {
     }
 
     const lv_coord_t content_w = Book_ContentWidth();
-    const lv_coord_t cell_w =
-        (content_w - kShelfColGap * (kShelfCols - 1)) / kShelfCols;
+    const lv_coord_t cell_w = ShelfBookWidth();
     const lv_coord_t cover_h =
         st.shelf.shelf_cover_h > 0 ? st.shelf.shelf_cover_h : (cell_w * 4 / 3);
 
     const int start = st.shelf.list_page * st.shelf.list_page_size;
     const int end = std::min(start + st.shelf.list_page_size, static_cast<int>(st.shelf.books.size()));
-    for (int i = start; i < end; ++i) {
-        CreateBookCoverCell(st.shelf.list_body, st.shelf.books[static_cast<size_t>(i)], i, cell_w, cover_h,
-                            st.shelf.shelf_covers, true, kShelfTitleGap, true);
+    const lv_coord_t front_h=ShelfBaseFrontHeight();
+    PrepareShelfBase(content_w);
+    for(int row_start=start;row_start<end;row_start+=kShelfCols) {
+        auto* row=lv_obj_create(st.shelf.list_body);lv_obj_remove_style_all(row);
+        lv_obj_set_size(row,content_w,cover_h+front_h+UiSy(6)+kShelfCoverCheckSize/2);
+        Book_DisableScroll(row);lv_obj_clear_flag(row,LV_OBJ_FLAG_CLICKABLE);
+        CreateShelfBase(row,cover_h+kShelfCoverCheckSize/2);
+        for(int col=0;col<kShelfCols && row_start+col<end;++col) {
+            const int i=row_start+col;
+            auto* cell=CreateBookCoverCell(row,st.shelf.books[static_cast<size_t>(i)],i,cell_w,cover_h,
+                                          st.shelf.shelf_covers,true,0,true);
+            lv_obj_set_style_layout(cell,LV_LAYOUT_NONE,0);
+            // The whole circle must lie inside the cell's native clip/hit bounds.
+            const lv_coord_t circle_inset=kShelfCoverCheckSize/2;
+            lv_obj_set_size(cell,cell_w+circle_inset,cover_h+front_h+UiSy(6)+circle_inset);
+            lv_obj_set_pos(cell,ShelfSideInset()+col*(cell_w+ShelfColumnGap()),0);
+            auto* cover=lv_obj_get_child(cell,0);lv_obj_set_pos(cover,0,circle_inset);
+            auto* title=lv_obj_get_child(cell,1);
+            lv_obj_set_height(title,Book_ItemFont()->line_height);
+            lv_obj_set_pos(title,0,circle_inset+cover_h+UiSy(6)+(front_h-Book_ItemFont()->line_height)/2);
+        }
     }
 
     if (st.shelf.list_footer != nullptr) {
@@ -87,6 +152,7 @@ void RenderBookshelfPage() {
 }
 
 lv_obj_t* CreateBookshelfScreen() {
+    CancelReadFontScan();
     auto& st = Book_State();
     const bool workers_busy = st.reader.opening.load() || st.reader.layout_busy.load() ||
                               st.reader.chapter_pages_busy.load() || st.reader.page_image_busy.load();
@@ -141,7 +207,6 @@ lv_obj_t* CreateBookshelfScreen() {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, Book_ListFont(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    Book_DisableScroll(scr);
     st.shelf.list_scr = scr;
     lv_obj_add_event_cb(
         scr,
@@ -377,17 +442,13 @@ lv_obj_t* CreateBookshelfScreen() {
     RefreshShelfViewToggleUi();
     UpdateShelfTitleLabel();
 
-    const lv_coord_t cell_w =
-        (Book_ContentWidth() - kShelfColGap * (kShelfCols - 1)) / kShelfCols;
-    const lv_coord_t title_h =
-        (Book_ItemFont() != nullptr && Book_ItemFont()->line_height > 0)
-            ? Book_ItemFont()->line_height + kShelfTitleGap + 2
-            : 34;
+    const lv_coord_t cell_w = ShelfBookWidth();
+    const lv_coord_t title_h = ShelfBaseFrontHeight()+UiSy(6)+kShelfCoverCheckSize/2;
     const lv_coord_t usable = st.shelf.shelf_content_h;
     const lv_coord_t cell_budget =
         (usable - kShelfRowGap * (kShelfRows - 1)) / kShelfRows;
     lv_coord_t cover_h = cell_budget - title_h;
-    const lv_coord_t cover_max = cell_w * 4 / 3;
+    const lv_coord_t cover_max = cell_w * 7 / 5;
     if (cover_h > cover_max) {
         cover_h = cover_max;
     }

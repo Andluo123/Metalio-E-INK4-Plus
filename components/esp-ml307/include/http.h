@@ -2,6 +2,7 @@
 #define HTTP_H
 
 #include <string>
+#include <cstdint>
 #include <map>
 #include <functional>
 
@@ -11,6 +12,8 @@ public:
 
     // Set timeout
     virtual void SetTimeout(int timeout_ms) = 0;
+    /** @brief 设置请求的启动后绝对截止时间（微秒）；未实现的后端沿用请求超时。 */
+    virtual void SetRequestDeadline(int64_t /*deadline_us*/) {}
 
     // 设置 HTTP 请求头
     virtual void SetHeader(const std::string& key, const std::string& value) = 0;
@@ -26,6 +29,9 @@ public:
 
     // 关闭 HTTP 连接
     virtual void Close() = 0;
+
+    // Thread-safe signal only; default backends finish at their request timeout.
+    virtual void Cancel() {}
 
     // 读取 HTTP 响应数据
     virtual int Read(char* buffer, size_t buffer_size) = 0;

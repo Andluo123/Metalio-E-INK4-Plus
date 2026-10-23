@@ -1,6 +1,7 @@
 #include "fontpack_lvgl.h"
 
 #include "font_loader.h"
+#include "font_bitmap_expand.h"
 
 #include <cstring>
 
@@ -29,49 +30,7 @@ FontpackLvFont s_fonts[kMaxFonts];
 bool s_flash_tried = false;
 bool s_flash_ok = false;
 
-static const uint8_t kOpa2Table[4] = {0, 85, 170, 255};
-static const uint8_t kOpa4Table[16] = {0,  17, 34,  51,  68,  85,  102, 119,
-                                      136, 153, 170, 187, 204, 221, 238, 255};
-
-void UnpackToA8(const uint8_t* src, uint8_t bpp, uint16_t box_w, uint16_t box_h, uint8_t* dst,
-                uint32_t stride_out) {
-    if (bpp == 1) {
-        for (uint16_t y = 0; y < box_h; ++y) {
-            uint8_t* row = dst + static_cast<size_t>(y) * stride_out;
-            for (uint16_t x = 0; x < box_w; ++x) {
-                const uint32_t bit_i = static_cast<uint32_t>(y) * box_w + x;
-                const uint8_t byte = src[bit_i >> 3];
-                const uint8_t bit = 7 - (bit_i & 7);
-                row[x] = (byte >> bit) & 1 ? 0xff : 0x00;
-            }
-        }
-        return;
-    }
-    if (bpp == 2) {
-        uint32_t bit_i = 0;
-        for (uint16_t y = 0; y < box_h; ++y) {
-            uint8_t* row = dst + static_cast<size_t>(y) * stride_out;
-            for (uint16_t x = 0; x < box_w; ++x) {
-                const uint8_t byte = src[bit_i >> 2];
-                const uint8_t shift = static_cast<uint8_t>(6 - 2 * (bit_i & 3));
-                row[x] = kOpa2Table[(byte >> shift) & 0x3];
-                ++bit_i;
-            }
-        }
-        return;
-    }
-    // bpp == 4
-    uint32_t pix_i = 0;
-    for (uint16_t y = 0; y < box_h; ++y) {
-        uint8_t* row = dst + static_cast<size_t>(y) * stride_out;
-        for (uint16_t x = 0; x < box_w; ++x) {
-            const uint8_t byte = src[pix_i >> 1];
-            const uint8_t nibble = (pix_i & 1) ? (byte & 0x0f) : (byte >> 4);
-            row[x] = kOpa4Table[nibble & 0x0f];
-            ++pix_i;
-        }
-    }
-}
+using font_bitmap_expand::UnpackToA8;
 
 lv_font_glyph_format_t FormatForBpp(uint16_t bpp) {
     if (bpp <= 1) {
@@ -136,9 +95,19 @@ const void* GetGlyphBitmapCb(lv_font_glyph_dsc_t* g_dsc, lv_draw_buf_t* draw_buf
     if (draw_buf == nullptr || draw_buf->data == nullptr) {
         return nullptr;
     }
-    const uint32_t stride_out = lv_draw_buf_width_to_stride(g.width, LV_COLOR_FORMAT_A8);
+    const uint32_t stride_out = draw_buf->header.stride != 0
+        ? draw_buf->header.stride : lv_draw_buf_width_to_stride(g.width, LV_COLOR_FORMAT_A8);
+    const size_t need = static_cast<size_t>(stride_out) * g.height;
+    if (stride_out < g.width || need > draw_buf->data_size) {
+        return nullptr;
+    }
+    std::memset(draw_buf->data, 0, need);
     UnpackToA8(g.bitmap, static_cast<uint8_t>(f->bpp), g.width, g.height, draw_buf->data,
                stride_out);
+    draw_buf->header.w = g.width;
+    draw_buf->header.h = g.height;
+    draw_buf->header.cf = LV_COLOR_FORMAT_A8;
+    draw_buf->header.stride = stride_out;
     lv_draw_buf_flush_cache(draw_buf, nullptr);
     return draw_buf;
 }

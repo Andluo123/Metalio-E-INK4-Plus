@@ -6,6 +6,8 @@
 #include "metalio_keys.h"
 
 #include "config.h"
+#include <atomic>
+#include <mutex>
 #include "epd_board_metalio_eink4_plus.h"
 
 #include <driver/gpio.h>
@@ -47,10 +49,12 @@ KeySlot g_keys[kCount] = {
     {"电源", EPD_IO_POWER, true, false, 0},
 };
 
-bool g_ready = false;
+std::atomic<bool> g_ready{false};
+std::atomic<bool> g_power_click{false};
 int64_t g_power_down_us = 0;
 bool g_power_long_fired = false;
-volatile bool g_shutdown_pulse_req = false;
+std::atomic<bool> g_shutdown_pulse_req{false};
+std::mutex g_sample_mu;
 QueueHandle_t g_evt_q = nullptr;
 TaskHandle_t g_keys_task = nullptr;
 uint8_t g_p1 = 0xFF;
@@ -100,6 +104,9 @@ void apply_edge(KeySlot& k, bool down, int64_t now) {
             g_power_down_us = now;
             g_power_long_fired = false;
         } else {
+            if (g_power_down_us != 0 && !g_power_long_fired) {
+                g_power_click.store(true, std::memory_order_release);
+            }
             g_power_down_us = 0;
             g_power_long_fired = false;
         }
@@ -154,7 +161,8 @@ void keys_task(void* /*arg*/) {
             while (ulTaskNotifyTake(pdTRUE, 0) > 0) {
             }
         }
-        sample_all();
+        std::lock_guard<std::mutex> lock(g_sample_mu);
+        if (g_ready.load()) sample_all();
     }
 }
 
@@ -200,6 +208,7 @@ extern "C" void MetalioKeys_Init(void) {
 }
 
 extern "C" void MetalioKeys_MaskForSleep(void) {
+    std::lock_guard<std::mutex> lock(g_sample_mu);
     // 先停扫描再驱脚：否则输出低会被 PollSideKeys 当成音量键按下，g_ready 变 false 后再「松开」→ 假 +10
     g_ready = false;
     epd_board_metalio_eink4_plus_ioexp_mask_for_sleep();
@@ -207,6 +216,7 @@ extern "C" void MetalioKeys_MaskForSleep(void) {
 }
 
 extern "C" void MetalioKeys_ResumeAfterSleep(void) {
+    std::lock_guard<std::mutex> lock(g_sample_mu);
     epd_board_metalio_eink4_plus_ioexp_restore_keys();
     g_shutdown_pulse_req = false;
     g_power_down_us = 0;
@@ -226,6 +236,14 @@ extern "C" bool MetalioKeys_IsReady(void) {
     return g_ready;
 }
 
+extern "C" bool MetalioKeys_TakePowerClick(void) {
+    return g_power_click.exchange(false, std::memory_order_acq_rel);
+}
+
+extern "C" bool MetalioKeys_HasPowerClick(void) {
+    return g_power_click.load(std::memory_order_acquire);
+}
+
 extern "C" bool MetalioKeys_TakeEdge(void) {
     if (!g_ready || g_evt_q == nullptr) {
         return false;
@@ -235,6 +253,7 @@ extern "C" bool MetalioKeys_TakeEdge(void) {
 }
 
 extern "C" bool MetalioKeys_IsDown(int index) {
+    std::lock_guard<std::mutex> lock(g_sample_mu);
     if (index < 0 || index >= kCount || !g_ready) {
         return false;
     }
@@ -246,9 +265,5 @@ extern "C" bool MetalioKeys_IsDown(int index) {
 }
 
 extern "C" bool MetalioKeys_TakeShutdownPulse(void) {
-    if (!g_shutdown_pulse_req) {
-        return false;
-    }
-    g_shutdown_pulse_req = false;
-    return true;
+    return g_shutdown_pulse_req.exchange(false);
 }

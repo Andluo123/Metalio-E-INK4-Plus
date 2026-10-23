@@ -126,7 +126,6 @@ bool Assets::Apply() {
 }
 
 bool Assets::Download(std::string url, std::function<void(int progress, size_t speed)> progress_callback) {
-    ESP_LOGD(TAG, "Downloading new version of assets from %s", url.c_str());
     
     // 取消当前资源分区的内存映射
     if (mmap_handle_ != 0) {

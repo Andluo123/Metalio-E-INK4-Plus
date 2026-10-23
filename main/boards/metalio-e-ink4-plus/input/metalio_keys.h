@@ -45,6 +45,10 @@ bool MetalioKeys_IsDown(int index);
  */
 bool MetalioKeys_TakeShutdownPulse(void);
 
+/** @brief 采样任务锁存的电源短按；全刷阻塞时保留，单一消费者取走。 */
+bool MetalioKeys_TakePowerClick(void);
+bool MetalioKeys_HasPowerClick(void);
+
 #ifdef __cplusplus
 }
 #endif

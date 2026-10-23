@@ -9,5 +9,6 @@ public:
 
 class SettingsTestAgingScreen {
 public:
+    static bool IsActive();
     static lv_obj_t* Create();
 };

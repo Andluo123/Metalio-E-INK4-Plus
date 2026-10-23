@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "assets/lang_config.h"
-#include "fontpack_lvgl.h"
 #include "reader/book_home_snapshot.h"
 #include "reader/book_progress_cache.h"
 #include "reader/reader.h"
@@ -112,7 +111,11 @@ HomeStats CollectHomeStats(const std::vector<reader::BookInfo>& books) {
     {
         reader::BookSession::ProgressPeek peek;
         const char* path = books[static_cast<size_t>(out.continue_index)].path.c_str();
-        if (reader::book_progress_cache::TryGet(path, peek) && peek.progress_x10 >= 0) {
+        if (!reader::book_progress_cache::TryGet(path, peek)) {
+            peek = reader::BookSession::PeekProgress(path);
+        }
+        out.continue_seconds = peek.reading_seconds;
+        if (peek.progress_x10 >= 0) {
             out.continue_progress_x10 = peek.progress_x10;
         } else {
             out.continue_progress_x10 = reader::BookSession::PeekReadingProgressX10(path);
@@ -289,7 +292,7 @@ void Book_ShowMessage(lv_obj_t* parent, const char* msg, const lv_font_t* font) 
     lv_obj_set_style_text_font(label, font != nullptr ? font : Book_ListFont(), 0);
     lv_obj_set_style_text_color(label, lv_color_black(), 0);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(label, Book_ContentWidth());
+    lv_obj_set_width(label, LV_PCT(100));
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
     lv_obj_center(label);
     Book_DisableScroll(label);
@@ -336,87 +339,6 @@ int Book_CachedProgressX10OrZero(const char* book_abs_path) {
     return v > 1000 ? 1000 : v;
 }
 
-// 18 号字常无 '%'：数字用 18@2，百分号手绘
-static void OnPercentMarkDraw(lv_event_t* e) {
-    lv_obj_t* obj = static_cast<lv_obj_t*>(lv_event_get_target(e));
-    lv_layer_t* layer = lv_event_get_layer(e);
-    if (obj == nullptr || layer == nullptr) {
-        return;
-    }
-    lv_area_t box;
-    lv_obj_get_coords(obj, &box);
-    const lv_coord_t w = lv_area_get_width(&box);
-    const lv_coord_t h = lv_area_get_height(&box);
-    if (w < 4 || h < 6) {
-        return;
-    }
-
-    const lv_coord_t d = h / 5;
-    const lv_coord_t dot = d < 2 ? 2 : d;
-
-    lv_draw_rect_dsc_t ink;
-    lv_draw_rect_dsc_init(&ink);
-    ink.bg_color = lv_color_black();
-    ink.bg_opa = LV_OPA_COVER;
-    ink.border_width = 0;
-    ink.radius = LV_RADIUS_CIRCLE;
-
-    lv_area_t top;
-    top.x1 = box.x1;
-    top.y1 = box.y1 + 1;
-    top.x2 = box.x1 + dot - 1;
-    top.y2 = box.y1 + dot;
-    lv_draw_rect(layer, &ink, &top);
-
-    lv_area_t bot;
-    bot.x1 = box.x2 - dot + 1;
-    bot.y1 = box.y2 - dot;
-    bot.x2 = box.x2;
-    bot.y2 = box.y2 - 1;
-    lv_draw_rect(layer, &ink, &bot);
-
-    lv_draw_line_dsc_t line;
-    lv_draw_line_dsc_init(&line);
-    line.color = lv_color_black();
-    line.width = 1;
-    line.opa = LV_OPA_COVER;
-    line.p1.x = box.x2;
-    line.p1.y = box.y1 + 1;
-    line.p2.x = box.x1;
-    line.p2.y = box.y2 - 1;
-    lv_draw_line(layer, &line);
-}
-
-static lv_obj_t* CreatePercentMark(lv_obj_t* parent, lv_coord_t h) {
-    const lv_coord_t mark_h = h > 4 ? static_cast<lv_coord_t>(h - 2) : h;
-    const lv_coord_t mark_w = mark_h * 3 / 5;
-    lv_obj_t* mark = lv_obj_create(parent);
-    lv_obj_remove_style_all(mark);
-    lv_obj_set_size(mark, mark_w < 4 ? 4 : mark_w, mark_h < 6 ? 6 : mark_h);
-    lv_obj_set_style_bg_opa(mark, LV_OPA_TRANSP, 0);
-    Book_DisableScroll(mark);
-    lv_obj_clear_flag(mark, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(mark, OnPercentMarkDraw, LV_EVENT_DRAW_MAIN, nullptr);
-    return mark;
-}
-
-static void FormatProgressNumber(char* out, size_t out_sz, int pct_x10) {
-    if (out == nullptr || out_sz == 0) {
-        return;
-    }
-    if (pct_x10 < 0) {
-        pct_x10 = 0;
-    }
-    if (pct_x10 > 1000) {
-        pct_x10 = 1000;
-    }
-    if (pct_x10 >= 1000) {
-        std::snprintf(out, out_sz, "100");
-    } else {
-        std::snprintf(out, out_sz, "%d.%d", pct_x10 / 10, pct_x10 % 10);
-    }
-}
-
 lv_obj_t* Book_CreateProgressPctBadge(lv_obj_t* parent, int pct_x10) {
     if (parent == nullptr || pct_x10 < 0) {
         return nullptr;
@@ -424,20 +346,27 @@ lv_obj_t* Book_CreateProgressPctBadge(lv_obj_t* parent, int pct_x10) {
     if (pct_x10 > 1000) {
         pct_x10 = 1000;
     }
-    const lv_font_t* badge_font = fontpack_lv_font_get(18, 2);
+    const lv_font_t* badge_font = Book_ItemFont();
     if (badge_font == nullptr) {
-        badge_font = Book_ItemFont();
+        return nullptr;
     }
 
+    // 与书架列表尾栏一致：12.3% / 100%
     char txt[12];
-    FormatProgressNumber(txt, sizeof(txt), pct_x10);
+    if (pct_x10 >= 1000) {
+        std::snprintf(txt, sizeof(txt), "100%%");
+    } else {
+        std::snprintf(txt, sizeof(txt), "%d.%d%%", pct_x10 / 10, pct_x10 % 10);
+    }
 
-    // 固定长方形：高 28，宽再加约一半（避开多选勾选 24×24）
-    const lv_coord_t line_h = badge_font != nullptr ? badge_font->line_height : 18;
+    constexpr lv_coord_t kPadX = 4;
+    constexpr lv_coord_t kPadY = 2;
+    const lv_coord_t tw = Book_MeasureTextWidth(badge_font, txt);
+    const lv_coord_t th = badge_font->line_height;
 
     lv_obj_t* badge = lv_obj_create(parent);
     lv_obj_remove_style_all(badge);
-    lv_obj_set_size(badge, kProgressBadgeW, kProgressBadgeH);
+    lv_obj_set_size(badge, tw + kPadX * 2, th + kPadY * 2);
     lv_obj_set_style_bg_color(badge, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(badge, lv_color_black(), 0);
@@ -446,23 +375,12 @@ lv_obj_t* Book_CreateProgressPctBadge(lv_obj_t* parent, int pct_x10) {
     Book_DisableScroll(badge);
     lv_obj_clear_flag(badge, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t* row = lv_obj_create(badge);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row, 1, 0);
-    Book_DisableScroll(row);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
-
-    lv_obj_t* lbl = lv_label_create(row);
+    lv_obj_t* lbl = lv_label_create(badge);
     lv_label_set_text(lbl, txt);
     lv_obj_set_style_text_font(lbl, badge_font, 0);
     lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
     lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
-
-    CreatePercentMark(row, line_h);
-    lv_obj_center(row);
+    lv_obj_center(lbl);
     return badge;
 }
 

@@ -9,7 +9,7 @@
 #include <esp_timer.h>
 
 /**
- * @brief EPDiy + LVGL9：I1 真刷；转发百问 SetChatMessage / 状态栏
+ * @brief EPDiy + LVGL9：默认 I1，内容按需 L8 灰度渲染；转发百问 SetChatMessage / 状态栏
  */
 class LvAdapterEpdiy : public Display {
 public:
@@ -109,7 +109,7 @@ public:
     void ResumeStandbyBackgroundWork();
 
     /**
-     * @brief 关机图：NVS 关机壁纸 → 内置 bg_shutdown.a2i1 → 「已关机」文案；刷完冻结 flush
+     * @brief 关机图：NVS 壁纸 → 中英文应用内置图 → resources 默认图 → 关机文案；刷完冻结 flush
      * @note 可在非 LVGL 任务调用（持内部锁）
      */
     void ShowPoweredOffScreen();
@@ -144,8 +144,12 @@ private:
     char status_body_cache_[64] = {};
     char battery_pct_cache_[8] = {}; // 如「100%」；与 397 一致跨页保留
     int battery_level_cache_ = -1;
+    int battery_candidate_ = -1;
+    int64_t battery_candidate_since_ = 0;
     const char* battery_icon_ = nullptr;
     const char* network_icon_ = nullptr;
+    bool network_busy_status_ = false;
+    char status_before_network_[64] = {};
     bool muted_ = false;
     esp_timer_handle_t notification_timer_ = nullptr;
     std::chrono::system_clock::time_point last_status_update_time_{};

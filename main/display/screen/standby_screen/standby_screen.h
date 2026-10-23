@@ -16,6 +16,10 @@ public:
 
     /** @brief Overlay 是否处于显示状态 */
     static bool IsActive();
+    // Requests survive a blocking panel refresh; LP restores hardware before FinishWake.
+    static void RequestWake(bool assistant = false);
+    static bool HasWakeRequest();
+    static void FinishWake(); // LVGL context, after SD/hardware restore
 
     /** @brief 待机内容是否已就绪（经典页：至少完成一帧 flush；壁纸：解码就绪） */
     static bool IsPaintReady();

@@ -9,9 +9,11 @@
 #include <esp_timer.h>
 #include <esp_types.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <stdalign.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,6 +23,7 @@
 #include "output_common/line_queue.h"
 #include "output_common/lut.h"
 #include "output_common/render_context.h"
+#include "output_common/spatial_wipe.h"
 #include "output_common/render_method.h"
 #ifdef RENDER_METHOD_I2S
 #include "output_i2s/render_i2s.h"
@@ -45,6 +48,49 @@ const int clear_cycle_time = 15;
     } while (0)
 
 static RenderContext_t render_context;
+
+// ESP-IDF task stack sizes and high-water marks are both measured in bytes.
+enum {
+    EPD_PREP_STACK_BYTES = 4096,
+    EPD_PREP_STACK_RESERVE_PERCENT = 20,
+    EPD_PREP_STACK_RESERVE_BYTES =
+        (EPD_PREP_STACK_BYTES * EPD_PREP_STACK_RESERVE_PERCENT + 99) / 100,
+};
+static unsigned prep_stack_minimum[NUM_RENDER_THREADS];
+static unsigned prep_stack_reported[NUM_RENDER_THREADS];
+static bool prep_stack_warned[NUM_RENDER_THREADS];
+static int64_t prep_stack_report_us;
+
+// Only the renderer caller samples/logs, after a waveform has finished. Never
+// scan stack fill bytes or print from the high-priority feeder/ISR hot path.
+static void report_prep_stack_watermarks(void) {
+    const int64_t now = esp_timer_get_time();
+    const bool periodic = now - prep_stack_report_us >= 60000000;
+    for (int i = 0; i < NUM_RENDER_THREADS; ++i) {
+        if (render_context.feed_tasks[i] == NULL) continue;
+        const unsigned free_bytes = uxTaskGetStackHighWaterMark(render_context.feed_tasks[i]);
+        if (free_bytes < prep_stack_minimum[i]) prep_stack_minimum[i] = free_bytes;
+        const unsigned minimum = prep_stack_minimum[i];
+        const bool below_reserve = minimum < EPD_PREP_STACK_RESERVE_BYTES;
+        const bool first = prep_stack_reported[i] == UINT32_MAX;
+        const bool dropped = !first && prep_stack_reported[i] >= minimum + 64;
+        if (first || periodic || dropped || (below_reserve && !prep_stack_warned[i])) {
+            const unsigned percent = minimum * 100 / EPD_PREP_STACK_BYTES;
+            if (below_reserve) {
+                ESP_LOGE("EpdStack", "epd_prep core=%d min_free=%u/%uB (%u%%) used_peak=%uB reserve=%uB BELOW-20%%; check stack depth/corruption",
+                         i, minimum, EPD_PREP_STACK_BYTES, percent,
+                         EPD_PREP_STACK_BYTES - minimum, EPD_PREP_STACK_RESERVE_BYTES);
+            } else {
+                ESP_LOGI("EpdStack", "epd_prep core=%d min_free=%u/%uB (%u%%) used_peak=%uB reserve=%uB OK",
+                         i, minimum, EPD_PREP_STACK_BYTES, percent,
+                         EPD_PREP_STACK_BYTES - minimum, EPD_PREP_STACK_RESERVE_BYTES);
+            }
+            prep_stack_reported[i] = minimum;
+        }
+        prep_stack_warned[i] = below_reserve;
+    }
+    if (periodic) prep_stack_report_us = now;
+}
 
 void epd_push_pixels(EpdRect area, short time, int color) {
     render_context.area = area;
@@ -163,6 +209,30 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
         ESP_LOGE("epdiy", "no output lookup method found for your mode and LUT size!");
         return EPD_DRAW_LOOKUP_NOT_IMPLEMENTED;
     }
+    render_context.spatial_luts=NULL;
+    render_context.spatial_bands=NULL;
+    if(mode & MODE_SPATIAL_WIPE_GL) {
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && defined(RENDER_METHOD_LCD)
+        if(!(mode & MODE_PACKING_1PPB_DIFFERENCE) || !waveform_phases ||
+           area.x || area.y || area.width!=epd_width() || area.height!=epd_height() ||
+           crop_to.x || crop_to.y || crop_to.width!=area.width || crop_to.height!=area.height)
+            return EPD_DRAW_INVALID_CROP;
+        const int orient=(mode>>13)&3;
+        render_context.spatial_by_y=orient==0 || orient==3;
+        const int axis=render_context.spatial_by_y ? epd_height() : epd_width();
+        render_context.spatial_luts=heap_caps_malloc(10*256,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+        render_context.spatial_bands=heap_caps_malloc(axis,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+        if(!render_context.spatial_luts || !render_context.spatial_bands) {
+            free(render_context.spatial_luts);free(render_context.spatial_bands);
+            render_context.spatial_luts=render_context.spatial_bands=NULL;
+            return EPD_DRAW_FAILED_ALLOC;
+        }
+        epd_spatial_bands(render_context.spatial_bands,axis,orient==0 || orient==2);
+        frame_count+=9;
+#else
+        return EPD_DRAW_LOOKUP_NOT_IMPLEMENTED;
+#endif
+    }
 
     render_context.area = area;
     render_context.crop_to = crop_to;
@@ -185,6 +255,7 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
     if (waveform_phases != NULL && waveform_phases->phase_times != NULL) {
         render_context.phase_times = waveform_phases->phase_times;
     }
+    if(render_context.spatial_luts) render_context.phase_times=NULL;
 
     epd_populate_line_mask(
         render_context.line_mask, drawn_columns, render_context.display_width / 4
@@ -196,6 +267,10 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
     lcd_do_update(&render_context);
 #endif
 
+    report_prep_stack_watermarks();
+
+    free(render_context.spatial_luts);free(render_context.spatial_bands);
+    render_context.spatial_luts=render_context.spatial_bands=NULL;
     if (render_context.error & EPD_DRAW_EMPTY_LINE_QUEUE) {
         ESP_LOGE("epdiy", "line buffer underrun occurred!");
     }
@@ -230,19 +305,28 @@ void epd_clear_area(EpdRect area) {
     epd_clear_area_cycles(area, 3, clear_cycle_time);     //  3 --->   1  20251124 test
 }
 
+enum EpdDrawError epd_clear_checked(void) {
+    render_context.error = EPD_DRAW_SUCCESS;
+    epd_clear_area_cycles(epd_full_screen(), 3, clear_cycle_time);
+    return render_context.error;
+}
+
 void epd_clear_area_cycles(EpdRect area, int cycles, int cycle_time) {
     const short white_time = cycle_time;
     const short dark_time = cycle_time;
 
     for (int c = 0; c < cycles; c++) {
         for (int i = 0; i < 10; i++) {                       //  10 --->   3  20251124 test
-            epd_push_pixels(area, dark_time, 0);                  
+            epd_push_pixels(area, dark_time, 0);
+            if (render_context.error) return;
         }
         for (int i = 0; i < 10; i++) {                       //  10 --->   3  20251124 test
-            epd_push_pixels(area, white_time, 1);            
+            epd_push_pixels(area, white_time, 1);
+            if (render_context.error) return;
         }
         for (int i = 0; i < 3; i++) {                       //  3 --->   1  20251124 test
-            epd_push_pixels(area, white_time, 2);            
+            epd_push_pixels(area, white_time, 2);
+            if (render_context.error) return;
         }
     }
 }
@@ -296,6 +380,8 @@ void epd_renderer_init(enum EpdInitOptions options) {
         rounded_display_height(), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL
     );
     assert(render_context.line_threads != NULL);
+    render_context.line_ready=heap_caps_calloc(rounded_display_height(),1,MALLOC_CAP_INTERNAL);
+    assert(render_context.line_ready!=NULL);
 
     int queue_len = 32;
     if (options & EPD_FEED_QUEUE_32) {
@@ -328,32 +414,34 @@ void epd_renderer_init(enum EpdInitOptions options) {
 
     for (int i = 0; i < NUM_RENDER_THREADS; i++) {
         render_context.line_queues[i] = lq_init(queue_len, queue_elem_size);
-        render_context.feed_line_buffers[i] = (uint8_t*)heap_caps_malloc(
-            render_context.display_width, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL
-        );
-        assert(render_context.feed_line_buffers[i] != NULL);
-        RTOS_ERROR_CHECK(xTaskCreatePinnedToCore(
+        prep_stack_minimum[i] = EPD_PREP_STACK_BYTES;
+        prep_stack_reported[i] = UINT32_MAX;
+        prep_stack_warned[i] = false;
+        RTOS_ERROR_CHECK(xTaskCreatePinnedToCoreWithCaps(
             render_thread,
             "epd_prep",
-            1 << 12,
+            EPD_PREP_STACK_BYTES,
             (void*)i,
             configMAX_PRIORITIES - 1, // 流式短队列：feed 必须压过 WiFi 等，否则易欠载
             &render_context.feed_tasks[i],
-            i
+            i,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
         ));
     }
+    ESP_LOGI("EpdStack", "epd_prep x%d stack=%uB in SPIRAM",
+             NUM_RENDER_THREADS, (unsigned)EPD_PREP_STACK_BYTES);
+    prep_stack_report_us = esp_timer_get_time();
+    report_prep_stack_watermarks();
 
     const size_t elem_aligned = ((queue_elem_size + 15) / 16) * 16;
     const size_t line_q_bytes =
         (size_t)NUM_RENDER_THREADS * (size_t)queue_len * elem_aligned;
-    const size_t feed_bytes =
-        (size_t)NUM_RENDER_THREADS * (size_t)render_context.display_width;
     const size_t line_threads_bytes = (size_t)rounded_display_height();
     const size_t line_mask_bytes = (size_t)epd_width() / 4;
     ESP_LOGD("epd_dram",
-             "render: lut=%u INTERNAL; line_q≈%u B; feed/mask/thr INTERNAL=%u B",
+             "render: lut=%u INTERNAL; line_q≈%u B; mask/thr INTERNAL=%u B",
              (unsigned)lut_size, (unsigned)line_q_bytes,
-             (unsigned)(feed_bytes + line_threads_bytes + line_mask_bytes));
+             (unsigned)(line_threads_bytes + line_mask_bytes));
 }
 
 void epd_renderer_deinit() {
@@ -362,9 +450,11 @@ void epd_renderer_deinit() {
     epd_board->poweroff(epd_ctrl_state());
 
     for (int i = 0; i < NUM_RENDER_THREADS; i++) {
-        vTaskDelete(render_context.feed_tasks[i]);
+        if (render_context.feed_tasks[i] != NULL) {
+            vTaskDeleteWithCaps(render_context.feed_tasks[i]);
+            render_context.feed_tasks[i] = NULL;
+        }
         lq_free(&render_context.line_queues[i]);
-        heap_caps_free(render_context.feed_line_buffers[i]);
         vSemaphoreDelete(render_context.feed_done_smphr[i]);
     }
 
@@ -380,6 +470,7 @@ void epd_renderer_deinit() {
 
     heap_caps_free(render_context.conversion_lut);
     heap_caps_free(render_context.line_threads);
+    heap_caps_free(render_context.line_ready);
     heap_caps_free(render_context.line_mask);
     vSemaphoreDelete(render_context.frame_done);
 }

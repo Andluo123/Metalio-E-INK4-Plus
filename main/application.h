@@ -16,6 +16,7 @@
 #include "ota.h"
 #include "audio_service.h"
 #include "device_state_event.h"
+#include "yunxin_text_inbox.h"
 
 
 #define MAIN_EVENT_SCHEDULE (1 << 0)
@@ -59,6 +60,8 @@ public:
     void StopListening();
     void AbortSpeakingToIdle();
     void Reboot();
+    // Main task only: persist the selected cloud's local TTS preference and stop queued speech when muted.
+    void SetLocalChatTtsEnabled(bool enabled);
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(Ota& ota, const std::string& url = "");
     bool UpgradeFirmwareUrl(const std::string& url, const std::string& current_version,
@@ -75,9 +78,19 @@ public:
     bool IsXiaozhiVoiceActive() const { return xiaozhi_voice_active_; }
     // 开机主流程是否已结束（联网/OTA 等）。
     bool IsBootReady() const { return boot_ready_.load(std::memory_order_acquire); }
+    bool IsBootWorkActive() const { return boot_work_active_.load(std::memory_order_acquire); }
 
     // 按需启动音频服务；不启动小智语音会话。
     void EnsureAudioServiceRunning();
+    enum class AudioClient : uint32_t {
+        Assistant = 1, // AI 语音会话
+        FactoryTest = 2, // 录音测试
+        AgingTest = 4, // 老化测试
+    };
+    /** @brief 申请共享音频服务，可通过回调取消已失效的页面请求 */
+    bool AcquireAudioService(AudioClient client, std::function<bool()> still_needed = {});
+    /** @brief 归还调用方的音频占用，最后一个调用方退出时释放资源 */
+    void ReleaseAudioService(AudioClient client);
     // 关闭按需拉起的音频任务；百问会话路径走 StopXiaozhiVoice。
     void StopAudioServiceIfRunning();
 
@@ -85,16 +98,37 @@ public:
     void ResumeActivationAfterStandby();
     // 仍有未绑定验证码时，Idle 顶栏显示验证码而非时钟。
     bool HasPendingActivationCode() const { return !activation_code_.empty(); }
+    const std::string& GetPendingActivationCode() const { return activation_code_; }
+
+    /**
+     * @brief 暂停激活轮询（日志上传、传输热点或 U 盘）
+     * @note 与 ResumeActivationPolling 成对；暂停期间不发起 Activate/CheckVersion HTTP
+     */
+    void PauseActivationPolling();
+    bool IsActivationPollingBusy();
+    /** @brief 传输热点或 U 盘占用期间为 true */
+    bool IsActivationPollingPaused() const {
+        return activation_paused_.load(std::memory_order_acquire);
+    }
+    /** @brief 恢复激活轮询；网络回来后由时钟节拍继续 */
+    void ResumeActivationPolling();
 
 private:
     Application();
     ~Application();
+    // Start() safe points: pause startup work while standby owns hardware.
+    void BootStandbyCheckpoint();
 
+    std::mutex activation_poll_mutex_;
+    unsigned activation_pause_count_ = 0;
+    bool activation_poll_busy_ = false;
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
+    esp_timer_handle_t yunxin_text_timer_handle_ = nullptr;
+    YunxinTextInbox yunxin_text_inbox_;
     volatile DeviceState device_state_ = kDeviceStateUnknown;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
@@ -104,19 +138,28 @@ private:
     bool has_server_time_ = false;
     std::string current_version_;
     bool audio_initialized_ = false;
+    std::recursive_mutex audio_service_mutex_; // 串行化服务启动、占用和释放
+    uint32_t audio_clients_ = 0; // 当前音频调用方位掩码
     bool audio_running_ = false;
     bool voice_models_ready_ = false;
     bool protocol_ready_ = false;
+    bool chat_config_loading_ = false;
+    bool chat_config_ready_ = false;
+    bool boot_version_checked_ = false;
+    bool chat_activation_pending_ = false;
     bool xiaozhi_voice_active_ = false;
     bool aborted_ = false;
     std::atomic<bool> boot_ready_{false}; // Start() 跑完后置 true
+    std::atomic<bool> boot_work_active_{true};
     // 开机未完成时进百问：记录意图，boot_ready 后自动 StartXiaozhiVoice。
     std::atomic<bool> pending_xiaozhi_voice_{false};
     std::atomic<bool> pending_xiaozhi_listen_{false};
+    std::atomic<bool> audio_mode_wait_pending_{false}; // 已安排后台等待音频模式就绪
     int clock_ticks_ = 0;
     std::string activation_code_;
     std::string activation_message_;
     std::atomic<bool> activation_kick_{false};
+    std::atomic<bool> activation_paused_{false}; // 日志上传等：挡 Activate/CheckVersion
     TaskHandle_t check_new_version_task_handle_ = nullptr;
     TaskHandle_t main_event_loop_task_handle_ = nullptr;
 
@@ -131,11 +174,18 @@ private:
     bool EnterContinuousListening();
     // Idle 状态栏：允许时钟页面（含百问）刷 HH:MM；固定文案页改用 GetIdleStatusFixedText。
     void ApplyIdleStatusBar();
-    // 可中断延迟；Idle 时返回 false，activation_kick 时返回 true。
+    // 可中断延迟；Idle 时返回 false，activation_kick 时返回 true；paused 时原地等待。
     bool DelayMsInterruptible(int ms);
+    /** @brief Activating 且 paused 时阻塞等待恢复（或变 Idle） */
+    void WaitWhileActivationPaused();
 
     void EnsureVoiceModelsReady();
+    void ReceiveYunxinText(const char* text);
+    void QueueYunxinTextUpdate();
+    void QueueYunxinTextBoundary(std::function<void()> after);
+    void ApplyYunxinText(const YunxinTextInbox::Snapshot& snapshot);
     void EnsureProtocolReady();
+    void CheckChatActivation();
     void TeardownProtocol();
     // 开机完成后：若仍在百问页，则兑现挂起的进页/聆听意图。
     void FlushPendingXiaozhiVoice();

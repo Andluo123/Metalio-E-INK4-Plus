@@ -102,6 +102,8 @@ void StandbyClassic_BuildUi(lv_obj_t* root) {
     lv_obj_set_style_pad_row(center, 0, 0);
     lv_obj_clear_flag(center, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(center, LV_OBJ_FLAG_CLICKABLE);
+    // 猫图宽=可绘区，略宽于 center 侧边距；允许溢出绘制
+    lv_obj_add_flag(center, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
 
     lv_obj_t* spacer = lv_obj_create(center);
     lv_obj_remove_style_all(spacer);
@@ -259,6 +261,7 @@ void StandbyClassic_BuildUi(lv_obj_t* root) {
     lv_obj_set_style_pad_row(hero, kHeroInnerGap, 0);
     lv_obj_clear_flag(hero, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(hero, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(hero, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
 
     lv_obj_t* bubble = lv_image_create(hero);
     lv_image_set_src(bubble, "A:ic_s_standby_bubble.spng");

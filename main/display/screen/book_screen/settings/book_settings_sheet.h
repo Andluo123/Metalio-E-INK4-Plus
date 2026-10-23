@@ -6,6 +6,14 @@ struct BookUiState;
 
 /** @brief 重建排版设置卡控件树 */
 void RebuildSettingsSheet();
+void ResizeReadingBottomSheet();
+void SelectReadingSheetTab(int tab);
+bool CancelBookmarkMultiSelection();
+void ResetBookmarkSelection();
+/** @brief 书签提示弹窗是否打开。 */
+bool BookmarkMessageVisible();
+/** @brief 关闭书签提示及遮罩，返回是否关闭了弹窗；须在 UI 任务调用。 */
+bool CloseBookmarkMessage();
 /** @brief 设置卡控件已缓存时原地刷；不再因按下推迟整卡 clean（±/翻页不拆树） */
 void ClearSettingsSheetWidgetRefs();
 /** @brief 刷新设置卡内容 */
@@ -57,3 +65,15 @@ void OnSheetFlBrightInc(lv_event_t* e);
 void OnSheetOrientMode(lv_event_t* e);
 /** @brief 设置卡「目录」 */
 void OnSheetTocClicked(lv_event_t* e);
+
+/** Shared fixed panel boundaries: 2px, 8px side insets; status bar owns adjoining top edge.
+ * bottom_gap reserves the main card's navigation area; subpanels pass zero.
+ * Idempotent and independent of padding, scrolling, orientation and card content.
+ */
+void ApplyReadingPanelRules(lv_obj_t* panel, int bottom_gap = 0);
+
+// Returns false when tab/layout structure changed and a rebuild is required.
+bool RefreshReadingSheetInPlace();
+void ResetReadingSheetLiveRefs();
+
+void HideReadLightPanel();

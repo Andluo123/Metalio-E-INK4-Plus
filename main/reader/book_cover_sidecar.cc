@@ -19,7 +19,7 @@ namespace reader {
 namespace {
 
 constexpr const char* TAG = "BookCoverSidecar";
-constexpr size_t kSidecarMaxFileBytes = 256 * 1024;
+constexpr size_t kSidecarMaxFileBytes = 2 * 1024 * 1024;
 
 bool IsUnderBooksDir(const char* path) {
     if (path == nullptr || path[0] == '\0') {
@@ -39,13 +39,13 @@ bool BuildSidecarPath(const char* book_path, char* out, size_t out_sz) {
         return false;
     }
     const size_t prefix_len = static_cast<size_t>(dot - book_path);
-    constexpr const char kExt[] = ".a2i1";
-    constexpr size_t kExtLen = sizeof(kExt);  // 含 '\0'
-    if (prefix_len + kExtLen > out_sz) {
-        return false;
-    }
-    std::memcpy(out, book_path, prefix_len);
-    std::memcpy(out + prefix_len, kExt, kExtLen);
+    // New caches keep gray; existing binary sidecars are read as-is, never migrated.
+    const std::string stem(book_path,prefix_len);
+    const std::string gray=stem+".a2l8",legacy=stem+".a2i1";
+    const std::string& path=access(gray.c_str(),F_OK)==0 ? gray :
+        (access(legacy.c_str(),F_OK)==0 ? legacy : gray);
+    if(path.size()+1>out_sz) return false;
+    std::memcpy(out,path.c_str(),path.size()+1);
     return true;
 }
 
@@ -58,9 +58,10 @@ bool WriteSidecarBytes(const char* sidecar_path, const std::vector<uint8_t>& byt
 
 /** 仅当新图像素面积更大时覆盖（只升不降） */
 bool ShouldUpgradeSidecar(const char* sidecar_path, int new_w, int new_h) {
+    if(std::strstr(sidecar_path,".a2i1") && access(sidecar_path,F_OK)==0) return false;
     int old_w = 0;
     int old_h = 0;
-    if (!PeekA2i1FileSize(sidecar_path, &old_w, &old_h)) {
+    if (!PeekRasterFileSize(sidecar_path, &old_w, &old_h)) {
         return true;
     }
     const uint32_t old_area = static_cast<uint32_t>(old_w) * static_cast<uint32_t>(old_h);
@@ -78,6 +79,9 @@ bool EncodeCoverBytesToSidecar(const char* book_path, const uint8_t* data, size_
     int new_w = 0;
     int new_h = 0;
     if (ValidateA2i1Bytes(data, len)) {
+        if(access(sidecar,F_OK)==0) return true;
+        const size_t path_len=std::strlen(sidecar);
+        if(path_len>=5) std::memcpy(sidecar+path_len-5,".a2i1",6);
         if (!PeekA2i1Size(data, len, &new_w, &new_h)) {
             return false;
         }
@@ -99,8 +103,8 @@ bool EncodeCoverBytesToSidecar(const char* book_path, const uint8_t* data, size_
             ESP_LOGI(TAG, "sidecar keep (decode not larger): %s", sidecar);
             return true;
         }
-        if (!EncodeL8ToA2i1(l8, file_bytes) ||
-            !ValidateA2i1Bytes(file_bytes.data(), file_bytes.size())) {
+        if (!EncodeL8ToA2l8(l8, file_bytes) ||
+            !ValidateA2l8Bytes(file_bytes.data(), file_bytes.size())) {
             ESP_LOGW(TAG, "sidecar encode fail: %s", book_path);
             return false;
         }
@@ -131,9 +135,10 @@ bool BookCoverSidecarAdequate(const char* book_path, int need_w, int need_h) {
     }
     int w = 0;
     int h = 0;
-    if (!PeekA2i1FileSize(sidecar, &w, &h)) {
+    if (!PeekRasterFileSize(sidecar, &w, &h)) {
         return false;
     }
+    if(std::strstr(sidecar,".a2i1")) return true;
     return RasterCoversNeed(w, h, need_w, need_h);
 }
 
@@ -162,7 +167,7 @@ bool SaveBookCoverSidecarFromL8(const char* book_path, const RasterImage& l8) {
         return true;
     }
     std::vector<uint8_t> file_bytes;
-    if (!EncodeL8ToA2i1(l8, file_bytes) || !ValidateA2i1Bytes(file_bytes.data(), file_bytes.size())) {
+    if (!EncodeL8ToA2l8(l8, file_bytes) || !ValidateA2l8Bytes(file_bytes.data(), file_bytes.size())) {
         ESP_LOGW(TAG, "sidecar encode from L8 fail: %s", book_path);
         return false;
     }

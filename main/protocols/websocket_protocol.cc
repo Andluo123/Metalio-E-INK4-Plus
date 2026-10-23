@@ -4,6 +4,7 @@
 #include "application.h"
 #include "settings.h"
 #include "api_endpoints.h"
+#include "chat_cloud.h"
 
 #include <cstring>
 #include <cJSON.h>
@@ -66,12 +67,10 @@ bool WebsocketProtocol::SendText(const std::string& text) {
     }
 
     if (!websocket_->Send(text)) {
-        ESP_LOGE(TAG, "Failed to send text: %s", text.c_str());
         SetError(Lang::Strings::SERVER_ERROR);
         return false;
     }
 
-    // ESP_LOGI(TAG, "Sent text: %s", text.c_str());
 
     return true;
 }
@@ -85,30 +84,29 @@ void WebsocketProtocol::CloseAudioChannel() {
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
-    if (!api::HasHost()) {
+    if (!chat_cloud::Available()) {
         ESP_LOGI(TAG, "websocket skipped: blank cloud endpoints");
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
         return false;
     }
 
-    Settings settings("websocket", false);
-    std::string url = settings.GetString("url");
-    std::string token = settings.GetString("token");
-    int version = settings.GetInt("version");
+    Settings settings(chat_cloud::WebsocketNamespace(), false);
+    std::string url = chat_cloud::IsYunxin()
+        ? chat_cloud::YunxinWebsocketUrl(SystemInfo::GetMacAddress()) : settings.GetString("url");
+    if (url.empty()) {
+        ESP_LOGE(TAG, "Missing websocket URL in %s; OTA configuration is required",
+                 chat_cloud::WebsocketNamespace());
+        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        return false;
+    }
+    std::string token = chat_cloud::IsYunxin() ? chat_cloud::YunxinToken() : settings.GetString("token");
+    int version = chat_cloud::IsYunxin() ? 1 : settings.GetInt("version");
     if (version != 0) {
         version_ = version;
     }
 
     error_occurred_ = false;
 
-    const bool had_ws = websocket_ != nullptr;
-    const bool had_open = IsAudioChannelOpened();
-    const size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    const size_t largest_int = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG,
-             "OpenAudioChannel begin url=%s had_ws=%d had_open=%d free_int=%u largest=%u",
-             url.c_str(), had_ws ? 1 : 0, had_open ? 1 : 0,
-             static_cast<unsigned>(free_int), static_cast<unsigned>(largest_int));
 
     auto network = Board::GetInstance().GetNetwork();
     websocket_ = network->CreateWebSocket(1);
@@ -166,7 +164,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
             }
         } else {
             // Parse JSON data
-            // ESP_LOGI(TAG, "Received JSON data: %s", data);
+            // ;
             auto root = cJSON_Parse(data);
             auto type = cJSON_GetObjectItem(root, "type");
             if (cJSON_IsString(type)) {
@@ -177,8 +175,6 @@ bool WebsocketProtocol::OpenAudioChannel() {
                         on_incoming_json_(root);
                     }
                 }
-            } else {
-                ESP_LOGE(TAG, "Missing message type, data: %s", data);
             }
             cJSON_Delete(root);
         }
@@ -192,7 +188,6 @@ bool WebsocketProtocol::OpenAudioChannel() {
         }
     });
 
-    ESP_LOGD(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
     const int64_t t0 = esp_timer_get_time();
     if (!websocket_->Connect(url.c_str())) {
         const int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
@@ -262,7 +257,6 @@ void WebsocketProtocol::ParseServerHello(const cJSON* root) {
     auto session_id = cJSON_GetObjectItem(root, "session_id");
     if (cJSON_IsString(session_id)) {
         session_id_ = session_id->valuestring;
-        ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
     }
 
     auto audio_params = cJSON_GetObjectItem(root, "audio_params");

@@ -14,7 +14,15 @@ namespace {
 constexpr const char* TAG = "Haptic";
 constexpr const char* kNvsNs = "display";
 constexpr const char* kNvsKey = "haptic";
+constexpr const char* kNvsIntensityKey = "haptic_lvl";
 constexpr bool kDefaultEnabled = true;
+constexpr int kIntensityWeak = 0; // 弱
+constexpr int kIntensityMedium = 1; // 中
+constexpr int kIntensityStrong = 2; // 强
+constexpr int kDefaultIntensity = kIntensityWeak;
+constexpr int kPulseMsWeak = 35; // 弱脉宽 ms
+constexpr int kPulseMsMedium = 50; // 中脉宽 ms
+constexpr int kPulseMsStrong = 70; // 强脉宽 ms
 
 // LVGL USER_1：标记已挂震动回调，避免重复 Attach 导致连震。
 constexpr lv_obj_flag_t kHapticBoundFlag = LV_OBJ_FLAG_USER_1;
@@ -29,7 +37,10 @@ struct HapticZone {
 };
 
 bool s_enabled = kDefaultEnabled;
+int s_intensity = kDefaultIntensity;
 bool s_ready = false;
+bool s_persist_busy = false;
+portMUX_TYPE s_persist_mux = portMUX_INITIALIZER_UNLOCKED;
 bool s_zone_early_pulse = true;  // 全屏遮罩时可关，避免下层热区误震
 // touch_feed 早震与 LVGL PRESSED 去重
 uint32_t s_press_seq = 0;
@@ -39,19 +50,76 @@ HapticZone s_zones[kMaxZones]{};
 size_t s_zone_count = 0;
 portMUX_TYPE s_zone_mux = portMUX_INITIALIZER_UNLOCKED;
 
+int ClampIntensity(int intensity) {
+    if (intensity == kIntensityMedium || intensity == kIntensityStrong) {
+        return intensity;
+    }
+    return kIntensityWeak;
+}
+
+int PulseMsForIntensity(int intensity) {
+    switch (ClampIntensity(intensity)) {
+        case kIntensityMedium:
+            return kPulseMsMedium;
+        case kIntensityStrong:
+            return kPulseMsStrong;
+        default:
+            return kPulseMsWeak;
+    }
+}
+
 void LoadFromNvs() {
     Settings settings(kNvsNs, false);
     s_enabled = settings.GetBool(kNvsKey, kDefaultEnabled);
+    s_intensity = ClampIntensity(settings.GetInt(kNvsIntensityKey, kDefaultIntensity));
     s_ready = true;
-    ESP_LOGI(TAG, "nvs load haptic=%d", s_enabled ? 1 : 0);
+    ESP_LOGI(TAG, "nvs load haptic=%d intensity=%d (%dms)", s_enabled ? 1 : 0, s_intensity,
+             PulseMsForIntensity(s_intensity));
 }
 
-void PersistTask(void* arg) {
-    const bool enabled = (arg != nullptr);
-    Settings settings(kNvsNs, true);
-    settings.SetBool(kNvsKey, enabled);
-    ESP_LOGI(TAG, "nvs save haptic=%d", enabled ? 1 : 0);
+void EnsureReady() {
+    if (!s_ready) {
+        LoadFromNvs();
+    }
+}
+
+void PersistTask(void* /*arg*/) {
+    for (;;) {
+        portENTER_CRITICAL(&s_persist_mux);
+        const bool enabled = s_enabled;
+        const int intensity = s_intensity;
+        portEXIT_CRITICAL(&s_persist_mux);
+        {
+            Settings settings(kNvsNs, true);
+            settings.SetBool(kNvsKey, enabled);
+            settings.SetInt(kNvsIntensityKey, intensity);
+        }
+        portENTER_CRITICAL(&s_persist_mux);
+        const bool done = enabled == s_enabled && intensity == s_intensity;
+        if (done) s_persist_busy = false;
+        portEXIT_CRITICAL(&s_persist_mux);
+        if (done) break;
+    }
     vTaskDelete(nullptr);
+}
+
+void SchedulePersist() {
+    // NVS needs an internal stack; coalesce rapid changes into one worker.
+    portENTER_CRITICAL(&s_persist_mux);
+    const bool busy = s_persist_busy;
+    s_persist_busy = true;
+    portEXIT_CRITICAL(&s_persist_mux);
+    if (busy) return;
+    if (xTaskCreate(PersistTask, "haptic_nvs", 4096, nullptr, 5, nullptr) != pdPASS) {
+        portENTER_CRITICAL(&s_persist_mux);
+        s_persist_busy = false;
+        portEXIT_CRITICAL(&s_persist_mux);
+        ESP_LOGE(TAG, "haptic_nvs task failed; preference remains in RAM");
+    }
+}
+
+void PulseNow() {
+    Board::GetInstance().PulseVibration(PulseMsForIntensity(s_intensity));
 }
 
 void WriteZoneCoords(HapticZone* z, lv_obj_t* obj) {
@@ -93,8 +161,19 @@ bool RegisterZone(lv_obj_t* obj) {
         return true;
     }
     if (s_zone_count >= kMaxZones) {
-        ESP_LOGW(TAG, "zone table full (%u)", static_cast<unsigned>(kMaxZones));
-        return false;
+        // Long font/TOC lists contain many off-screen buttons. Only retain
+        // visible early-feedback zones; PRESSED feedback still works for all.
+        for (size_t i = s_zone_count; i > 0; --i) {
+            if (!lv_obj_is_visible(s_zones[i - 1].obj)) RemoveZoneAt(i - 1);
+        }
+        if (s_zone_count >= kMaxZones) {
+            static bool warned = false;
+            if (!warned) {
+                ESP_LOGW(TAG, "visible zone table full (%u); use press feedback", static_cast<unsigned>(kMaxZones));
+                warned = true;
+            }
+            return false;
+        }
     }
     lv_area_t a{};
     lv_obj_get_coords(obj, &a);
@@ -114,6 +193,8 @@ void OnGeomChanged(lv_event_t* e) {
     lv_obj_t* obj = static_cast<lv_obj_t*>(lv_event_get_target(e));
     HapticZone* z = FindZoneByObj(obj);
     if (z == nullptr) {
+        if (lv_event_get_code(e) == LV_EVENT_DRAW_MAIN_BEGIN && lv_obj_is_visible(obj))
+            RegisterZone(obj);
         return;
     }
     lv_area_t a{};
@@ -157,27 +238,42 @@ void OnPressFeedback(lv_event_t* e) {
 }  // namespace
 
 bool HapticIsEnabled(void) {
-    if (!s_ready) {
-        LoadFromNvs();
-    }
+    EnsureReady();
     return s_enabled;
 }
 
 void HapticSetEnabled(bool enabled) {
+    EnsureReady();
+    portENTER_CRITICAL(&s_persist_mux);
     s_enabled = enabled;
+    portEXIT_CRITICAL(&s_persist_mux);
     s_ready = true;
-    // 与 card_style 同理：LVGL worker 栈在 PSRAM，禁止本任务直接写 NVS。
-    if (xTaskCreate(PersistTask, "haptic_nvs", 4096, enabled ? reinterpret_cast<void*>(1) : nullptr, 5,
-                    nullptr) != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate(haptic_nvs) failed");
+    SchedulePersist();
+}
+
+int HapticGetIntensity(void) {
+    EnsureReady();
+    return s_intensity;
+}
+
+void HapticSetIntensity(int intensity) {
+    EnsureReady();
+    const int next = ClampIntensity(intensity);
+    if (s_intensity == next) {
+        return;
     }
+    portENTER_CRITICAL(&s_persist_mux);
+    s_intensity = next;
+    portEXIT_CRITICAL(&s_persist_mux);
+    s_ready = true;
+    SchedulePersist();
 }
 
 void HapticPulseIfEnabled(void) {
     if (!HapticIsEnabled()) {
         return;
     }
-    Board::GetInstance().PulseVibration();
+    PulseNow();
 }
 
 void HapticBeginPress(void) {
@@ -193,7 +289,7 @@ void HapticPulseOnFingerDown(void) {
     if (!HapticIsEnabled()) {
         return;
     }
-    Board::GetInstance().PulseVibration();
+    PulseNow();
 }
 
 bool HapticTryPulseAtUiPoint(int16_t x, int16_t y) {
@@ -237,7 +333,7 @@ void HapticAttachClick(lv_obj_t* obj) {
     // 布局常改位置不改尺寸：SIZE_CHANGED 不来，上屏绘制时刷新热区坐标
     lv_obj_add_event_cb(obj, OnGeomChanged, LV_EVENT_DRAW_MAIN_BEGIN, nullptr);
     lv_obj_add_event_cb(obj, OnObjDeleted, LV_EVENT_DELETE, nullptr);
-    RegisterZone(obj);
+    // Register after layout, when DRAW supplies the actual visible coordinates.
 }
 
 void HapticDetachClick(lv_obj_t* obj) {

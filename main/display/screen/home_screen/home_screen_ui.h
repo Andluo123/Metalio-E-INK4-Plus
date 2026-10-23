@@ -2,6 +2,9 @@
 
 #include "home_screen_priv.h"
 
+/** @brief 在细体上轻叠一像素，让应用名略微加粗。 */
+void Home_OnAppNameDraw(lv_event_t* e);
+
 /** @brief 盖板键短按翻应用页 */
 bool Home_OnVkKey(const char* key);
 /** @brief BOOT 长按快捷进百问 */

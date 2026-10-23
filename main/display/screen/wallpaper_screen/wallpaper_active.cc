@@ -16,6 +16,7 @@
 #include "screen_common.h"
 #include "sd_paths.h"
 #include "settings.h"
+#include "sd_access.h"
 
 
 static constexpr const char* kLogTag = "WpActive";
@@ -29,6 +30,7 @@ enum class WallpaperActiveSlot : uint8_t { Shutdown = 0, Standby = 1, Count = 2 
 static char s_names[static_cast<size_t>(WallpaperActiveSlot::Count)][kNameMax + 1] = {};
 static std::atomic<bool> s_cache_ready{false};
 static std::atomic<bool> s_hydrate_busy{false};
+static std::atomic<bool> s_standby_selected{false};
 
 struct WallpaperActiveHydrateWork {
     Wallpaper_HydrateDoneFn done = nullptr;
@@ -99,6 +101,9 @@ static void SetSlotCache(WallpaperActiveSlot slot, const char* name) {
     } else {
         std::snprintf(s_names[i], sizeof(s_names[i]), "%s", name);
     }
+    if (slot == WallpaperActiveSlot::Standby) {
+        s_standby_selected.store(name != nullptr && name[0] != '\0', std::memory_order_release);
+    }
 }
 
 static void MarkCacheReady() {
@@ -156,12 +161,13 @@ static void LoadAllFromNvsIntoCache() {
             ESP_LOGI(kLogTag, "hydrate %s=%s", SlotTag(slot), name.c_str());
             continue;
         }
-        if (SdCardManager::GetInstance().IsMounted()) {
+        if (SdCardManager::GetInstance().IsMounted() && !sd_access::IsQuiescing()) {
             ESP_LOGW(kLogTag, "hydrate %s NVS=%s missing on SD → clear", SlotTag(slot), name.c_str());
             PersistSlotToNvs(slot, nullptr);
             SetSlotCache(slot, "");
         } else {
-            SetSlotCache(slot, "");
+            // 尚未挂载不等于没有选择；保留配置供待机入口判断，稍后再验证文件。
+            SetSlotCache(slot, name.c_str());
             defer_ready = true;
             ESP_LOGW(kLogTag, "hydrate SD unmounted, keep NVS %s=%s", SlotTag(slot), name.c_str());
         }
@@ -337,6 +343,10 @@ std::string Wallpaper_GetActiveFilename() {
 
 std::string Wallpaper_GetStandbyFilename() {
     return GetSlotFilename(WallpaperActiveSlot::Standby);
+}
+
+bool Wallpaper_HasStandbySelection() {
+    return s_standby_selected.load(std::memory_order_acquire);
 }
 
 bool Wallpaper_IsActiveFilename(const char* filename) {

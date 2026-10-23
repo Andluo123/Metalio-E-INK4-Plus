@@ -4,7 +4,7 @@
 
 // 正文 3×3 触摸分区（NVS namespace "reader" / key "tap_zones"）：
 // 行主序 cell 0..8；默认左列上一页、中列菜单、右列下一页。
-// 动作：无 / 上一页 / 菜单 / 下一页 / 返回 / 目录 / 全刷一次。
+// 动作：无 / 上一页 / 菜单 / 下一页 / 返回 / 目录 / 全刷一次 / 书签 / 字体 / 设置。
 // 读走 RAM 缓存；首次 Ensure 须在 DRAM 栈；落盘在内部 RAM 栈任务。
 
 enum class BookTapZoneAction : uint8_t {
@@ -15,7 +15,11 @@ enum class BookTapZoneAction : uint8_t {
     kBack = 4,
     kToc = 5,
     kFullRefresh = 6, // 下一帧 EPD 全刷一次
-    kCount = 7,
+    // Append actions: existing saved 0..6 assignments keep their meaning.
+    kBookmarks = 7,
+    kFontSettings = 8,
+    kSettings = 9,
+    kCount = 10,
 };
 
 constexpr int kBookTapZoneCellCount = 9;

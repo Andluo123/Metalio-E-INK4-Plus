@@ -27,10 +27,16 @@ void SsidManager::LoadFromNvs() {
     // ssid, ssid1, ssid2, ... ssid9
     // password, password1, password2, ... password9
     nvs_handle_t nvs_handle;
-    auto ret = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    auto ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
     if (ret != ESP_OK) {
-        // The namespace doesn't exist, just return
-        ESP_LOGW(TAG, "NVS namespace %s doesn't exist", NVS_NAMESPACE);
+        ESP_LOGE(TAG, "Failed to open Wi-Fi NVS: %s", esp_err_to_name(ret));
+        return;
+    }
+    uint8_t initialized = 0;
+    const auto init_ret = nvs_get_u8(nvs_handle, "initialized", &initialized);
+    if (init_ret != ESP_OK && init_ret != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "Failed to read Wi-Fi initialization state: %s", esp_err_to_name(init_ret));
+        nvs_close(nvs_handle);
         return;
     }
     for (int i = 0; i < MAX_WIFI_SSID_COUNT; i++) {
@@ -56,6 +62,14 @@ void SsidManager::LoadFromNvs() {
         ssid_list_.push_back({ssid, password});
     }
     nvs_close(nvs_handle);
+    // Seed only once. An explicitly cleared list must stay empty after reboot.
+    // Preserve saved networks when upgrading devices without this marker.
+    if (init_ret == ESP_ERR_NVS_NOT_FOUND) {
+        if (ssid_list_.empty()) {
+            ssid_list_.push_back({"CloudZao-Test", "asdfghjkl"});
+        }
+        SaveToNvs();
+    }
 }
 
 void SsidManager::SaveToNvs() {
@@ -79,7 +93,8 @@ void SsidManager::SaveToNvs() {
             nvs_erase_key(nvs_handle, password_key.c_str());
         }
     }
-    nvs_commit(nvs_handle);
+    ESP_ERROR_CHECK(nvs_set_u8(nvs_handle, "initialized", 1));
+    ESP_ERROR_CHECK(nvs_commit(nvs_handle));
     nvs_close(nvs_handle);
 }
 

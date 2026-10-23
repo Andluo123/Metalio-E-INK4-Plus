@@ -1,6 +1,7 @@
 #include "settings_theme_tab.h"
 
 #include "assets/lang_config.h"
+#include "assets/lang_pixel.h"
 #include "fontpack_lvgl.h"
 #include "home_screen/home_screen.h"
 #include "settings_common.h"
@@ -23,6 +24,12 @@ static const char* ThemeTitleBorder() {
 static const char* ThemeTitleSlash() {
     return Lang::Strings::SETTINGS_THEME_SLASH;
 }
+static const char* ThemeTitlePixel() {
+    return Lang::Strings::SETTINGS_THEME_PIXEL;
+}
+static const char* ThemeCurPixel() {
+    return Lang::Strings::SETTINGS_THEME_CURRENT_PIXEL;
+}
 static const char* ThemeCurWhite() {
     return Lang::Strings::SETTINGS_THEME_CURRENT_WHITE;
 }
@@ -41,6 +48,7 @@ static constexpr SettingsThemeOption kThemeOptions[] = {
     {HomeScreen::kCardStyleGray, ThemeTitleGray, ThemeCurGray},
     {HomeScreen::kCardStyleBorder, ThemeTitleBorder, ThemeCurBorder},
     {HomeScreen::kCardStyleSlash, ThemeTitleSlash, ThemeCurSlash},
+    {HomeScreen::kCardStylePixel, ThemeTitlePixel, ThemeCurPixel},
 };
 static constexpr int kThemeOptionCount = sizeof(kThemeOptions) / sizeof(kThemeOptions[0]);
 

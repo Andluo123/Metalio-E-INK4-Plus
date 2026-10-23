@@ -6,6 +6,10 @@
 #include <cstdio>
 
 #include <esp_log.h>
+#ifndef EBOOK_EMULATOR
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 #include <zlib.h>
 #ifndef EBOOK_EMULATOR
 #include "assets/lang_config.h"
@@ -177,12 +181,14 @@ void EbookDocument::Close() {
 }
 
 bool EbookDocument::Open(const char* path) {
+    error_ = BookReadError::kInvalidData;
     Close();
     if (path == nullptr || path[0] == '\0') {
         return false;
     }
     fp_ = std::fopen(path, "rb");
     if (fp_ == nullptr) {
+        error_ = BookReadError::kFileIo;
         ESP_LOGE(TAG, "fopen fail: %s", path);
         return false;
     }
@@ -551,25 +557,6 @@ bool EbookDocument::ReadOneBlockAt(uint32_t offset, uint8_t& type, std::vector<u
     return true;
 }
 
-void EbookDocument::TextPayloadToBlocks(const uint8_t* data, size_t len,
-                                        std::vector<ContentBlock>& out) {
-    size_t i = 0;
-    while (i < len) {
-        size_t j = i;
-        while (j < len && data[j] != kCtrlPara) {
-            ++j;
-        }
-        if (j > i) {
-            ContentBlock b;
-            b.kind = ContentKind::kText;
-            b.text.assign(reinterpret_cast<const char*>(data + i), j - i);
-            // 软换行保留；渲染侧按 \\n 折行
-            out.push_back(std::move(b));
-        }
-        i = (j < len) ? j + 1 : j;
-    }
-}
-
 bool EbookDocument::ImagePayloadToBytes(const uint8_t* raw, size_t raw_len,
                                         std::vector<uint8_t>& out) {
     out.clear();
@@ -609,8 +596,8 @@ bool EbookDocument::ImagePayloadToBytes(const uint8_t* raw, size_t raw_len,
     return false;
 }
 
-bool EbookDocument::LoadChapterBlocks(int chapter_index, std::vector<ContentBlock>& out) {
-    out.clear();
+bool EbookDocument::StreamChapterBlocks(int chapter_index, const ContentBlockSink& sink) {
+    error_ = BookReadError::kInvalidData;
     if (!IsOpen() || chapter_index < 0 ||
         static_cast<size_t>(chapter_index) >= chapters_.size()) {
         return false;
@@ -622,7 +609,6 @@ bool EbookDocument::LoadChapterBlocks(int chapter_index, std::vector<ContentBloc
         if (cursor >= end) {
             ESP_LOGW(TAG, "chapter %d truncated at block %u", chapter_index,
                      static_cast<unsigned>(bi));
-            out.clear();
             return false;
         }
         uint8_t type = 0;
@@ -631,21 +617,34 @@ bool EbookDocument::LoadChapterBlocks(int chapter_index, std::vector<ContentBloc
         const uint32_t block_off = cursor;
         if (!ReadOneBlockAt(cursor, type, raw, &next)) {
             ESP_LOGW(TAG, "block read fail ch=%d bi=%u", chapter_index, static_cast<unsigned>(bi));
-            out.clear();
-            return false;
+                    return false;
         }
+        if (next > end || next <= cursor) return false;
         cursor = next;
+#ifndef EBOOK_EMULATOR
+        vTaskDelay(1);
+#endif
         if (type == kBlockText) {
-            TextPayloadToBlocks(raw.data(), raw.size(), out);
+            size_t begin = 0;
+            for (size_t i = 0; i <= raw.size(); ++i) {
+                if (i != raw.size() && raw[i] != kCtrlPara) continue;
+                if (i > begin) {
+                    ContentBlock block;
+                    block.text.assign(reinterpret_cast<const char*>(raw.data() + begin), i - begin);
+                    if (!sink(std::move(block))) return false;
+                }
+                begin = i + 1;
+            }
         } else if (type == kBlockImage) {
             ContentBlock b;
             b.kind = ContentKind::kImage;
             b.image_href = std::string(kImgHrefPrefix) + std::to_string(block_off);
-            out.push_back(std::move(b));
+            if (!sink(std::move(b))) return false;
         } else {
             ESP_LOGD(TAG, "skip unknown block type 0x%02x", type);
         }
     }
+    error_ = BookReadError::kNone;
     return true;
 }
 

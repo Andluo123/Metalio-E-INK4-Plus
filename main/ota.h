@@ -2,6 +2,7 @@
 #define _OTA_H
 
 #include <functional>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -18,6 +19,7 @@ public:
     ~Ota();
 
     esp_err_t CheckVersion();
+    esp_err_t CheckChatConfiguration();
     esp_err_t Activate();
     bool HasActivationChallenge() { return has_activation_challenge_; }
     bool HasNewVersion() { return has_new_version_; }
@@ -46,6 +48,9 @@ public:
     std::string GetCheckVersionUrl();
 
 private:
+    esp_err_t CheckResponse(bool chat_only);
+    esp_err_t CheckResponseOnce(bool chat_only, int64_t deadline_us);
+    bool chat_only_ = false;
     std::string activation_message_;
     std::string activation_code_;
     bool has_new_version_ = false;

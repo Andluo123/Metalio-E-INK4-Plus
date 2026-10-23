@@ -1,6 +1,8 @@
 #include "wifi_station.h"
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <mutex>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -18,6 +20,22 @@
 #define MAX_RECONNECT_COUNT 5
 // esp_timer 单位为微秒；扫不到已存 AP 时隔多久再扫（勿写成 10*1000=10ms）
 constexpr uint64_t kScanRetryUs = 10ULL * 1000 * 1000;
+// Boot Start and policy Pause run on different tasks. Never stop the driver
+// halfway through netif/driver/event/timer initialization.
+static std::recursive_mutex s_lifecycle_mu;
+
+static void ApplyApSelection(wifi_config_t& config) {
+    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    config.sta.bssid_set = false;
+    memset(config.sta.bssid, 0, sizeof(config.sta.bssid));
+    config.sta.channel = 0;
+}
+
+static void ApplyWifiProfile() {
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+}
 
 static esp_err_t NetifInitOnce()
 {
@@ -35,20 +53,20 @@ WifiStation::WifiStation() {
     event_group_ = xEventGroupCreate();
 
     // 读取配置
+    max_tx_power_ = 0;
+    remember_bssid_ = 0;
     nvs_handle_t nvs;
-    esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs);
-    if (err != ESP_OK) {
+    const esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs);
+    if (err == ESP_OK) {
+        nvs_get_i8(nvs, "max_tx_power", &max_tx_power_);
+        nvs_get_u8(nvs, "remember_bssid", &remember_bssid_);
+        nvs_close(nvs);
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGE(TAG, "Failed to open NVS: %d", err);
     }
-    err = nvs_get_i8(nvs, "max_tx_power", &max_tx_power_);
-    if (err != ESP_OK) {
-        max_tx_power_ = 0;
-    }
-    err = nvs_get_u8(nvs, "remember_bssid", &remember_bssid_);
-    if (err != ESP_OK) {
-        remember_bssid_ = 0;
-    }
-    nvs_close(nvs);
+    #if CONFIG_BOARD_TYPE_METALIO_E_INK4_PLUS
+    max_tx_power_ = kMetalioWifiMaxTxPower;
+    #endif
 }
 
 WifiStation::~WifiStation() {
@@ -61,6 +79,10 @@ void WifiStation::AddAuth(const std::string &&ssid, const std::string &&password
 }
 
 void WifiStation::Stop() {
+    std::lock_guard<std::recursive_mutex> lock(s_lifecycle_mu);
+    // Publish unavailable before stopping the radio. A caller may still have
+    // observed the old bit, so queries must also handle driver errors below.
+    xEventGroupClearBits(event_group_, WIFI_EVENT_CONNECTED);
     lp_paused_ = false;
     fast_reconnect_on_start_ = false;
     scanning_ = false;
@@ -96,6 +118,7 @@ void WifiStation::Stop() {
 }
 
 void WifiStation::PauseForLp() {
+    std::lock_guard<std::recursive_mutex> lock(s_lifecycle_mu);
     if (lp_paused_) {
         return;
     }
@@ -103,6 +126,10 @@ void WifiStation::PauseForLp() {
     if (station_netif_ == nullptr) {
         return;
     }
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    const bool driver_ready = esp_wifi_get_mode(&mode) == ESP_OK;
+    // STA 的后台超时或省电请求不得停止正在运行的热点。
+    if (driver_ready && (mode & WIFI_MODE_AP) != 0) return;
     if (timer_handle_ != nullptr) {
         esp_timer_stop(timer_handle_);
     }
@@ -111,8 +138,7 @@ void WifiStation::PauseForLp() {
     xEventGroupClearBits(event_group_, WIFI_EVENT_CONNECTED);
     // 先置位，避免 esp_wifi_stop 触发的 DISCONNECTED 里再 connect/扫网
     lp_paused_ = true;
-    wifi_mode_t mode = WIFI_MODE_NULL;
-    if (esp_wifi_get_mode(&mode) == ESP_OK) {
+    if (driver_ready) {
         esp_err_t err = esp_wifi_stop();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "LP pause wifi stop: %s", esp_err_to_name(err));
@@ -122,6 +148,7 @@ void WifiStation::PauseForLp() {
 }
 
 esp_err_t WifiStation::ResumeFromLp() {
+    std::lock_guard<std::recursive_mutex> lock(s_lifecycle_mu);
     if (!lp_paused_) {
         return ESP_OK;
     }
@@ -131,10 +158,16 @@ esp_err_t WifiStation::ResumeFromLp() {
         lp_paused_ = false;
         return ESP_ERR_INVALID_STATE;
     }
+    // 传输热点是纯 AP，此时没有 STA 口，set_protocol 会 INVALID_ARG 并重启
+    if ((mode & WIFI_MODE_STA) == 0) {
+        ESP_LOGW(TAG, "LP resume skipped (no STA, mode=%d)", static_cast<int>(mode));
+        return ESP_ERR_INVALID_STATE;
+    }
     reconnect_count_ = 0;
     // 须先清 pause：esp_wifi_start 可能同步抛 STA_START，否则扫网被丢掉
     lp_paused_ = false;
     fast_reconnect_on_start_ = !ssid_.empty();
+    ApplyWifiProfile();
     esp_err_t err = esp_wifi_start();
     if (err != ESP_OK) {
         lp_paused_ = true;
@@ -159,6 +192,7 @@ void WifiStation::OnConnected(std::function<void(const std::string& ssid)> on_co
 }
 
 void WifiStation::Start() {
+    std::lock_guard<std::recursive_mutex> lock(s_lifecycle_mu);
     if (station_netif_ != nullptr) {
         if (lp_paused_) {
             ResumeFromLp();
@@ -176,6 +210,7 @@ void WifiStation::Start() {
 
     // Initialize the WiFi stack in station mode
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    // Keep the IDF default TX/RX aggregation settings.
     cfg.nvs_enable = false;
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -190,11 +225,8 @@ void WifiStation::Start() {
                                                         this,
                                                         &instance_got_ip_));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ApplyWifiProfile();
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    if (max_tx_power_ != 0) {
-        ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(max_tx_power_));
-    }
 
     // Setup the timer to scan WiFi
     esp_timer_create_args_t timer_args = {
@@ -258,7 +290,6 @@ void WifiStation::HandleScanResult() {
     free(ap_records);
 
     if (connect_queue_.empty()) {
-        ESP_LOGI(TAG, "Wait for next scan");
         if (timer_handle_ != nullptr && !lp_paused_) {
             esp_timer_start_once(timer_handle_, kScanRetryUs);
         }
@@ -283,29 +314,37 @@ void WifiStation::StartConnect() {
     bzero(&wifi_config, sizeof(wifi_config));
     strcpy((char *)wifi_config.sta.ssid, ap_record.ssid.c_str());
     strcpy((char *)wifi_config.sta.password, ap_record.password.c_str());
-    if (remember_bssid_) {
-        wifi_config.sta.channel = ap_record.channel;
-        memcpy(wifi_config.sta.bssid, ap_record.bssid, 6);
-        wifi_config.sta.bssid_set = true;
-    }
+    ApplyApSelection(wifi_config);
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
     reconnect_count_ = 0;
     ESP_ERROR_CHECK(esp_wifi_connect());
 }
 
+bool WifiStation::TryGetApInfo(wifi_ap_record_t& ap_info) {
+    ap_info = {};
+    if (!IsConnected()) {
+        return false;
+    }
+    wifi_ap_record_t current = {};
+    // The connected bit is a hint, not a lock on the driver's lifecycle.
+    // STOP_STATE/NOT_STARTED/NOT_INIT/NOT_CONNECT are normal during transitions.
+    const esp_err_t err = esp_wifi_sta_get_ap_info(&current);
+    if (err != ESP_OK || !IsConnected()) {
+        return false;
+    }
+    ap_info = current;
+    return true;
+}
+
 int8_t WifiStation::GetRssi() {
-    // Get station info
-    wifi_ap_record_t ap_info;
-    ESP_ERROR_CHECK(esp_wifi_sta_get_ap_info(&ap_info));
-    return ap_info.rssi;
+    wifi_ap_record_t ap_info = {};
+    return TryGetApInfo(ap_info) ? ap_info.rssi : kRssiUnavailable;
 }
 
 uint8_t WifiStation::GetChannel() {
-    // Get station info
-    wifi_ap_record_t ap_info;
-    ESP_ERROR_CHECK(esp_wifi_sta_get_ap_info(&ap_info));
-    return ap_info.primary;
+    wifi_ap_record_t ap_info = {};
+    return TryGetApInfo(ap_info) ? ap_info.primary : kChannelUnavailable;
 }
 
 bool WifiStation::IsConnected() {
@@ -323,12 +362,12 @@ bool WifiStation::IsScanning() {
     return IsLinkInProgress() && scanning_;
 }
 
-void WifiStation::SetPowerSaveMode(bool enabled) {
-    ESP_ERROR_CHECK(esp_wifi_set_ps(enabled ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE));
+void WifiStation::SetPowerSaveMode(bool /*enabled*/) {
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 
 // Static event handler functions
-void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+void WifiStation::WifiEventHandler(void* arg, esp_event_base_t /*event_base*/, int32_t event_id, void* /*event_data*/) {
     auto* this_ = static_cast<WifiStation*>(arg);
     if (this_->lp_paused_) {
         if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -337,10 +376,15 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
         return;
     }
     if (event_id == WIFI_EVENT_STA_START) {
+        if (this_->max_tx_power_ != 0) {
+            ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(this_->max_tx_power_));
+        }
         if (this_->fast_reconnect_on_start_) {
             this_->fast_reconnect_on_start_ = false;
             wifi_config_t cfg = {};
             if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.ssid[0] != '\0') {
+                ApplyApSelection(cfg);
+                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
                 this_->reconnect_count_ = 0;
                 this_->scanning_ = false;
                 if (this_->on_connect_ && !this_->ssid_.empty()) {
@@ -390,11 +434,10 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
         if (this_->timer_handle_ != nullptr && !this_->lp_paused_) {
             esp_timer_start_once(this_->timer_handle_, kScanRetryUs);
         }
-    } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
     }
 }
 
-void WifiStation::IpEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+void WifiStation::IpEventHandler(void* arg, esp_event_base_t /*event_base*/, int32_t /*event_id*/, void* event_data) {
     auto* this_ = static_cast<WifiStation*>(arg);
     auto* event = static_cast<ip_event_got_ip_t*>(event_data);
 

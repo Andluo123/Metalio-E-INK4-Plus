@@ -1,3 +1,4 @@
+#include "epd_content_policy.h"
 #include "cloud_screen/preview/cloud_wallpaper_preview.h"
 #include "cloud_screen/cloud_screen_priv.h"
 #include "cloud_screen/download/cloud_download.h"
@@ -16,10 +17,19 @@
 #include <freertos/task.h>
 
 #include "assets/lang_config.h"
+#include "epd_refresh.h"
 #include "power_policy.h"
 #include "reader/reader.h"
 #include "reader/image_util.h"
 #include "screen_common.h"
+
+static void CloudRevealAfterWhite() {
+    EpdCancelPageTurn();
+    EpdRequestScreenChange();
+    if (Cloud_State().chrome.screen != nullptr) {
+        lv_obj_invalidate(Cloud_State().chrome.screen);
+    }
+}
 
 void StyleDownloadBtn(bool enabled) {
     auto& st = Cloud_State();
@@ -77,6 +87,10 @@ void ShowWallpaperPreviewMode(bool preview) {
             lv_obj_add_flag(st.preview.body, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    // 离开详情时请求清白过渡，避免灰阶图像残留。
+    if (!preview) {
+        CloudRevealAfterWhite();
+    }
 }
 
 void CloseWallpaperPreview() {
@@ -130,6 +144,7 @@ void ApplyWallpaperPreviewAsync(void* p) {
     if (st.preview.img != nullptr) {
         lv_image_set_scale(st.preview.img, LV_SCALE_NONE);
         lv_image_set_src(st.preview.img, &st.preview.raster->dsc);
+        EpdSetContentRole(st.preview.img,EpdContentRole::WallpaperPreview);
         lv_obj_set_size(st.preview.img, st.preview.raster->width,
                         st.preview.raster->height);
         lv_obj_clear_flag(st.preview.img, LV_OBJ_FLAG_HIDDEN);
@@ -315,13 +330,15 @@ void OpenWallpaperPreview(int index) {
     StyleDownloadBtn(true);
     if (CloudDlTasksActive() || s_dl_owns_http.load(std::memory_order_acquire)) {
         ShowPreviewWaitDlTip();
-        return;
+    } else {
+        if (st.preview.status != nullptr) {
+            lv_label_set_text(st.preview.status, Lang::Strings::CLOUD_LOADING);
+            lv_obj_clear_flag(st.preview.status, LV_OBJ_FLAG_HIDDEN);
+        }
+        ScheduleLoadWallpaperPreview(index);
     }
-    if (st.preview.status != nullptr) {
-        lv_label_set_text(st.preview.status, Lang::Strings::CLOUD_LOADING);
-        lv_obj_clear_flag(st.preview.status, LV_OBJ_FLAG_HIDDEN);
-    }
-    ScheduleLoadWallpaperPreview(index);
+    // 进入详情时清白过渡，异步图像回填不重复清屏。
+    CloudRevealAfterWhite();
 }
 
 void OnWallpaperDownloadClicked(lv_event_t* /*e*/) {

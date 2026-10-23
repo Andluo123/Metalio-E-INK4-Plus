@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -19,6 +20,33 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+
+namespace {
+std::mutex audio_power_mutex;
+bool audio_power_held = false;
+bool mode3_audio = false;
+
+void SetAudioPowerLocked(bool enabled) {
+    if (audio_power_held == enabled) return;
+    if (enabled) {
+        PowerPolicy::GetInstance().Acquire(PowerNeed::BtAudio);
+    } else {
+        PowerPolicy::GetInstance().Release(PowerNeed::BtAudio);
+    }
+    audio_power_held = enabled;
+}
+}  // namespace
+
+void Bluetooth_set_mode_audio_power(BtMode mode) {
+    std::lock_guard<std::mutex> lock(audio_power_mutex);
+    mode3_audio = mode == BtMode::kMode3;
+    SetAudioPowerLocked(mode3_audio);
+}
+
+void Bluetooth_release_page_audio_power() {
+    std::lock_guard<std::mutex> lock(audio_power_mutex);
+    if (!mode3_audio) SetAudioPowerLocked(false);
+}
 
 bool Bluetooth_is_hex_char(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
@@ -179,11 +207,11 @@ void Bluetooth_on_uart_data(const std::vector<uint8_t>& data) {
     }
 }
 
-void Bluetooth_mode_cmd_task(void* param) {
-    auto* args = static_cast<ModeCmdArgs*>(param);
+void Bluetooth_apply_mode_commands(BtMode mode) {
     SimpleUart& uart = SimpleUart::getInstance();
 
-    switch (args->mode) {
+    Bluetooth_set_mode_audio_power(mode);
+    switch (mode) {
         case BtMode::kMode1:
             Bluetooth_post_status(Lang::Strings::BT_SWITCH_MODE1);
             uart.sendString("AT+RX=2\r\n");
@@ -211,7 +239,11 @@ void Bluetooth_mode_cmd_task(void* param) {
         default:
             break;
     }
+}
 
+void Bluetooth_mode_cmd_task(void* param) {
+    auto* args = static_cast<ModeCmdArgs*>(param);
+    Bluetooth_apply_mode_commands(args->mode);
     delete args;
     Bluetooth_mode_cmd_busy.store(false, std::memory_order_release);
     vTaskDelete(nullptr);
@@ -242,8 +274,10 @@ void Bluetooth_send_mode_command(BtMode mode) {
 }
 
 void Bluetooth_call_mode_task(void* /*param*/) {
-    PowerPolicy::GetInstance().Release(PowerNeed::BtAudio);
-    PowerPolicy::GetInstance().Acquire(PowerNeed::BtAudio);
+    {
+        std::lock_guard<std::mutex> lock(audio_power_mutex);
+        SetAudioPowerLocked(true);
+    }
     SimpleUart& uart = SimpleUart::getInstance();
     Bluetooth_post_status(Lang::Strings::BT_SWITCH_CALL);
     uart.sendString("AT+PP=1\r\n");
@@ -255,7 +289,10 @@ void Bluetooth_call_mode_task(void* /*param*/) {
 }
 
 void Bluetooth_music_mode_task(void* /*param*/) {
-    PowerPolicy::GetInstance().Release(PowerNeed::BtAudio);
+    {
+        std::lock_guard<std::mutex> lock(audio_power_mutex);
+        if (!mode3_audio) SetAudioPowerLocked(false);
+    }
     SimpleUart& uart = SimpleUart::getInstance();
     Bluetooth_post_status(Lang::Strings::BT_SWITCH_MUSIC);
     uart.sendString("AT+BTSCO=0\r\n");

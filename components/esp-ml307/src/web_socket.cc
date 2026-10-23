@@ -108,7 +108,6 @@ bool WebSocket::Connect(const char* uri) {
         }
     }
 
-    ESP_LOGD(TAG, "Connecting to %s://%s:%s%s", protocol.c_str(), host.c_str(), port.c_str(), path.c_str());
 
     // 设置 WebSocket 特定的头部
     SetHeader("Upgrade", "websocket");

@@ -24,6 +24,20 @@
 #include "reader/image_util.h"
 #include "screen_common.h"
 
+// 黑白显示路径仅保留低亮度像素，先进行有序抖动以保留封面层次。
+static void QuantizeThumbBinary(reader::RasterImage& img) {
+    static const uint8_t kBayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+    uint8_t* px = img.pixels.data();
+    const int w = img.width;
+    const int h = img.height;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const unsigned t = static_cast<unsigned>(kBayer[(y & 3) * 4 + (x & 3)]) * 16u + 8u;
+            px[y * w + x] = px[y * w + x] >= t ? 255 : 0;
+        }
+    }
+}
+
 bool Cloud_DownloadUrlToBuffer(const char* url, std::vector<uint8_t>& buf, size_t max_bytes) {
     buf.clear();
     if (url == nullptr || url[0] == '\0' || max_bytes == 0) {
@@ -208,6 +222,9 @@ void CoverThumbFillTask(void* arg) {
                     ok = reader::DecodeImageToL8(bytes.data(), bytes.size(), kThumbDecodeW,
                                                  kThumbDecodeH, *img) &&
                          !img->empty();
+                    if (ok) {
+                        QuantizeThumbBinary(*img);
+                    }
                     ESP_LOGI(TAG, "cover decode idx=%d ok=%d bytes=%u", w.index, ok ? 1 : 0,
                              static_cast<unsigned>(bytes.size()));
                 } else {

@@ -9,7 +9,7 @@
 
 namespace {
 
-constexpr lv_coord_t kCompactOptionH = UiSy(52);
+constexpr lv_coord_t kCompactOptionH = UiSy(44);
 constexpr lv_coord_t kRowGap = UiSx(8);
 constexpr lv_coord_t kPagePadRow = UiSy(8); // 本页行距略紧于全局 kSettingsOptionGap
 

@@ -1,4 +1,7 @@
 #include "book_screen/book_nav.h"
+#include "book_screen/reader/book_auto_turn.h"
+#include "book_screen/reader/book_reader_prefs.h"
+#include "epd_refresh.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/shelf/book_bookshelf.h"
 #include "book_screen/shelf/book_detail.h"
@@ -14,8 +17,10 @@
 #include "book_screen/reader/book_reader_body.h"
 #include "book_screen/reader/book_reader_overlay.h"
 #include "book_screen/settings/book_settings_sheet.h"
+#include "book_screen/settings/book_font_multi.h"
 
 #include <lvgl.h>
+#include <atomic>
 #include <cstdint>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -77,22 +82,33 @@ void ApplyReaderPageDelta() {
     }
     // 一次吃光积压：长按按档累加，每帧画到「当前指到的页」（墨水慢则中间页跳过）
     int d = s_reader_page_delta.exchange(0, std::memory_order_acq_rel);
+    const bool auto_turn = ConsumeReaderAutoTurnRequest();
+    if (d == 0 && auto_turn) d = 1;
+    int moved = 0;
     while (d > 0) {
         if (!st.reader.session->NextPage()) {
             break;
         }
         --d;
+        ++moved;
     }
     while (d < 0) {
         if (!st.reader.session->PrevPage()) {
             break;
         }
         ++d;
+        --moved;
+    }
+    if (moved) {
+        ReaderAutoTurnPageMoved();
+        EpdSetReaderEffect(BookReaderPrefsPageTurn() == kBookReaderPageTurnRipple ? EpdEffect::Ripple : EpdEffect::None);
+        EpdRequestPageTurn(moved > 0 ? 1 : -1);
     }
 }
 
 // 盖板键/长按定时器：只累加 delta，真正翻页在 RenderReaderPage（LVGL）
 bool QueueReaderPageTurn(int dir) {
+    if (dir != 0) ReaderAutoTurnManualInput();
     auto& st = Book_State();
     if (dir == 0 || !st.reader.session || !st.reader.session->IsOpen()) {
         return false;
@@ -160,8 +176,17 @@ void WarnReaderWorkersBusy(const char* where) {
 }
 
 // 离开正文（进百问等）：落盘 .pos、释放 session/字库；打开中则延后清。
+void ReleaseReaderForSystemHome() {
+    if (Book_State().reader.read_scr != nullptr) {
+        ReleaseReaderSessionForLeave();
+    }
+}
+
 void ReleaseReaderSessionForLeave() {
+    CancelReadFontScan();
+    CloseBookmarkMessage();
     auto& st = Book_State();
+    CancelReaderPrefsReopen();
     st.reader.open_token.fetch_add(1);
     st.reader.read_scr = nullptr;
     st.reader.content = nullptr;
@@ -175,6 +200,8 @@ void ReleaseReaderSessionForLeave() {
     st.reader.status_label = nullptr;
     st.reader.status_h = 0;
     st.settings.settings_sheet = nullptr;
+    st.settings.reader_light_panel = nullptr;
+    st.settings.reader_light_page = false;
     ClearSettingsSheetWidgetRefs();
     StopTtfPollTimer();
     st.ttf.ttf_mode = BookUiState::TtfMode::kNone;
@@ -229,7 +256,7 @@ void ReleaseReaderSessionForLeave() {
     SyncReaderAaForImmersion(false);
     if (DisplayUiSetOrient(kDisplayUiPortrait)) {
         if (auto* disp = LVAdapterDisplay::Instance()) {
-            disp->RequestNextFullRefresh();
+            disp->RequestFullOnNextCommit();
         }
     }
 }
@@ -259,7 +286,7 @@ lv_obj_t* ResumeDetailScreen() {
     if (st.shelf.selected < 0 || st.shelf.selected >= static_cast<int>(st.shelf.books.size())) {
         return BookScreen::Create();
     }
-    return CreateDetailScreen(st.shelf.selected);
+    return CreateReaderScreen(st.shelf.books[static_cast<size_t>(st.shelf.selected)]);
 }
 
 void OpenAssistantFromReaderAsync(void* /*user_data*/) {
@@ -297,9 +324,17 @@ bool BookLvAsync(void (*cb)(void*), void* user_data) {
     return ok;
 }
 
+static std::atomic<bool> s_bookshelf_screen_change{false};
+
 void PaintBookshelfPage() {
     ESP_LOGI(TAG, "async RenderBookshelfPage page=%d begin", Book_State().shelf.list_page);
+    const bool screen_change=s_bookshelf_screen_change.exchange(false);
     RenderBookshelfPage();
+    if (screen_change && Book_State().shelf.list_scr==lv_screen_active()) {
+        EpdCancelPageTurn();
+        EpdRequestScreenChange();
+        lv_obj_invalidate(lv_screen_active());
+    }
     ESP_LOGI(TAG, "async RenderBookshelfPage done");
 }
 
@@ -319,17 +354,20 @@ void EnsureBookPaintFns() {
     }
     if (s_reader_paint.paint == nullptr) {
         s_reader_paint.paint = PaintReaderPage;
+        s_reader_paint.defer_while_epd_busy = true;
     }
     if (s_toc_paint.paint == nullptr) {
         s_toc_paint.paint = PaintTocList;
     }
     if (s_settings_sheet_paint.paint == nullptr) {
         s_settings_sheet_paint.paint = RefreshSettingsSheet;
+        s_settings_sheet_paint.defer_while_epd_busy = true;
     }
 }
 
 // 页码已同步改完后调用：序号合并，积压回调跳过已画过的序号。
-void RequestRenderBookshelfPage() {
+void RequestRenderBookshelfPage(bool screen_change) {
+    if (screen_change) s_bookshelf_screen_change.store(true);
     EnsureBookPaintFns();
     ScreenPaintCoalesceRequest(&s_library_paint);
 }
@@ -351,6 +389,8 @@ void RequestSettingsSheetPaint() {
 }
 
 void AsyncHideReadChrome(void* /*user_data*/) {
+    if (CloseBookmarkMessage()) return;
+    if(CancelBookmarkMultiSelection())return;
     ESP_LOGI(TAG, "async HideReadChrome begin");
     HideReadChrome();
     ESP_LOGI(TAG, "async HideReadChrome done");
@@ -358,11 +398,13 @@ void AsyncHideReadChrome(void* /*user_data*/) {
 
 // BOOT 短按：正文弹出/收起悬浮排版卡片（须 LVGL 任务，禁止 touch_feed 同步改树）。
 void ToggleReadSettingsSheetAsync(void* /*user_data*/) {
+    if (CloseBookmarkMessage()) return;
     auto& st = Book_State();
     if (st.reader.read_scr == nullptr || st.reader.opening.load() || !st.reader.session || !st.reader.session->IsOpen()) {
         return;
     }
     if (st.reader.read_chrome == BookUiState::ReadChrome::kSettings) {
+        if(CancelBookmarkMultiSelection())return;
         ESP_LOGI(TAG, "async ToggleReadSettingsSheet -> hide");
         HideReadChrome();
         return;

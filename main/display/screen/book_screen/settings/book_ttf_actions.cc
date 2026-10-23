@@ -7,6 +7,7 @@
 #include "book_screen/settings/book_ttf_panel.h"
 #include "book_screen/reader/book_reader_overlay.h"
 #include "book_screen/settings/book_settings_sheet.h"
+#include "book_screen/book_nav.h"
 
 #include <lvgl.h>
 #include <cstdint>
@@ -19,13 +20,13 @@
 void OnFontImportClick(lv_event_t* e) {
     lv_event_stop_bubbling(e);
     auto& st = Book_State();
-    if (st.reader.opening.load() || ttf_convert::Busy()) {
+    if (st.reader.opening.load() || st.settings.font_scan_loading || ttf_convert::Busy()) {
         return;
     }
     if (st.settings.font_multi) {
         return;
     }
-    // 与触摸分区浮层互斥
+    // 导入面板覆盖字体卡片，仅关闭触摸分区浮层，保留顶部前光面板。
     TapZonesPanelClose();
     TtfScanFiles();
     st.ttf.ttf_page = 0;
@@ -170,11 +171,15 @@ void OnTtfConfirmNo(lv_event_t* e) {
 void OnTtfClose(lv_event_t* e) {
     lv_event_stop_bubbling(e);
     TtfPanelClose();
+    StartReadFontScan();
+    RequestSettingsSheetPaint();
 }
 
 void OnTtfResultOk(lv_event_t* e) {
     lv_event_stop_bubbling(e);
     TtfPanelClose();
+    StartReadFontScan();
+    RequestSettingsSheetPaint();
 }
 
 void TtfPollTimerCb(lv_timer_t* t) {
@@ -198,21 +203,18 @@ void TtfPollTimerCb(lv_timer_t* t) {
         st.ttf.ttf_mode = BookUiState::TtfMode::kNone;
         return;
     }
-    ScanReadFonts();
     st.ttf.ttf_result_ok = (s == 2);
     if (st.ttf.ttf_mode == BookUiState::TtfMode::kProgress && st.settings.settings_sheet != nullptr &&
         lv_obj_is_valid(st.settings.settings_sheet) && st.ttf.ttf_sheet != nullptr &&
         lv_obj_is_valid(st.ttf.ttf_sheet)) {
         st.ttf.ttf_mode = BookUiState::TtfMode::kResult;
         TtfRebuildContent();
-        ClampFontListPage();
-        RefreshSettingsSheetFontList();
     } else {
         // 面板已关：静默收尾；字库仍刷新，下次打开设置可见
         st.ttf.ttf_mode = BookUiState::TtfMode::kNone;
-        ClampFontListPage();
-        if (st.settings.settings_sheet != nullptr && lv_obj_is_valid(st.settings.settings_sheet)) {
-            RefreshSettingsSheetFontList();
+        if (st.reader.read_chrome == BookUiState::ReadChrome::kSettings && st.settings.reader_tab == 1) {
+            StartReadFontScan();
+            RequestSettingsSheetPaint();
         }
     }
 }

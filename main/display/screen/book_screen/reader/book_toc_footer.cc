@@ -1,6 +1,9 @@
+#include "assets/lang_reader.h"
+#include "epd_content_policy.h"
 #pragma GCC optimize("O1")
 
 #include "book_screen/reader/book_toc_footer.h"
+#include "book_screen/reader/book_auto_turn.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/cover/book_cover_loader.h"
 #include "book_screen/cover/book_cover_style.h"
@@ -75,6 +78,7 @@ void SyncFooterClockTimer() {
 }
 
 void StopFooterClockTimer() {
+    StopReaderAutoTurn();
     auto& st = Book_State();
     if (st.reader.footer_clock_timer != nullptr) {
         lv_timer_del(st.reader.footer_clock_timer);
@@ -84,6 +88,7 @@ void StopFooterClockTimer() {
 
 void UpdateReadFooter() {
     auto& st = Book_State();
+    if (st.reader.standby_paused) return;
     if (st.reader.page_label == nullptr) {
         return;
     }
@@ -122,7 +127,8 @@ void UpdateReadFooter() {
     if ((mask & kBookReaderFooterProgress) != 0) {
         const int cur = st.reader.session->BookCurrentPage() + 1;
         const int total = std::max(1, st.reader.session->BookPageCount());
-        std::snprintf(prog, sizeof(prog), "%d.%d%%  %d/%d", pct_x10 / 10, pct_x10 % 10, cur, total);
+        std::snprintf(prog, sizeof(prog), "%d.%d%%  %d/%s%d", pct_x10 / 10, pct_x10 % 10, cur,
+            st.reader.session->PageCountsEstimated() ? "~" : "", total);
     }
 
     char batt[12] = "";
@@ -176,6 +182,7 @@ void UpdateReadFooter() {
 
 void RenderTocList() {
     auto& st = Book_State();
+    if (st.reader.standby_paused) return;
     if (st.reader.content == nullptr || !st.reader.session || !st.reader.session->IsOpen()) {
         return;
     }
@@ -248,7 +255,7 @@ void RenderTocList() {
 
     const int toc_inner_w = CoverFrameInner(kTocCoverW);
     const int toc_inner_h = CoverFrameInner(kTocCoverH);
-    // 详情已删时复用 detail_cover；否则旁路秒读，无则占位并后台抽内嵌回写 .a2i1。
+    // 详情已删时复用 detail_cover；否则旁路秒读，无则占位并后台抽内嵌回写 .a2l8。
     if (st.detail.detail_scr == nullptr || !lv_obj_is_valid(st.detail.detail_scr)) {
         if (st.detail.detail_cover.empty() || st.detail.detail_cover.width + 8 < toc_inner_w ||
             st.detail.detail_cover.height + 8 < toc_inner_h) {
@@ -260,6 +267,7 @@ void RenderTocList() {
         st.detail.detail_cover.BindDsc();
         lv_obj_t* img = lv_image_create(cover_host);
         lv_image_set_src(img, &st.detail.detail_cover.dsc);
+        EpdSetContentRole(img,EpdContentRole::Cover);
         lv_obj_center(img);
         lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
     } else {
@@ -350,12 +358,13 @@ void RenderTocList() {
     }
 
     if (toc_n <= 0) {
-        lv_obj_t* empty = lv_label_create(st.reader.content);
-        lv_obj_set_style_text_font(empty, Book_ListFont(), 0);
-        lv_obj_set_style_text_color(empty, lv_color_black(), 0);
-        lv_label_set_text(empty, Lang::Strings::BOOK_TOC_EMPTY);
-        lv_obj_set_width(empty, list_w);
+        lv_obj_t* empty = lv_obj_create(st.reader.content);
+        lv_obj_remove_style_all(empty);
+        lv_obj_set_size(empty, list_w, std::max<lv_coord_t>(1, usable));
+        Book_DisableScroll(empty);
         lv_obj_clear_flag(empty, LV_OBJ_FLAG_CLICKABLE);
+        Book_ShowMessage(empty, st.reader.session->LiveRelayoutPending() ?
+            Lang::Strings::BOOK_TOC_BUILDING : Lang::Strings::BOOK_TOC_EMPTY);
         Book_FinishColRule(st.reader.content, col_rule);
         UpdateReadFooter();
         ResetPointerLongPress();

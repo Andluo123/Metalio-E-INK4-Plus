@@ -14,7 +14,11 @@ namespace reader {
  */
 bool RasterPageTextToL8(const Page& page, const lv_font_t* font, lv_coord_t line_gap,
                         lv_coord_t para_gap, int page_w, int page_h, int underline_mode,
-                        RasterImage& out);
+                        RasterImage& out, bool antialias = false);
+
+bool RasterPageVerticalTextToL8(const Page& page, const lv_font_t* font, lv_coord_t line_gap,
+                                lv_coord_t para_gap, int page_w, int page_h, int rule_mode,
+                                RasterImage& out, bool antialias = false);
 
 /**
  * @brief 估算正文墨迹高度（不含大片空白），供裁剪 L8 高度

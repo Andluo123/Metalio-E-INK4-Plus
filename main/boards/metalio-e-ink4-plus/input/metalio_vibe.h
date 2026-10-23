@@ -16,6 +16,8 @@ void MetalioVibe_Init(void);
  * @brief 短震一次（连续模式或强度 0 时忽略）
  */
 void MetalioVibe_Pulse(void);
+/** 指定短震毫秒数，非正数忽略；复用现有定时器。 */
+void MetalioVibe_PulseFor(int duration_ms);
 
 /**
  * @brief 连续震动开关（老化等）

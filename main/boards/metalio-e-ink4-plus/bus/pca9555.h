@@ -1,7 +1,7 @@
 #ifndef PCA9555_H
 #define PCA9555_H
 
-#include <driver/i2c.h>
+#include <driver/i2c_master.h>
 #include <esp_err.h>
 
 #define PCA_PIN_P00 0x0001

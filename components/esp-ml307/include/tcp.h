@@ -3,6 +3,7 @@
 
 
 #include <string>
+#include <cstdint>
 #include <functional>
 
 class Tcp {
@@ -11,6 +12,10 @@ public:
     virtual bool Connect(const std::string& host, int port) = 0;
     virtual void Disconnect() = 0;
     virtual int Send(const std::string& data) = 0;
+    /** @brief 设置本次请求的启动后绝对截止时间，单位微秒，零表示不限制。 */
+    virtual void SetRequestDeadline(int64_t deadline_us) {
+        request_deadline_us_ = deadline_us;
+    }
 
     virtual void OnStream(std::function<void(const std::string& data)> callback) {
         stream_callback_ = callback;
@@ -27,6 +32,7 @@ public:
     virtual int GetLastError() = 0;
 
 protected:
+    int64_t request_deadline_us_ = 0;
     std::function<void(const std::string& data)> stream_callback_;
     std::function<void()> disconnect_callback_;
     

@@ -7,6 +7,7 @@
 #include "book_screen/book_nav.h"
 
 #include <lvgl.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -135,11 +136,17 @@ lv_obj_t* FindShelfCell(int index) {
         return nullptr;
     }
     const uint32_t n = lv_obj_get_child_count(st.shelf.list_body);
-    for (uint32_t i = 0; i < n; ++i) {
-        lv_obj_t* cell = lv_obj_get_child(st.shelf.list_body, i);
-        if (cell != nullptr &&
-            static_cast<int>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(cell))) == index) {
-            return cell;
+    for(uint32_t i=0;i<n;++i) {
+        auto* item=lv_obj_get_child(st.shelf.list_body,i);
+        if(st.shelf.shelf_view==kBookReaderShelfViewList) {
+            if(static_cast<int>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(item)))==index)return item;
+        } else {
+            // Grid cells are now inside shelf rows; ignore the decorative base.
+            for(uint32_t j=0;j<lv_obj_get_child_count(item);++j) {
+                auto* cell=lv_obj_get_child(item,j);
+                if(lv_obj_has_flag(cell,LV_OBJ_FLAG_CLICKABLE) &&
+                   static_cast<int>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(cell)))==index)return cell;
+            }
         }
     }
     return nullptr;
@@ -153,8 +160,8 @@ lv_obj_t* FindShelfCheckBox(lv_obj_t* cell) {
     const uint32_t n_cell = lv_obj_get_child_count(cell);
     for (uint32_t i = 0; i < n_cell; ++i) {
         lv_obj_t* c = lv_obj_get_child(cell, i);
-        if (c != nullptr && lv_obj_get_width(c) == kShelfCheckSize &&
-            lv_obj_get_height(c) == kShelfCheckSize) {
+        if (c != nullptr && (lv_obj_get_width(c) == kShelfCheckSize || lv_obj_get_width(c) == kShelfCoverCheckSize) &&
+            lv_obj_get_height(c) == lv_obj_get_width(c)) {
             return c;
         }
     }
@@ -166,8 +173,8 @@ lv_obj_t* FindShelfCheckBox(lv_obj_t* cell) {
     const uint32_t n = lv_obj_get_child_count(host);
     for (uint32_t i = 0; i < n; ++i) {
         lv_obj_t* c = lv_obj_get_child(host, i);
-        if (c != nullptr && lv_obj_get_width(c) == kShelfCheckSize &&
-            lv_obj_get_height(c) == kShelfCheckSize) {
+        if (c != nullptr && (lv_obj_get_width(c) == kShelfCheckSize || lv_obj_get_width(c) == kShelfCoverCheckSize) &&
+            lv_obj_get_height(c) == lv_obj_get_width(c)) {
             return c;
         }
     }
@@ -211,14 +218,16 @@ void PatchShelfVisibleCheckMarks() {
     if (!st.shelf.shelf_multi || st.shelf.list_body == nullptr || !lv_obj_is_valid(st.shelf.list_body)) {
         return;
     }
-    const uint32_t n = lv_obj_get_child_count(st.shelf.list_body);
-    for (uint32_t i = 0; i < n; ++i) {
-        lv_obj_t* cell = lv_obj_get_child(st.shelf.list_body, i);
-        if (cell == nullptr) {
-            continue;
+    if(st.shelf.shelf_view==kBookReaderShelfViewList) {
+        const uint32_t n=lv_obj_get_child_count(st.shelf.list_body);
+        for(uint32_t i=0;i<n;++i) {
+            auto* cell=lv_obj_get_child(st.shelf.list_body,i);
+            PatchShelfRowCheckMark(static_cast<int>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(cell))));
         }
-        PatchShelfRowCheckMark(
-            static_cast<int>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(cell))));
+    } else {
+        const int start=st.shelf.list_page*st.shelf.list_page_size;
+        const int end=std::min(start+st.shelf.list_page_size,static_cast<int>(st.shelf.books.size()));
+        for(int i=start;i<end;++i)PatchShelfRowCheckMark(i);
     }
     if (st.reader.status_label != nullptr && lv_obj_is_valid(st.reader.status_label)) {
         char buf[32];

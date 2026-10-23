@@ -4,8 +4,10 @@
 #include "assistant_ingest.h"
 #include "assistant_chat_store.h"
 #include "assistant_screen.h"
+#include "assistant_flow.h"
 #include "board.h"
 #include "display.h"
+#include "chat_cloud.h"
 
 #include <cstring>
 #include <string>
@@ -265,8 +267,72 @@ void Assistant_PersistTurnJson(cJSON* msg)
     cJSON_free(raw);
 }
 
+void AssistantScreen::FlushYunxinSpeech() {
+    auto& stream = Assistant_State().stream;
+    if (!stream.yunxin_dirty || stream.yunxin_text.empty() || !IsActive()) { return; }
+    FlowItem item;
+    item.kind = FlowKind::RichText;
+    SpanRun prefix;
+    prefix.text = "AI：";
+    prefix.bold = true;
+    item.spans.push_back(std::move(prefix));
+    SpanRun text;
+    text.text = stream.yunxin_formatter.Text().c_str();
+    item.spans.push_back(std::move(text));
+    FlowList chunk;
+    chunk.push_back(std::move(item));
+    if (!stream.yunxin_rendered || !Assistant_ReplaceYunxinSpeech(std::move(chunk))) {
+        Assistant_AppendFlowAndShow(std::move(chunk), false);
+    }
+    stream.yunxin_rendered = true;
+    stream.yunxin_dirty = false;
+}
+
+void AssistantScreen::AddYunxinSpeech(const char* text) {
+    if (!chat_cloud::IsYunxin() || !IsActive() || text == nullptr || text[0] == '\0') { return; }
+    auto& stream = Assistant_State().stream;
+    if (stream.yunxin_text == text) { return; }
+    if (!stream.yunxin_text.empty() &&
+        std::strncmp(text, stream.yunxin_text.c_str(), stream.yunxin_text.size()) != 0) {
+        FinishYunxinSpeech();
+    }
+    stream.yunxin_formatter.Append(std::string_view(text).substr(stream.yunxin_text.size()));
+    stream.yunxin_text = text;
+    stream.yunxin_dirty = true;
+}
+
+void AssistantScreen::FinishYunxinSpeech() {
+    auto& stream = Assistant_State().stream;
+    if (stream.yunxin_text.empty()) { return; }
+    FlushYunxinSpeech();
+    ESP_LOGI(TAG, "<< %s", stream.yunxin_text.c_str());
+    // Only final text is serialized and saved; intermediate snapshots stay plain text.
+    cJSON* root = cJSON_CreateObject();
+    auto* body = cJSON_AddObjectToObject(root, "updateComponents");
+    cJSON_AddStringToObject(body, "root", "speech");
+    auto* comps = cJSON_AddArrayToObject(body, "components");
+    auto* comp = cJSON_CreateObject();
+    cJSON_AddItemToArray(comps, comp);
+    cJSON_AddStringToObject(comp, "id", "speech");
+    cJSON_AddStringToObject(comp, "component", "RichText");
+    auto* spans = cJSON_AddArrayToObject(comp, "spans");
+    auto* prefix = cJSON_CreateObject();
+    cJSON_AddItemToArray(spans, prefix);
+    cJSON_AddStringToObject(prefix, "text", "AI：");
+    cJSON_AddBoolToObject(prefix, "bold", true);
+    auto* message = cJSON_CreateObject();
+    cJSON_AddItemToArray(spans, message);
+    cJSON_AddStringToObject(message, "text", stream.yunxin_formatter.Text().c_str());
+    Assistant_PersistTurnJson(root);
+    cJSON_Delete(root);
+    stream.yunxin_text.clear();
+    stream.yunxin_formatter.Reset();
+    stream.yunxin_dirty = false;
+    stream.yunxin_rendered = false;
+}
+
 void AssistantScreen::AddMessage(const char* role, const char* content) {
-    ESP_LOGI(TAG, "AddMessage role=%s content=%s",
+    ESP_LOGD(TAG, "AddMessage role=%s content=%s",
              role != nullptr ? role : "(null)",
              content != nullptr ? content : "(null)");
     if (!IsActive()) {
@@ -276,19 +342,45 @@ void AssistantScreen::AddMessage(const char* role, const char* content) {
         return;
     }
 
-    const char* p = content;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
-        ++p;
-    }
-    if (*p != '{' && *p != '[') {
-        ESP_LOGW(TAG, "AddMessage: content is not A2UI JSON, skip (role=%s len=%u)",
-                 role != nullptr ? role : "?", static_cast<unsigned>(std::strlen(content)));
-        return;
-    }
-
+    // Preserve locally generated A2UI (for example camera inserts).
     cJSON* root = cJSON_Parse(content);
+    const bool is_a2ui = cJSON_IsObject(root) &&
+        (cJSON_HasObjectItem(root, "updateComponents") || cJSON_HasObjectItem(root, "deleteSurface"));
+    if (!is_a2ui) {
+        cJSON_Delete(root);
+        root = nullptr;
+    }
+    if (chat_cloud::IsYunxin() && (is_a2ui || (role != nullptr && std::strcmp(role, "user") == 0))) {
+        FinishYunxinSpeech();
+    }
+    if (!is_a2ui && chat_cloud::UsesXiaozhiProtocol() && role != nullptr &&
+        (std::strcmp(role, "user") == 0 || std::strcmp(role, "assistant") == 0)) {
+        // Standard Xiaozhi STT/TTS text must enter the same pagination/history path.
+        // Build JSON structurally so quotes, newlines and JSON-looking speech stay text.
+        root = cJSON_CreateObject();
+        auto* body = cJSON_AddObjectToObject(root, "updateComponents");
+        cJSON_AddStringToObject(body, "root", "speech");
+        auto* comps = cJSON_AddArrayToObject(body, "components");
+        auto* comp = cJSON_CreateObject();
+        cJSON_AddItemToArray(comps, comp);
+        cJSON_AddStringToObject(comp, "id", "speech");
+        cJSON_AddStringToObject(comp, "component", "RichText");
+        auto* spans = cJSON_AddArrayToObject(comp, "spans");
+        auto* prefix = cJSON_CreateObject();
+        cJSON_AddItemToArray(spans, prefix);
+        cJSON_AddStringToObject(prefix, "text", std::strcmp(role, "user") == 0 ? "用户：" : "AI：");
+        cJSON_AddBoolToObject(prefix, "bold", true);
+        auto* message = cJSON_CreateObject();
+        cJSON_AddItemToArray(spans, message);
+        cJSON_AddStringToObject(message, "text", content);
+    } else if (!is_a2ui) {
+        const char* p = content;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') { ++p; }
+        if (*p != '{' && *p != '[') { return; }
+        root = cJSON_Parse(content);
+    }
     if (root == nullptr) {
-        ESP_LOGW(TAG, "AddMessage: cJSON_Parse failed");
+        ESP_LOGW(TAG, "AddMessage: invalid JSON or allocation failed");
         return;
     }
 

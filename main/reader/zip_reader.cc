@@ -55,11 +55,13 @@ uint8_t* AllocPsram(size_t n) {
 }  // namespace
 
 bool ZipReader::Open(const char* path) {
+    error_ = BookReadError::kInvalidData;
     Close();
     if (path == nullptr || path[0] == '\0') {
         return false;
     }
     fp_ = std::fopen(path, "rb");
+    if (!fp_) error_ = BookReadError::kFileIo;
     if (fp_ == nullptr) {
         ESP_LOGE(TAG, "open failed: %s", path);
         return false;
@@ -162,13 +164,13 @@ bool ZipReader::LoadCentralDirectory() {
             break;
         }
         Entry e;
-        if (!SeekCur(fp_, 6)) {
+        if (!SeekCur(fp_, 4) || !ReadU16(fp_, &e.flags)) {
             return false;
         }
         if (!ReadU16(fp_, &e.method)) {
             return false;
         }
-        if (!SeekCur(fp_, 8)) {
+        if (!SeekCur(fp_, 4) || !ReadU32(fp_, &e.crc)) {
             return false;
         }
         if (!ReadU32(fp_, &e.comp_size) || !ReadU32(fp_, &e.uncomp_size)) {
@@ -374,6 +376,7 @@ void ZipReader::CloseEntryStream() {
 }
 
 bool ZipReader::OpenEntryStream(const char* name) {
+    error_ = BookReadError::kInvalidData;
     CloseEntryStream();
     io_mutex_.lock();
     stream_holding_mutex_ = true;
@@ -384,7 +387,8 @@ bool ZipReader::OpenEntryStream(const char* name) {
         CloseEntryStream();
         return false;
     }
-    if (e.method != kMethodStore && e.method != kMethodDeflate) {
+    if ((e.flags & 1) || (e.method != kMethodStore && e.method != kMethodDeflate)) {
+        error_ = BookReadError::kUnsupported;
         ESP_LOGE(TAG, "stream unsupported method %u", e.method);
         CloseEntryStream();
         return false;
@@ -398,12 +402,14 @@ bool ZipReader::OpenEntryStream(const char* name) {
     stream_store_ = (e.method == kMethodStore);
     stream_comp_remain_ = remain;
     stream_uncomp_size_ = e.uncomp_size;
+    stream_expected_crc_ = e.crc; stream_crc_ = crc32(0, Z_NULL, 0); stream_total_ = 0;
     stream_eof_ = (remain == 0 && e.uncomp_size == 0);
     stream_error_ = false;
 
     if (!stream_store_) {
         stream_inbuf_ = AllocPsram(kStreamInBuf);
         if (stream_inbuf_ == nullptr) {
+            error_ = BookReadError::kNoMemory;
             ESP_LOGE(TAG, "stream inbuf alloc fail");
             CloseEntryStream();
             return false;
@@ -413,6 +419,7 @@ bool ZipReader::OpenEntryStream(const char* name) {
         stream_inbuf_pos_ = 0;
         stream_z_ = {};
         if (inflateInit2(&stream_z_, -MAX_WBITS) != Z_OK) {
+            error_ = BookReadError::kNoMemory;
             CloseEntryStream();
             return false;
         }
@@ -423,6 +430,16 @@ bool ZipReader::OpenEntryStream(const char* name) {
     ESP_LOGI(TAG, "stream open %s uncomp=%u method=%u", name, static_cast<unsigned>(e.uncomp_size),
              e.method);
     return true;
+}
+
+size_t ZipReader::ValidateStreamChunk(const uint8_t* bytes, size_t size) {
+    stream_crc_ = crc32(stream_crc_, bytes, static_cast<uInt>(size));
+    stream_total_ += size;
+    if (stream_total_ > stream_uncomp_size_ ||
+        (stream_eof_ && (stream_total_ != stream_uncomp_size_ || stream_crc_ != stream_expected_crc_))) {
+        error_ = BookReadError::kInvalidData; stream_error_ = true;
+    }
+    return size;
 }
 
 size_t ZipReader::EntryStreamRead(uint8_t* dst, size_t n) {
@@ -442,12 +459,13 @@ size_t ZipReader::EntryStreamRead(uint8_t* dst, size_t n) {
         const size_t got = std::fread(dst, 1, want, fp_);
         stream_comp_remain_ -= static_cast<uint32_t>(got);
         if (got < want) {
+            error_ = BookReadError::kFileIo;
             stream_error_ = true;
         }
         if (stream_comp_remain_ == 0) {
             stream_eof_ = true;
         }
-        return got;
+        return ValidateStreamChunk(dst, got);
     }
 
     size_t produced = 0;
@@ -457,6 +475,7 @@ size_t ZipReader::EntryStreamRead(uint8_t* dst, size_t n) {
                 stream_comp_remain_ < stream_inbuf_cap_ ? stream_comp_remain_ : stream_inbuf_cap_;
             const size_t got = std::fread(stream_inbuf_, 1, want, fp_);
             if (got == 0) {
+                error_ = std::ferror(fp_) ? BookReadError::kFileIo : BookReadError::kInvalidData;
                 stream_error_ = true;
                 break;
             }
@@ -482,7 +501,7 @@ size_t ZipReader::EntryStreamRead(uint8_t* dst, size_t n) {
         }
         if (zret == Z_BUF_ERROR && got_out == 0 && stream_comp_remain_ == 0 &&
             stream_inbuf_pos_ >= stream_inbuf_len_) {
-            stream_eof_ = true;
+            error_ = BookReadError::kInvalidData; stream_error_ = true;
             break;
         }
         if (zret != Z_OK && zret != Z_BUF_ERROR) {
@@ -490,12 +509,12 @@ size_t ZipReader::EntryStreamRead(uint8_t* dst, size_t n) {
             stream_error_ = true;
             break;
         }
-        if (got_out == 0 && stream_z_.avail_in == 0 && stream_comp_remain_ == 0) {
-            stream_eof_ = true;
+        if (got_out == 0 && took_in == 0 && (stream_z_.avail_in > 0 || stream_comp_remain_ == 0)) {
+            error_ = BookReadError::kInvalidData; stream_error_ = true;
             break;
         }
     }
-    return produced;
+    return ValidateStreamChunk(dst, produced);
 }
 
 }  // namespace reader

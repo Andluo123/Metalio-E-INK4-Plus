@@ -39,8 +39,10 @@ public:
     // 解压封面图到 bytes（PNG/JPEG）；小资源/调试用。大图请走 DecodeCoverImageToL8。
     bool LoadCoverBytes(std::vector<uint8_t>& out, size_t max_bytes = 8 * 1024 * 1024);
 
-    // 读取 spine 章节 HTML，并解析为 ContentBlock 列表。
-    bool LoadChapterBlocks(int spine_index, std::vector<ContentBlock>& out, size_t max_html_bytes = 1024 * 1024);
+    /** @brief 流式解压章节 HTML 并同步消费正文，不受整章内存大小限制。 */
+    bool StreamChapterBlocks(int spine_index, const ContentBlockSink& sink);
+    /** @brief 获取最近一次读取失败的原因。 */
+    BookReadError Error() const { return error_; }
 
     // 读取 EPUB 内任意资源（HTML/CSS 等小文件）；图片请走 DecodeItemImageToL8。
     bool LoadItemBytes(const char* href, std::vector<uint8_t>& out, size_t max_bytes = 8 * 1024 * 1024);
@@ -64,6 +66,7 @@ private:
     bool ParseOpf(const std::string& opf_path);
     static std::string DirOf(const std::string& path);
 
+    BookReadError error_ = BookReadError::kInvalidData; // 最近一次章节读取错误
     ZipReader zip_;
     std::string path_;
     std::string content_base_;  // OPF 所在目录

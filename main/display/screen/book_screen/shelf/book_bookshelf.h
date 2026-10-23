@@ -14,6 +14,7 @@ constexpr lv_coord_t kShelfUnderlineH = 2;
 constexpr lv_coord_t kShelfUnderlinePadHor = UiSx(5);
 constexpr lv_coord_t kShelfMultiDotSize = UiSx(6);
 constexpr lv_coord_t kShelfCheckSize = UiSx(24);     // 封面角勾选
+constexpr lv_coord_t kShelfCoverCheckSize = UiSx(40); // 封面右上跨边圆圈
 constexpr int64_t kShelfSuppressRowClickUs = 400000; // 只挡长按行松手假 CLICKED
 constexpr uint64_t kShelfCheckPaintDebounceUs = 280000;
 constexpr lv_coord_t kShelfTitleGap = UiSy(6);

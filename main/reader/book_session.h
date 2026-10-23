@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -8,9 +9,11 @@
 #include <vector>
 
 #include "ebook_document.h"
+#include "book_disk_cache.h"
 #include "epub_document.h"
 #include "lvgl.h"
 #include "reader_types.h"
+#include "book_bookmarks.h"
 #include "txt_chapter.h"
 
 namespace reader {
@@ -18,20 +21,20 @@ namespace reader {
 // 统一阅读会话：TXT / EPUB / EBOOK，分页、翻页、封面与插图解码。
 //
 // TXT 大文件策略（真流式）：
-// - 打开时只扫一遍源文件，页表存「源文件字节偏移」
+// - 打开先显示当前页；现有排版任务单趟建立 SD 行索引和页索引
 // - 不把全文（无论 GBK/UTF-8）留在 RAM
 // - CurrentPageData() 按行 seek+读+转码，只物化当前页
 // - 按 \\n 分段：段首两字宽 pad 缩进；源文空行仅分段，不渲染占位行
 // - 顶格章节 TOC（第N章/第N回/数字短章名）与分页同趟扫描，写入 .idx
 // - 换参：当前页即时预览 + 后台全量建索引；预览态可邻页流式翻页（短历史回退）
 // - 索引可缓存到 SD：与 txt 同目录 `<书名>.txt.idx`（书库在 /sdcard/metalio/e-ink/books）
-// - 阅读状态：同目录 <书名>.*.pos（POS3：章+页+百分比+终身累计秒+本地日戳+当日秒），下次打开续读
+// - 阅读状态：同目录 <书名>.*.pos（POS3 及可选 TXT 字节锚点），下次打开续读
 //   兼容读 POS1/POS2；写出始终 POS3
 //
 // EBOOK：按章 fseek + 分块 zlib；章内图文以 ContentBlock 分页（与 EPUB 同路径）。
 // 段首缩进：去掉源文前导空白，渲染侧 pad_left 两字宽（与 TXT 同策略）。
 // 打开时以索引 flags/uncompressed_total 轻量过滤空章，不再全量解压扫章。
-// 超大章：转换侧按体积拆章；设备对超限章拒绝加载，分页 OOM 软失败（不 abort）。
+// 超大章：按物理块/HTML 流解析，分页正文落 SD；内存只保留固定窗口和当前页。
 // 全书页数：打开时只读 .cpg；未命中则先估算，后台只计页扫各章写入缓存；换参后同样后台重算。
 // 后台计页与翻页经互斥串行，不占用 layout_busy（不挡翻页）。
 //
@@ -51,12 +54,20 @@ public:
     BookSession& operator=(const BookSession&) = delete;
 
     void SetFont(const lv_font_t* font) { font_ = font; }
-    void SetViewport(lv_coord_t width, lv_coord_t height) {
-        viewport_w_ = width;
-        viewport_h_ = height;
+    void SetVerticalWriting(bool vertical) {
+        vertical_writing_ = vertical;
+        SetViewport(physical_w_, physical_h_);
     }
-    lv_coord_t ViewportWidth() const { return viewport_w_; }
-    lv_coord_t ViewportHeight() const { return viewport_h_; }
+    bool VerticalWriting() const { return vertical_writing_; }
+    void SetViewport(lv_coord_t width, lv_coord_t height) {
+        physical_w_ = width;
+        physical_h_ = height;
+        // Each vertical column is paginated as a line in a transposed viewport.
+        viewport_w_ = vertical_writing_ ? height : width;
+        viewport_h_ = vertical_writing_ ? width : height;
+    }
+    lv_coord_t ViewportWidth() const { return physical_w_; }
+    lv_coord_t ViewportHeight() const { return physical_h_; }
     /** 段内行距 / 段间距（须 ≥0；打开前设置，影响分页与 .idx 指纹） */
     void SetGaps(lv_coord_t line_gap, lv_coord_t para_gap) {
         line_gap_ = line_gap < 0 ? 0 : line_gap;
@@ -75,6 +86,8 @@ public:
     bool Open(const BookInfo& info);
     void Close();
     bool IsOpen() const { return open_; }
+    /** @brief 最近一次打开或正文加载失败的具体原因。 */
+    BookReadError Error() const { return error_; }
 
     const BookInfo& Info() const { return info_; }
     const std::string& Title() const { return display_title_; }
@@ -84,12 +97,13 @@ public:
     const RasterImage& Cover() const { return cover_; }
 
     int PageCount() const;
-    int CurrentPage() const { return page_index_; }
+    int CurrentPage() const;
     /** 全书页数（TXT=PageCount；章节书=各章页数之和，未就绪时用估算） */
     int BookPageCount() const;
     /** 全书当前页 0-based（TXT=CurrentPage；章节书=前章页数之和+章内页） */
     int BookCurrentPage() const;
     bool GoToPage(int page);
+    bool GoToReadingProgress(int progress_x10);
     bool NextPage();
     bool PrevPage();
     /** 是否还能向后翻（含跨章），不改状态 */
@@ -98,6 +112,12 @@ public:
     bool HasPrevPage() const;
 
     const Page* CurrentPageData() const;
+    const BookBookmarkStore& BookmarkStore() const { return bookmarks_; }
+    bool CaptureBookmarkRange(BookSourcePosition& first,BookSourcePosition& end) const;
+    uint32_t CurrentPageBookmarkId() const;
+    bool AddCurrentPageBookmark(std::string& error);
+    bool RemoveBookmarks(const std::vector<uint32_t>& ids,std::string& error) { return bookmarks_.Remove(ids,error); }
+    bool GoToBookmark(uint32_t id);
 
     bool LoadPageImage(const std::string& href, int max_w, int max_h, RasterImage& out);
 
@@ -172,30 +192,38 @@ public:
     };
 
     LayoutAnchor CaptureLayoutAnchor() const;
-    /** 是否正用「当前页预览」占位（TXT 后台建索引期间） */
-    bool LiveRelayoutPending() const { return live_preview_active_; }
+    /** @brief 是否仍需后台完成 TXT 索引或当前章节重排 */
+    bool LiveRelayoutPending() const { return live_preview_active_ || chapter_relayout_pending_; }
     void ClearLivePreview();
-    /** TXT 换参后需后台全量重建页表；章节书 Begin 内已同步重排 */
+    /** @brief TXT 换参后由已有排版任务重建 SD 页表 */
     bool NeedsTxtIndexRebuild() const { return txt_mode_ && !txt_empty_; }
-    /** 章节书换参后需后台重算各章页数（当前章已即时更新） */
+    /** @brief 章节书换参后先重排当前章，再由已有计页任务更新全书页数 */
     bool NeedsChapterPageRebuild() const;
     /** 作废进行中的全书页表扫描（换字号 defer 时尽快停掉后台计宽） */
     void InvalidateChapterPageTable();
     /** 中止进行中的 TXT 全量分页（离开正文时尽快结束 layout worker） */
     void AbortTxtPaginate();
+    /** @brief 暂停或恢复后台编排；恢复前须等待旧编排任务结束。 */
+    void SetBackgroundPaused(bool paused);
 
     /**
      * @brief 按当前 font/gaps/viewport 即时重排当前位置（LVGL 任务）
      * @param anchor_inout 传入可空；成功时写出锚点供 TXT 后台对齐
-     * @return TXT：只填当前页预览（仍须 FinishTxtRelayout）；章节书：重排当前章并对齐页
+     * @return 先保留当前页，后续由现有排版任务调用 FinishLiveRelayout 完成索引或章节重排
      */
     bool BeginLiveRelayout(LayoutAnchor* anchor_inout);
 
     /**
-     * @brief TXT 全量重建页表并对齐锚点（可在 worker 线程）
+     * @brief 在既有排版任务中重建 TXT 索引或当前章，并对齐锚点
      * @note 期间 LiveRelayoutPending 为 true；用独立 FILE*，不抢预览翻页句柄；完成后清除预览
      */
-    bool FinishTxtRelayout(const LayoutAnchor& anchor);
+    bool FinishLiveRelayout(const LayoutAnchor& anchor);
+    /** @brief 在 UI 任务发布已完成的排版结果，避免后台替换正在显示的页。 */
+    void CommitLiveRelayout(const LayoutAnchor& anchor);
+    /** @brief 在 UI 任务取出有界批次的目录和计页结果，不等待全书编排完成。 */
+    bool PollLayoutProgress();
+    /** @brief 页数仍为扫描前缀推算值，显示时应标记暂估。 */
+    bool PageCountsEstimated() const { return LiveRelayoutPending() || NeedsChapterPageRebuild(); }
     /**
      * @brief 章节书：只计页重扫各章，更新全书页表（可在 worker 线程）
      * @note 不改当前 pages_/阅读位置；与翻页经互斥串行，不占用 layout_busy
@@ -205,8 +233,9 @@ public:
     bool WarmChapterPageTableFromCache();
 
 private:
-    // 源文件中一行的字节区间（GBK 或 UTF-8 原样）
-    struct TxtLineRef {
+    BookBookmarkStore bookmarks_;
+    // 与永久索引的 6 字节行记录保持一致，可直接窗口读取。
+    struct __attribute__((packed)) TxtLineRef {
         uint32_t off = 0;
         uint16_t len = 0;
     };
@@ -223,24 +252,24 @@ private:
         uint32_t day_id = 0;
         uint32_t daily_seconds = 0;
         bool has_daily = false;
+        bool has_txt_anchor = false; // 是否有可用的 TXT 源字节锚点
+        uint32_t txt_anchor = 0; // TXT 页首源字节
+        bool txt_para_start = true; // 锚点是否为段落起始
     };
     enum class PosLoadStatus : int8_t { kMissing = 0, kInvalid = -1, kOk = 1 };
 
+    bool OpenImpl(const BookInfo& info);
     bool OpenTxt(const char* path, size_t known_size = 0);
     bool OpenEpub(const char* path);
     bool OpenEbook(const char* path);
-    bool BuildPagesFromBlocks(const std::vector<ContentBlock>& blocks);
-    bool CountPagesFromBlocks(const std::vector<ContentBlock>& blocks, int& out_pages) const;
+    bool PaginateChapter(int chapter, BookPageStore& built) const;
     bool CountChapterPages(int chapter, int& out_pages) const;
     bool RebuildChapterPageTable();
     static std::string ChapterPageCachePath(const char* book_path);
     bool TryLoadChapterPageCache();
-    bool SaveChapterPageCache() const;
+    bool SaveChapterPageCache(const std::vector<uint32_t>& counts) const;
     void NoteChapterPageCount(int chapter, int pages);
-    bool LoadEpubChapter(int chapter);
-    bool LoadEbookChapter(int chapter);
-    bool PaginateTextBlock(const std::string& text, std::vector<Page>& pages, Page& cur, lv_coord_t& y,
-                           bool chapter_title = false);
+    bool LoadChapter(int chapter);
     bool StreamPaginateTxt(FILE* fp, size_t file_size);
     void MaterializeTxtPage(int page) const;
     void ClearTxtIndex();
@@ -259,7 +288,7 @@ private:
     static uint32_t DailySecondsIfToday(const PosFileData& data);
     uint32_t FontFingerprint() const;
     bool TryLoadTxtIndex(const char* txt_path, size_t file_size);
-    bool SaveTxtIndex(const char* txt_path, size_t file_size) const;
+    bool SaveTxtIndex(const char* txt_path, size_t file_size, const std::vector<TocEntry>& entries) const;
     // 读 .pos：POS1/2/3；seconds/daily 按版本填充（缺省 0）。
     bool ReadProgressPos(uint32_t& chapter, uint32_t& page, uint32_t* seconds_out = nullptr,
                          uint32_t* day_id_out = nullptr, uint32_t* daily_out = nullptr);
@@ -275,11 +304,23 @@ private:
     bool TryPushTxtChapter(std::string title, uint32_t first_line);
     bool IsChapteredBook() const;
     bool FillTxtLivePreview(uint32_t byte_off, bool at_para_start);
-    bool RelayoutCurrentChapter(const LayoutAnchor& anchor);
+    bool SeekTxtPreview(uint32_t byte_off);
 
     // StreamPaginateTxt 建新目录时指向临时 vector，避免 ClearToc 导致编排中章节标题乱跳
     std::vector<TocEntry>* toc_build_ = nullptr;
+    std::atomic<bool> background_paused_{false}; // 待机期间持续阻止后台编排
+    mutable std::mutex layout_progress_mu_; // 只保护小批次交接，不持锁排版或操作 UI
+    std::vector<TocEntry> pending_toc_; // 至多 32 条增量；完成时接管最终目录
+    bool pending_toc_complete_ = false; // 待发布目录为完整快照
+    uint32_t pending_txt_bytes_ = 0, pending_txt_pages_ = 0; // 扫描前缀
+    uint32_t txt_indexed_bytes_ = 0, txt_indexed_pages_ = 0; // UI 已发布的扫描前缀
+    std::atomic<uint32_t> txt_preview_anchor_{0}; // UI 当前页源位置，供扫描任务定位
+    uint32_t pending_anchor_ = 0, pending_anchor_page_ = 0; // 扫描任务定位的当前位置
+    uint32_t indexed_anchor_ = 0, indexed_anchor_page_ = 0; // UI 当前可用的精确页位置
+    std::vector<std::pair<int, uint32_t>> pending_chapter_counts_; // 小批次章节计页结果
+    std::vector<uint32_t> completed_chapter_counts_; // 扫描完成后的全书计页结果
 
+    mutable std::atomic<BookReadError> error_{BookReadError::kNone}; // 打开及正文加载错误
     bool open_ = false;
     OpenProgressFn progress_fn_ = nullptr;
     void* progress_user_ = nullptr;
@@ -288,6 +329,12 @@ private:
     std::string display_title_;
     std::string display_author_;
     const lv_font_t* font_ = nullptr;
+    bool vertical_writing_ = false;
+    lv_coord_t physical_w_ = 440;
+    lv_coord_t physical_h_ = 700;
+    lv_coord_t LayoutLineHeight() const;
+    lv_coord_t LayoutGlyphWidth(uint32_t cp) const;
+    lv_coord_t LayoutIndentWidth() const;
     lv_coord_t viewport_w_ = 440;
     lv_coord_t viewport_h_ = 700;
     lv_coord_t line_gap_ = kReaderLineGapDefault;
@@ -304,13 +351,13 @@ private:
     bool txt_as_gbk_ = false;
     bool txt_empty_ = false;
     mutable FILE* txt_fp_ = nullptr;
-    TxtLineRef* txt_lines_ = nullptr;
+    BookDiskArray<TxtLineRef> txt_lines_; // SD 行索引，仅缓存固定窗口
     size_t txt_lines_len_ = 0;
     size_t txt_lines_cap_ = 0;
-    uint32_t* txt_page_first_line_ = nullptr;
+    BookDiskArray<uint32_t> txt_page_first_line_; // SD 页索引，仅缓存固定窗口
     size_t txt_page_count_ = 0;
     size_t txt_page_starts_cap_ = 0;
-    uint32_t txt_paginate_gen_ = 0; // AbortTxtPaginate 递增；StreamPaginateTxt 轮询
+    std::atomic<uint32_t> txt_paginate_gen_{0}; // AbortTxtPaginate 递增；StreamPaginateTxt 轮询
     mutable Page txt_view_page_;
     mutable int txt_view_index_ = -1;
 
@@ -330,14 +377,16 @@ private:
     };
     std::vector<LivePreviewHistEnt> live_preview_hist_;
 
-    std::vector<Page> pages_;
+    BookPageStore pending_pages_; // 后台构建完成后由 UI 发布
+    BookPageStore pages_; // 分页正文落 SD，内存保留当前及相邻页
     int page_index_ = 0;
     int chapter_index_ = 0;
     int chapter_count_ = 1;
     // 各章页数（与 PageCount 同口径）；ready 后 BookPageCount 为真实全书页
-    std::vector<uint16_t> chapter_page_counts_;
-    bool chapter_pages_ready_ = false;
-    uint32_t chapter_pages_gen_ = 0;  // Relayout 递增；后台写回时比对防过期
+    std::vector<uint32_t> chapter_page_counts_;
+    std::atomic<bool> chapter_pages_ready_{false};
+    bool chapter_relayout_pending_ = false; // 当前章待现有排版任务重排
+    std::atomic<uint32_t> chapter_pages_gen_{0};  // Relayout 递增；后台写回时比对防过期
     // 后台计页与翻页 LoadChapter 串行，避免 ebook/epub 文件句柄竞态
     mutable std::mutex chapter_io_mu_;
 

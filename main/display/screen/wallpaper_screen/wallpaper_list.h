@@ -16,19 +16,21 @@ int Wallpaper_ListPageCount();
 void Wallpaper_ClampListPage();
 /** @brief 先拆掉引用 RasterImage 的控件；缩略图缓存在进程内复用，下次进 app 免白屏 */
 void DetachRasterUsers();
-/** @brief 只保留当前页缩略图，翻页时释放其他缓存。 */
-void ClearOffPageThumbs();
 /** @brief 网格单元格：封面、启用状态角标和多选勾选框。 */
 lv_obj_t* CreateGridCell(lv_obj_t* parent, int index, lv_coord_t cell_w, lv_coord_t cover_h);
+/** @brief 按已缓存缩略图刷新一格：有图则填入，未解码显示加载中，解码失败显示失败文案。 */
+void PaintCellThumb(int index);
 /** @brief 重建列表页（内部） */
-void RebuildListPageInternal(bool schedule_thumbs);
+void RebuildListPageInternal();
 /** @brief 重建壁纸列表当前页 */
 void RebuildListPage();
 /** @brief 请求重建壁纸列表 */
-void RequestWallpaperListRebuild();
+void RequestWallpaperListRebuild(bool screen_change = false);
+/** @brief 下一帧先推白再画出当前画面。缩略图回填不要调。 */
+void Wallpaper_RevealAfterWhite();
 /** @brief 构建列表主体 */
 void BuildListBody(lv_obj_t* scr, lv_coord_t status_h);
-/** @brief 先确保本页缩略图完成，再刷屏，避免首帧白底和重复全刷。 */
-void FillPageThumbsSync(int page);
-/** @brief 调度缩略图填充 */
+/** @brief 作废在飞缩略图解码，丢弃尚未开始的队列。 */
+void CancelThumbFill();
+/** @brief 后台逐张解码当前页缺的缩略图。 */
 void ScheduleThumbFill();

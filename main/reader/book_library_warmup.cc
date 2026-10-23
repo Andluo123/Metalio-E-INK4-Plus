@@ -6,6 +6,7 @@
 #include "book_session.h"
 #include "sd_paths.h"
 #include "SdCardManager.hpp"
+#include "sd_access.h"
 
 #include <atomic>
 #include <sys/stat.h>
@@ -53,6 +54,8 @@ void PeekAllIntoCache(const std::vector<BookInfo>& books) {
     items.reserve(books.size());
 
     for (size_t i = 0; i < books.size(); ++i) {
+        // Do not publish a partial aggregate/cache when standby cancels warmup.
+        if (sd_access::IsQuiescing()) return;
         if ((i & 15u) == 0u) {
             vTaskDelay(1);
         }
@@ -91,6 +94,7 @@ void PeekAllIntoCache(const std::vector<BookInfo>& books) {
         kept.push_back(std::move(it));
     }
 
+    if (sd_access::IsQuiescing()) return;
     book_progress_cache::ReplaceAll(std::move(kept));
     s_cache_ready.store(true, std::memory_order_release);
     book_home_snapshot::StoreAggregateStats(total_seconds, finished_count);
@@ -108,17 +112,23 @@ void WorkerTask(void* /*arg*/) {
         SetPhase(Phase::kScan);
         s_cache_ready.store(false, std::memory_order_release);
 
-        if (!SdCardManager::GetInstance().IsMounted()) {
+        if (sd_access::IsQuiescing()) {
+            ESP_LOGI(TAG, "boot warmup deferred for standby");
+        } else if (!SdCardManager::GetInstance().IsMounted()) {
             ESP_LOGW(TAG, "开机书库预热: 跳过(SD 未挂载)");
             book_progress_cache::ReplaceAll({});
             s_cache_ready.store(true, std::memory_order_release);
         } else {
             std::vector<BookInfo> books;
             if (!ScanBookLibrary(kDefaultBooksDir, books)) {
-                ESP_LOGW(TAG, "开机书库预热: 扫盘失败 dir=%s", kDefaultBooksDir);
-                book_progress_cache::ReplaceAll({});
-                s_cache_ready.store(true, std::memory_order_release);
-            } else {
+                if (sd_access::IsQuiescing()) {
+                    ESP_LOGI(TAG, "boot library scan cancelled for standby");
+                } else {
+                    ESP_LOGW(TAG, "开机书库预热: 扫盘失败 dir=%s", kDefaultBooksDir);
+                    book_progress_cache::ReplaceAll({});
+                    s_cache_ready.store(true, std::memory_order_release);
+                }
+            } else if (!sd_access::IsQuiescing()) {
                 OfferBookLibraryCache(books);
                 ESP_LOGI(TAG, "开机书库预热: 扫盘完成 n=%u, 开始 Peek 进度/时长",
                          static_cast<unsigned>(books.size()));

@@ -3,6 +3,7 @@
 
 #include "assistant_ptt.h"
 #include "application.h"
+#include "epd_refresh.h"
 #include "boot_key_handler.h"
 #include "haptic_feedback.h"
 #include "lv_adapter_display.h"
@@ -263,6 +264,10 @@ void OnPttWaveTimer(lv_timer_t* /*t*/) {
     if (!Assistant_State().ptt.ptt_wave_visible) {
         return;
     }
+    const auto refresh = EpdGetStats();
+    if (refresh.busy || refresh.completed < refresh.submitted || refresh.test_active) {
+        return;
+    }
     Assistant_State().ptt.ptt_wave_frame = static_cast<uint8_t>((Assistant_State().ptt.ptt_wave_frame + 1) % kPttWaveFrames);
     UpdatePttWaveBars();
 }
@@ -335,4 +340,3 @@ void Assistant_RequestSyncPttOverlay() {
     // BOOT/触摸回调不在 LVGL 任务：经 ScreenLvAsync，勿在本线程死等锁
     ScreenLvAsync(AsyncSyncPttOverlay);
 }
-

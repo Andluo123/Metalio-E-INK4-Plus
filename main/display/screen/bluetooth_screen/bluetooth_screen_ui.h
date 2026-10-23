@@ -29,7 +29,6 @@ void Bluetooth_bt_reset_task(void* param);
 /** @brief 去掉容器多余样式 */
 void Bluetooth_strip_container(lv_obj_t* obj);
 /** @brief LV 异步：复位完成后刷新 */
-void Bluetooth_async_after_bt_reset(void* user_data);
 /** @brief 更新状态标签文案 */
 void Bluetooth_update_status_label(const char* text);
 /** @brief LV 异步：更新状态标签 */

@@ -2,6 +2,7 @@
 
 #include "standby_classic_priv.h"
 #include "standby_classic_weather_fetch.h"
+#include "screen_common.h"
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -33,8 +34,8 @@ static void AsyncApplyWeatherUi(void* /*p*/) {
 }
 
 void StandbyClassic_PostWeatherUi() {
-    if (lv_async_call(AsyncApplyWeatherUi, nullptr) != LV_RESULT_OK) {
-        ESP_LOGW(TAG, "lv_async_call weather ui failed");
+    if (!ScreenLvAsync(AsyncApplyWeatherUi)) {
+        ESP_LOGW(TAG, "weather ui enqueue failed");
     }
 }
 
@@ -123,16 +124,13 @@ bool StandbyClassic_HttpGetWeather(std::string& body_out, std::string& err_out) 
     }
     http->SetTimeout(kHttpTimeoutMs);
     api::ApplyCommonHeaders(http);
-    api::LogHttpRequest(TAG, "GET", url);
     if (!http->Open("GET", url)) {
         err_out = Lang::Strings::STANDBY_REQUEST_FAIL;
-        api::LogHttpResponse(TAG, -1, err_out);
         return false;
     }
     const int status = http->GetStatusCode();
     body_out = http->ReadAll();
     http->Close();
-    api::LogHttpResponse(TAG, status, api::RedactClawUrlsForLog(body_out));
     if (status < 200 || status >= 300) {
         err_out = Lang::Strings::STANDBY_REQUEST_FAIL;
         return false;

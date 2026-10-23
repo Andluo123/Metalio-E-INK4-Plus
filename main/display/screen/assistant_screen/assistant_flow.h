@@ -12,3 +12,4 @@ void Assistant_ReplayHistoryFromStore();
 void Assistant_ClearSession();
 /** @brief 流式分片：排队或立即展示 */
 void Assistant_QueueOrShowChunk(FlowList&& chunk, bool jump_to_new);
+bool Assistant_ReplaceYunxinSpeech(FlowList&& chunk);

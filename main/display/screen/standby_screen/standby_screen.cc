@@ -4,10 +4,12 @@
 #include "standby_screen/standby_wallpaper.h"
 
 #include "wallpaper_screen/wallpaper_active.h"
+#include "wallpaper_screen/wallpaper_screen.h"
 
 #include "application.h"
 #include "assistant_screen/assistant_screen.h"
 #include "book_screen/book_screen.h"
+#include "cloud_screen/cloud_screen.h"
 #include "bq27220_gauge.h"
 #include "display_orient.h"
 #include "lv_adapter_display.h"
@@ -17,6 +19,9 @@
 #include "settings_screen/settings_screen.h"
 #include "settings_screen/settings_test/settings_test_battery_screen.h"
 #include "vk_key_handler.h"
+#include "sd_access.h"
+#include "sd_log_writer.h"
+#include "book_library_warmup.h"
 
 #include <atomic>
 #include <esp_log.h>
@@ -30,7 +35,7 @@ static constexpr const char* kScreenId = "standby";
 
 enum class StandbyVariant : uint8_t { None = 0, Classic = 1, Wallpaper = 2 };
 
-static bool s_host_alive = false;
+static std::atomic<bool> s_host_alive{false};
 static bool s_as_overlay = false;
 static lv_obj_t* s_overlay_root = nullptr;
 static lv_obj_t* s_underlying_scr = nullptr;
@@ -38,11 +43,13 @@ static StandbyVariant s_variant = StandbyVariant::None;
 static std::atomic<uint32_t> s_paint_token{0};
 static std::atomic<uint32_t> s_paint_flushed{0};
 static SemaphoreHandle_t s_park_done = nullptr;
+static std::atomic<unsigned> s_wake_request{0};
 
 static void EnsureStandbyPortrait() {
+    DisplayUiSetFullScreen(true);
     if (DisplayUiSetOrient(kDisplayUiPortrait)) {
         if (auto* disp = LVAdapterDisplay::Instance()) {
-            disp->RequestNextFullRefresh();
+            disp->RequestFullOnNextCommit();
         }
     }
 }
@@ -54,7 +61,7 @@ static void ClearStatusBindings() {
 }
 
 static bool PreferWallpaperVariant() {
-    return !Wallpaper_GetStandbyFilename().empty();
+    return Wallpaper_HasStandbySelection();
 }
 
 static void TeardownVariant() {
@@ -82,6 +89,7 @@ static void MountVariant(lv_obj_t* root, bool as_overlay) {
 
 static void TeardownHostState() {
     TeardownVariant();
+    DisplayUiSetFullScreen(false);
     s_host_alive = false;
     s_as_overlay = false;
     s_overlay_root = nullptr;
@@ -106,23 +114,6 @@ static bool StandbyOnVkKey(const char* /*key_name*/) {
     return true;
 }
 
-static void DismissThenAssistantAsync(void* /*arg*/) {
-    StandbyScreen::Dismiss();
-    AssistantScreen::RequestOpen();
-}
-
-static bool OnBootClick() {
-    ESP_LOGI(TAG, "boot short -> ignore (stay standby)");
-    return true;
-}
-
-static bool OnBootLongPress() {
-    ESP_LOGI(TAG, "boot long -> assistant (hold-through PTT if still pressed)");
-    AssistantScreen::RequestOpen();
-    return true;
-}
-
-
 lv_obj_t* StandbyScreen::Create() {
     EnsureStandbyPortrait();
     lv_obj_t* scr = lv_obj_create(nullptr);
@@ -133,8 +124,8 @@ lv_obj_t* StandbyScreen::Create() {
     MountVariant(scr, false);
     lv_obj_add_event_cb(scr, OnScreenUnloaded, LV_EVENT_SCREEN_UNLOADED, nullptr);
     VkKey_AttachScreen(scr, kScreenId,
-                       VkKeyScreenDesc{StandbyScreen::Create, StandbyOnVkKey, OnBootClick,
-                                       OnBootLongPress});
+                       VkKeyScreenDesc{StandbyScreen::Create, StandbyOnVkKey,
+                                       StandbyScreen::HandleBootClick, StandbyScreen::HandleBootLongPress});
     return scr;
 }
 
@@ -142,6 +133,7 @@ void StandbyScreen::Show() {
     if (s_host_alive) {
         return;
     }
+    s_wake_request.store(0);
     lv_obj_t* under = lv_screen_active();
     if (under == nullptr) {
         ESP_LOGW(TAG, "show: no active screen");
@@ -152,6 +144,9 @@ void StandbyScreen::Show() {
 
     lv_obj_t* overlay = lv_obj_create(under);
     lv_obj_remove_style_all(overlay);
+    // Standby covers the drawable screen, independently of the underlying
+    // page's flex/grid placement and scroll offset.
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_FLOATING);
     lv_obj_set_size(overlay, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_pos(overlay, 0, 0);
     lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
@@ -174,7 +169,12 @@ void StandbyScreen::Show() {
         disp->BeginStandbyEnterPaint();
     }
 
+    WallpaperScreen::SetDecodePaused(true);
     BookScreen::OnEnterStandby();
+    // Stop the log producer before closing admission. Existing file handles and
+    // the explicitly permitted standby decoder finish before SD is removed.
+    SdLogWriter_OnSdUnmounting();
+    sd_access::Quiesce();
     SettingsScreen_OnEnterStandby();
     SettingsTestBatteryScreen_PauseForStandby();
     if (auto* disp = LVAdapterDisplay::Instance()) {
@@ -188,6 +188,8 @@ void StandbyScreen::Dismiss() {
         return;
     }
     ExitEpdSleep();
+    sd_access::Resume();
+    SdLogWriter_OnSdMounted();
     ESP_LOGI(TAG, "dismiss overlay (under=%p variant=%u)", static_cast<void*>(s_underlying_scr),
              static_cast<unsigned>(s_variant));
 
@@ -211,6 +213,7 @@ void StandbyScreen::Dismiss() {
     s_as_overlay = false;
     s_underlying_scr = nullptr;
 
+    DisplayUiSetFullScreen(false);
     PowerPolicy::GetInstance().OnStandbyOverlayDismissed();
 
     // 待机浅睡期间主循环停，电量单向步进冻在进待机前读数；退出时重锚定并立刻刷顶栏
@@ -223,6 +226,9 @@ void StandbyScreen::Dismiss() {
         TaskScreen::OnResumeFromStandby();
     }
     BookScreen::OnResumeFromStandby();
+    if (!reader::book_library_warmup::IsProgressCacheReady()) {
+        reader::book_library_warmup::RequestBootWarmup();
+    }
     SettingsScreen_OnResumeFromStandby();
     SettingsTestBatteryScreen_ResumeFromStandby();
     if (auto* disp = LVAdapterDisplay::Instance()) {
@@ -241,10 +247,26 @@ void StandbyScreen::Dismiss() {
             Application::GetInstance().StartXiaozhiVoice(false);
         });
     }
+    WallpaperScreen::SetDecodePaused(false);
+    CloudScreen::ReloadApAfterStandby();
 }
 
 bool StandbyScreen::IsActive() {
     return s_host_alive;
+}
+
+void StandbyScreen::RequestWake(bool assistant) {
+    s_wake_request.store(assistant ? 2 : 1, std::memory_order_release);
+}
+
+bool StandbyScreen::HasWakeRequest() {
+    return s_wake_request.load(std::memory_order_acquire) != 0;
+}
+
+void StandbyScreen::FinishWake() {
+    const unsigned request = s_wake_request.exchange(0);
+    Dismiss();
+    if (request == 2) AssistantScreen::RequestOpen();
 }
 
 bool StandbyScreen::IsPaintReady() {
@@ -334,7 +356,7 @@ bool StandbyScreen::HandleBootLongPress() {
         return false;
     }
     ESP_LOGI(TAG, "boot long -> dismiss + assistant (hold-through)");
-    lv_async_call(DismissThenAssistantAsync, nullptr);
+    RequestWake(true);
     return true;
 }
 

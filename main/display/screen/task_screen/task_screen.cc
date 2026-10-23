@@ -810,16 +810,13 @@ bool HttpJson(const char* method, const std::string& url, std::string& body_out,
         (std::strcmp(method, "POST") == 0 || std::strcmp(method, "PUT") == 0)) {
         http->SetContent(std::string());
     }
-    api::LogHttpRequest(TAG, method, url);
     if (!http->Open(method, url)) {
         err_out = Lang::Strings::TASK_REQUEST_FAIL;
-        api::LogHttpResponse(TAG, -1, err_out);
         return false;
     }
     const int status = http->GetStatusCode();
     body_out = http->ReadAll();
     http->Close();
-    api::LogHttpResponse(TAG, status, api::RedactClawUrlsForLog(body_out));
     if (status < 200 || status >= 300) {
         err_out = body_out.empty() ? ("HTTP " + std::to_string(status)) : Lang::Strings::TASK_REQUEST_FAIL;
         return false;
@@ -1212,7 +1209,7 @@ void BatchTask(void* arg) {
         delete msg;
         s_busy.store(false);
     }
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 void ScheduleBatch(BatchOp op) {
@@ -1695,7 +1692,6 @@ lv_obj_t* TaskScreen::Create() {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, TaskFont(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    DisableScroll(scr);
     lv_obj_add_event_cb(scr, OnScreenLoaded, LV_EVENT_SCREEN_LOADED, nullptr);
     lv_obj_add_event_cb(scr, OnScreenUnloaded, LV_EVENT_SCREEN_UNLOADED, nullptr);
 

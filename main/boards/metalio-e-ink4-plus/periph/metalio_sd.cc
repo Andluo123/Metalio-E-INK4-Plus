@@ -7,6 +7,8 @@
 
 #include "SdCardManager.hpp"
 #include "config.h"
+#include "sd_access.h"
+#include "sd_log_writer.h"
 
 #include <driver/gpio.h>
 #include <esp_log.h>
@@ -69,17 +71,20 @@ void MetalioSd_ReleaseHold(void) {
 }
 
 bool MetalioSd_Init(void) {
+    sd_access::Permit permit;
     MetalioSd_ReleaseHold();
-    return SdCardManager::GetInstance().Mount();
+    const bool mounted = SdCardManager::GetInstance().Mount();
+    if (sd_access::IsQuiescing()) SdLogWriter_OnSdUnmounting();
+    return mounted;
 }
 
 bool MetalioSd_Ok(void) {
     return SdCardManager::GetInstance().IsMounted();
 }
 
-void MetalioSd_HoldPinsLow(void) {
+bool MetalioSd_HoldPinsLow(void) {
     MetalioSd_ReleaseHold();
-    SdCardManager::GetInstance().Unmount();
+    if (!SdCardManager::GetInstance().Unmount()) return false;
 #if CONFIG_IDF_TARGET_ESP32S31
     sdio_cnnt_release_to_gpio();
 #endif
@@ -87,6 +92,7 @@ void MetalioSd_HoldPinsLow(void) {
         sd_pin_force_low(pin);
     }
     ESP_LOGI(TAG, "SD pins held low");
+    return true;
 }
 
 void MetalioSd_LatchForSleep(void) {

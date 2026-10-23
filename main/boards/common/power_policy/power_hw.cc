@@ -2,12 +2,16 @@
  * @brief S31 低功耗硬件原子（对齐 light_test 入睡序列）
  */
 #include "power_hw.h"
+#include "s31_sleep/s31_sleep.h"
 
 #include "application.h"
 #include "board.h"
+#include "dual_network_board.h"
+#include "nt26_board.h"
 #include "config.h"
 #include "device_state.h"
 #include "display.h"
+#include "epd_flash_guard.h"
 #include "frontlight.h"
 #include "metalio_accel.h"
 #include "metalio_audio.h"
@@ -15,6 +19,8 @@
 #include "metalio_sd.h"
 #include "epd_board_metalio_eink4_plus.h"
 #include "lv_adapter_display.h"
+#include "sd_access.h"
+#include "standby_screen/standby_screen.h"
 
 #include <driver/gpio.h>
 #include <esp_log.h>
@@ -22,7 +28,6 @@
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <wifi_configuration_ap.h>
 #include <wifi_station.h>
 
 #if CONFIG_PM_ENABLE
@@ -46,10 +51,25 @@ static constexpr int kUsjReviveDisconnectMs = 150;
 static constexpr int kUsjReviveWaitConnectedMs = 800;
 #endif
 
+static Nt26Board* CellularBoard() {
+    auto* dual = dynamic_cast<DualNetworkBoard*>(&Board::GetInstance());
+    return dual ? dynamic_cast<Nt26Board*>(&dual->GetCurrentBoard()) : nullptr;
+}
+
+void power_hw_cellular_resume(void) {
+    if (auto* cell = CellularBoard()) cell->RecoverAfterPowerOnAsync();
+}
+
 static bool s_main_rail_known = false;
 static bool s_main_rail_on = true;
+static bool s_sd_parked = false;
 static bool s_gpio_wake_boot_low = false;
 static bool s_gpio_wake_power_low = false;
+
+// Keep board-facing entry points stable; SDK details live in s31_sleep.
+void power_hw_log_sleep_reset(void) { s31_sleep::CaptureReset(); }
+void power_hw_report_sleep_reset(void) { s31_sleep::ReportReset(); }
+esp_err_t power_hw_sleep_init(void) { return s31_sleep::Init(); }
 
 static void NotifyNetworkIconChanged(void) {
     Display* disp = Board::GetInstance().GetDisplay();
@@ -130,10 +150,29 @@ static void ReviveUsjAfterSdRestore(void) {
 #endif
 }
 
+esp_err_t power_hw_sd_park(void) {
+    if (s_sd_parked) return ESP_OK;
+    if (!sd_access::IsQuiescing() || !sd_access::IsIdle()) return ESP_ERR_INVALID_STATE;
+    if (!MetalioSd_HoldPinsLow()) return ESP_FAIL;
+    MetalioSd_LatchForSleep();
+    s_sd_parked = true;
+    return ESP_OK;
+}
+
+esp_err_t power_hw_sd_restore(void) {
+    if (!s_sd_parked) return ESP_OK;
+    s_sd_parked = false;
+    const bool mounted = MetalioSd_Init();
+    ReviveUsjAfterSdRestore();
+    return mounted ? ESP_OK : ESP_FAIL;
+}
+
 static void SleepAbort(const char* why, unsigned applied) {
     ESP_LOGW(TAG, "%s (applied=0x%x)", why, applied);
     if ((applied & kLsRails) != 0) {
         epd_board_metalio_eink4_plus_sleep_restore_rails();
+        MetalioAudio_OnPowerRestored();
+        if (auto* cell = CellularBoard()) cell->OnPowerRestored();
         Frontlight::GetInstance().ForceAllLow();
     }
     if ((applied & kLsBus) != 0) {
@@ -141,14 +180,39 @@ static void SleepAbort(const char* why, unsigned applied) {
     }
     MetalioKeys_ResumeAfterSleep();
     if ((applied & kLsSd) != 0) {
-        MetalioSd_Init();
-        ReviveUsjAfterSdRestore();
+        power_hw_sd_restore();
     }
 }
 
 esp_err_t power_hw_pa_set(bool on) {
     MetalioAudio_SetPa(on);
     return ESP_OK;
+}
+
+esp_err_t power_hw_bt_power_reset(void) {
+    auto* cell = CellularBoard();
+    if (cell) cell->PreparePowerOff();
+    esp_err_t err;
+    {
+        // 等当前波形结束，并阻止 P14 断电期间探测/启动 TPS。
+        // 4G 清理与恢复可能更新 UI，必须放在此锁之外。
+        EpdFlashGuard panel_guard;
+        MetalioAudio_SetPa(false);
+        MetalioAudio_OnPowerOff();
+        err = epd_board_metalio_eink4_plus_bt_power_reset();
+        if (err == ESP_OK) {
+            // 与开机 P14 恢复路径一致，待电源稳定后才允许下一次刷屏。
+            vTaskDelay(pdMS_TO_TICKS(80));
+        }
+    }
+    if (err == ESP_OK) {
+        MetalioAudio_OnPowerRestored();
+        if (cell) {
+            cell->OnPowerRestored();
+            cell->RecoverAfterPowerOnAsync();
+        }
+    }
+    return err;
 }
 
 esp_err_t power_hw_main_rail_set(bool on) {
@@ -158,7 +222,8 @@ esp_err_t power_hw_main_rail_set(bool on) {
     }
     s_main_rail_known = true;
     s_main_rail_on = on;
-    ESP_LOGD(TAG, "main_rail_set(%d) nop", on ? 1 : 0);
+    if (on) power_hw_cellular_resume();
+    ESP_LOGD(TAG, "main_rail_set(%d) policy only; physical P14 follows light sleep", on ? 1 : 0);
     return ESP_OK;
 }
 
@@ -167,16 +232,7 @@ bool power_hw_main_rail_is_on(void) {
 }
 
 esp_err_t power_hw_wifi_stop(void) {
-    if (Application::GetInstance().GetDeviceState() == kDeviceStateWifiConfiguring) {
-        wifi_mode_t mode = WIFI_MODE_NULL;
-        if (esp_wifi_get_mode(&mode) != ESP_OK) {
-            ESP_LOGW(TAG, "WiFi config LP pause skipped (not started)");
-            return ESP_OK;
-        }
-        WifiConfigurationAp::GetInstance().PauseForLp();
-        NotifyNetworkIconChanged();
-        return ESP_OK;
-    }
+    if (CellularBoard()) return ESP_OK;
     wifi_mode_t mode = WIFI_MODE_NULL;
     if (esp_wifi_get_mode(&mode) != ESP_OK) {
         ESP_LOGW(TAG, "WiFi STA pause skipped (not started)");
@@ -189,22 +245,14 @@ esp_err_t power_hw_wifi_stop(void) {
 }
 
 esp_err_t power_hw_wifi_start(void) {
-    if (Application::GetInstance().GetDeviceState() == kDeviceStateWifiConfiguring) {
-        auto& wifi_ap = WifiConfigurationAp::GetInstance();
-        esp_err_t err = wifi_ap.ResumeFromLp();
-        if (err == ESP_OK) {
-            return ESP_OK;
-        }
-        wifi_mode_t mode = WIFI_MODE_NULL;
-        if (esp_wifi_get_mode(&mode) == ESP_OK) {
-            ESP_LOGI(TAG, "WiFi config already up");
-            return ESP_OK;
-        }
-        wifi_ap.Start();
-        ESP_LOGI(TAG, "WiFi config AP started");
+    if (CellularBoard()) { power_hw_cellular_resume(); return ESP_OK; }
+    auto& sta = WifiStation::GetInstance();
+    wifi_mode_t ap_mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&ap_mode) == ESP_OK && (ap_mode & WIFI_MODE_AP) != 0 &&
+        (ap_mode & WIFI_MODE_STA) == 0) {
+        ESP_LOGI(TAG, "WiFi STA start skipped (softAP)");
         return ESP_OK;
     }
-    auto& sta = WifiStation::GetInstance();
     if (sta.IsLpPaused()) {
         esp_err_t err = sta.ResumeFromLp();
         if (err == ESP_OK) {
@@ -283,14 +331,21 @@ void power_hw_begin_power_off(void) {
  * tip 全量浅睡；SD/CNNT hold 保留。醒后：restore → Sd_Init →（若做过 SD）ReviveUsj。
  */
 esp_err_t power_hw_light_sleep_once(uint64_t max_sleep_us) {
+    // No timeout may force power removal with live files or boot hardware work.
+    if (!sd_access::IsQuiescing() || !sd_access::IsIdle() ||
+        Application::GetInstance().IsBootWorkActive() || StandbyScreen::HasWakeRequest()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     unsigned applied = 0;
+    s31_sleep::BeginCycle();
+    s31_sleep::Checkpoint(s31_sleep::Phase::Admission, applied); // admission passed
     ESP_LOGI(TAG, "light sleep once max_us=%llu hw=0x%x (sd=%d tps=%d bus=%d rails=%d)",
              (unsigned long long)max_sleep_us, kLightSleepHw,
              (kLightSleepHw & kLsSd) ? 1 : 0, (kLightSleepHw & kLsTps) ? 1 : 0,
              (kLightSleepHw & kLsBus) ? 1 : 0, (kLightSleepHw & kLsRails) ? 1 : 0);
 
     if ((kLightSleepHw & kLsSd) != 0) {
-        MetalioSd_HoldPinsLow();
+        if (power_hw_sd_park() != ESP_OK) return ESP_ERR_INVALID_STATE;
         applied |= kLsSd;
     }
     if ((kLightSleepHw & kLsTps) != 0) {
@@ -303,7 +358,12 @@ esp_err_t power_hw_light_sleep_once(uint64_t max_sleep_us) {
     }
 
     MetalioAccel_ReleaseIntLine();
+    s31_sleep::Checkpoint(s31_sleep::Phase::HardwareParked, applied); // SD/TPS/bus parked
     MetalioKeys_MaskForSleep();
+    if (MetalioKeys_HasPowerClick() || StandbyScreen::HasWakeRequest()) {
+        SleepAbort("abort light sleep: pending POWER exit", applied);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     if (!WaitIntLineHigh()) {
         SleepAbort("abort light sleep: GPIO2 low", applied);
@@ -329,19 +389,20 @@ esp_err_t power_hw_light_sleep_once(uint64_t max_sleep_us) {
     }
 
     if ((kLightSleepHw & kLsRails) != 0) {
+        s31_sleep::Checkpoint(s31_sleep::Phase::WakeArmed, applied); // wake sources armed; about to cut rails
         Frontlight::GetInstance().ForceAllLow();
+        if (auto* cell = CellularBoard()) cell->PreparePowerOff();
+        MetalioAudio_OnPowerOff();
         epd_board_metalio_eink4_plus_sleep_cut_rails();
         applied |= kLsRails;
     }
     if ((kLightSleepHw & kLsBus) != 0) {
         epd_board_metalio_eink4_plus_bus_latch_for_sleep();
     }
-    if ((kLightSleepHw & kLsSd) != 0) {
-        MetalioSd_LatchForSleep();
-    }
 
     fflush(stdout);
-    esp_err_t err = esp_light_sleep_start();
+    s31_sleep::Checkpoint(s31_sleep::Phase::BeforeSleep, applied); // last checkpoint before the CPU sleeps
+    esp_err_t err = s31_sleep::LightSleep(applied);
     const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
 
     // 醒瞬间锁存 P17；此时 USJ 可能仍哑，用 ROM 打一行便于对照
@@ -355,20 +416,25 @@ esp_err_t power_hw_light_sleep_once(uint64_t max_sleep_us) {
         esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
     }
     MetalioKeys_ResumeAfterSleep();
+    s31_sleep::Checkpoint(s31_sleep::Phase::KeysRestored, applied); // key/IO-expander access returned
     if ((applied & kLsRails) != 0) {
         epd_board_metalio_eink4_plus_sleep_restore_rails();
+        MetalioAudio_OnPowerRestored();
+        if (auto* cell = CellularBoard()) cell->OnPowerRestored();
         // P14 回来时 LEDC 可能仍有旧占空比 → 背光闪一下；待机/关机路径保持灭
         Frontlight::GetInstance().ForceAllLow();
     }
-    if ((applied & kLsSd) != 0) {
-        MetalioSd_Init();
-        ReviveUsjAfterSdRestore();
+    if ((applied & kLsSd) != 0 && cause != ESP_SLEEP_WAKEUP_TIMER) {
+        s31_sleep::Checkpoint(s31_sleep::Phase::BeforeSdRestore, applied); // rails restored; about to restore SD/USB console
+        power_hw_sd_restore();
     }
     if ((applied & kLsBus) != 0) {
+        s31_sleep::Checkpoint(s31_sleep::Phase::BeforeBusRestore, applied); // about to reinitialize display bus
         epd_board_metalio_eink4_plus_bus_restore();
     }
     ESP_LOGI(TAG, "light_sleep wake err=%s cause=%d power_low=%d restore done applied=0x%x",
              esp_err_to_name(err), (int)cause, s_gpio_wake_power_low ? 1 : 0, applied);
+    s31_sleep::Checkpoint(s31_sleep::Phase::Restored, applied); // hardware restore complete
     return err;
 }
 

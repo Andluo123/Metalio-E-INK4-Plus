@@ -8,6 +8,9 @@ public:
     /** @brief 创建百问页 */
     static lv_obj_t* Create();
 
+    /** @brief 当前服务的应用名称；首页使用 compact 英文缩写 */
+    static const char* DisplayName(bool compact = false);
+
     /** @brief 当前页面是否在前台；后台消息会被忽略 */
     static bool IsActive();
 
@@ -25,6 +28,9 @@ public:
 
     /** @brief 向会话流追加消息；须在持 LVGL 锁时调用 */
     static void AddMessage(const char* role, const char* content);
+    static void FinishYunxinSpeech();
+    static void AddYunxinSpeech(const char* text);
+    static void FlushYunxinSpeech();
 
     /** @brief 设置情绪表情（当前可为空操作） */
     static void SetEmotion(const char* emotion);

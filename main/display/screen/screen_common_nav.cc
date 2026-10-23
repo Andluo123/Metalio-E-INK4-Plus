@@ -4,7 +4,10 @@
 
 #include "application.h"
 #include "home_screen/home_screen.h"
+#include "book_screen/book_nav.h"
+#include "display_orient.h"
 #include "lv_adapter_epdiy.h"
+#include "epd_refresh.h"
 #include "vk_key_handler.h"
 
 #include <cstring>
@@ -40,6 +43,8 @@ bool ScreenIsHome() {
 
 void ScreenLoadReplace(lv_obj_t* new_scr) {
     lv_obj_t* old_scr = lv_screen_active();
+    EpdCancelPageTurn();
+    EpdRequestScreenChange();
     lv_screen_load(new_scr);
     if (old_scr != nullptr && old_scr != new_scr) {
         lv_obj_delete_async(old_scr);
@@ -87,6 +92,13 @@ void ScreenNavigateBack() {
 }
 
 void ScreenGoHome() {
+    // 回首页入口可能来自默认按键策略：必须在创建竖屏首页前退出阅读。
+    ReleaseReaderForSystemHome();
+    if (DisplayUiSetOrient(kDisplayUiPortrait)) {
+        if (auto* disp = LvAdapterEpdiy::Instance()) {
+            disp->RequestFullOnNextCommit();
+        }
+    }
     ScreenCommon_ClearBackStack();
     ScreenCommon_on_home = true;
     ScreenLoadReplace(HomeScreen::Create());
@@ -152,6 +164,7 @@ bool ScreenLvAsyncUrgent(void (*cb)(void*), void* user_data) {
 }
 
 void ScreenPaintCoalesceEnqueue(ScreenPaintCoalesce* c);
+void ScreenPaintCoalesceArmDefer(ScreenPaintCoalesce* c, uint64_t delay_us);
 
 void ScreenPaintCoalesceAsync(void* user_data) {
     auto* c = static_cast<ScreenPaintCoalesce*>(user_data);
@@ -161,6 +174,12 @@ void ScreenPaintCoalesceAsync(void* user_data) {
     c->queued.store(false, std::memory_order_release);
     const uint32_t want = c->seq.load(std::memory_order_acquire);
     if (want == c->done.load(std::memory_order_acquire)) {
+        return;
+    }
+    // Chapter parsing, pagination and widget allocation compete with LCD DMA
+    // refill. Keep the request pending until the previous waveform finishes.
+    if (c->defer_while_epd_busy && EpdGetStats().busy) {
+        ScreenPaintCoalesceArmDefer(c, 20000);
         return;
     }
     // 每次只画一帧；落后则立刻再排队（不再防抖），让 LVGL/墨水有机会 flush

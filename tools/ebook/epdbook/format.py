@@ -47,8 +47,8 @@ DEFAULT_COVER_MAX_W = 240
 DEFAULT_COVER_MAX_H = 320
 COVER_MAX_PAYLOAD = 24 * 1024  # ImagePayload 总长上限（含 12B 头）
 
-# 单章解压合计上限：转换拆章预算 / 固件硬拒（须保持 DEFAULT < DEVICE）
-# 固件同步：main/reader/book_session.cc kMaxChapterUncompForPaginate
+# 兼容旧固件的拆章预算；新固件已按物理块流式排版，不再按单章合计硬拒
+# 默认仍按 256 KiB 拆章，以缩短章节切换与重新排版等待
 DEVICE_CHAPTER_MAX_UNCOMP = 384 * 1024
 DEFAULT_CHAPTER_MAX_BYTES = 256 * 1024
 if not (1024 <= DEFAULT_CHAPTER_MAX_BYTES < DEVICE_CHAPTER_MAX_UNCOMP):

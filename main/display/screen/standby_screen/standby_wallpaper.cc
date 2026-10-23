@@ -2,9 +2,9 @@
 
 #include "wallpaper_screen/wallpaper_active.h"
 
-#include "config.h"
 #include "image_util.h"
 #include "reader_types.h"
+#include "sd_access.h"
 
 #include <atomic>
 #include <cstdio>
@@ -19,18 +19,10 @@
 
 
 static constexpr const char* TAG = "StandbyWp";
-static constexpr int kDecodeMaxW = DISPLAY_WIDTH;
-static constexpr int kDecodeMaxH = DISPLAY_HEIGHT;
 static constexpr uint32_t kLoadStack = 12 * 1024;
 
 enum class StandbyWpLoadState : uint8_t { Idle = 0, Loading = 1, Ready = 2, Failed = 3 };
 
-struct StandbyWpUiState {
-    lv_obj_t* root = nullptr;
-    lv_obj_t* img = nullptr;
-};
-
-static StandbyWpUiState s_ui;
 static bool s_alive = false;
 static uint32_t s_epoch = 0;
 static reader::RasterImage* s_raster = nullptr;
@@ -51,11 +43,7 @@ struct StandbyWpLoadResult {
 static void MarkLoadDone(StandbyWpLoadState st) {
     s_load_state.store(st, std::memory_order_release);
 }
-static void DetachImage() {
-    if (s_ui.img != nullptr) {
-        lv_image_set_src(s_ui.img, nullptr);
-        lv_obj_add_flag(s_ui.img, LV_OBJ_FLAG_HIDDEN);
-    }
+static void FreeDecodedImage() {
     if (s_raster != nullptr) {
         delete s_raster;
         s_raster = nullptr;
@@ -81,19 +69,10 @@ static void ApplyLoadAsync(void* p) {
         return;
     }
 
-    DetachImage();
+    FreeDecodedImage();
     s_raster = msg->img;
     msg->img = nullptr;
-    if (s_ui.img != nullptr) {
-        lv_image_set_src(s_ui.img, &s_raster->dsc);
-        lv_obj_set_size(s_ui.img, s_raster->width, s_raster->height);
-        lv_obj_center(s_ui.img);
-        lv_obj_clear_flag(s_ui.img, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (s_ui.root != nullptr) {
-        lv_obj_invalidate(s_ui.root);
-        lv_refr_now(nullptr);
-    }
+    // 待机与关机共用全屏绘制，不挂入底层页面的 LVGL 层级。
     MarkLoadDone(StandbyWpLoadState::Ready);
     delete msg;
 }
@@ -104,30 +83,31 @@ static void LoadTask(void* arg) {
     msg->epoch = work != nullptr ? work->epoch : 0;
     delete work;
 
-    char path[192] = {};
-    if (!Wallpaper_TryResolveStandbyWallpaperPath(path, sizeof(path))) {
-        std::snprintf(msg->err, sizeof(msg->err), "%s", Lang::Strings::STANDBY_WP_NOT_FOUND);
-    } else {
-        auto* img = new reader::RasterImage();
-        // 与壁纸预览一致走 L8：本板全屏 I1 lv_image 易白底
-        if (!reader::DecodeImageFileToL8(path, kDecodeMaxW, kDecodeMaxH, *img) || img->empty()) {
-            std::snprintf(msg->err, sizeof(msg->err), "%s", Lang::Strings::STANDBY_DECODE_FAIL);
-            delete img;
+    {
+        sd_access::Permit permit;
+        char path[192] = {};
+        if (!Wallpaper_TryResolveStandbyWallpaperPath(path, sizeof(path))) {
+            std::snprintf(msg->err, sizeof(msg->err), "%s", Lang::Strings::STANDBY_WP_NOT_FOUND);
         } else {
-            msg->ok = true;
-            msg->img = img;
-            ESP_LOGI(TAG, "decoded standby wallpaper %s (%ux%u)", path,
-                     static_cast<unsigned>(img->width), static_cast<unsigned>(img->height));
+            auto* img = new reader::RasterImage();
+            if (!reader::DecodeImageFileToL8(path, 0, 0, *img) || img->empty()) {
+                std::snprintf(msg->err, sizeof(msg->err), "%s", Lang::Strings::STANDBY_DECODE_FAIL);
+                delete img;
+            } else {
+                msg->ok = true;
+                msg->img = img;
+                ESP_LOGI(TAG, "decoded standby wallpaper %s (%ux%u)", path,
+                         static_cast<unsigned>(img->width), static_cast<unsigned>(img->height));
+            }
         }
     }
-
     if (lv_async_call(ApplyLoadAsync, msg) != LV_RESULT_OK) {
         delete msg->img;
         delete msg;
         s_load_busy.store(false, std::memory_order_release);
         MarkLoadDone(StandbyWpLoadState::Failed);
     }
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 
@@ -137,7 +117,6 @@ void StandbyWallpaper_Build(lv_obj_t* root) {
     }
     ++s_epoch;
     s_alive = true;
-    s_ui = StandbyWpUiState{};
     MarkLoadDone(StandbyWpLoadState::Idle);
 
     lv_obj_set_style_bg_color(root, lv_color_white(), 0);
@@ -146,10 +125,6 @@ void StandbyWallpaper_Build(lv_obj_t* root) {
     lv_obj_set_style_border_width(root, 0, 0);
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_ui.root = root;
-    s_ui.img = lv_image_create(root);
-    lv_obj_add_flag(s_ui.img, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(s_ui.img, LV_OBJ_FLAG_CLICKABLE);
 }
 
 void StandbyWallpaper_StartLoad() {
@@ -176,11 +151,15 @@ bool StandbyWallpaper_IsContentReady() {
     return st == StandbyWpLoadState::Ready || st == StandbyWpLoadState::Failed;
 }
 
+const reader::RasterImage* StandbyWallpaper_DecodedImage() {
+    return s_alive && s_load_state.load(std::memory_order_acquire) == StandbyWpLoadState::Ready
+        ? s_raster : nullptr;
+}
+
 void StandbyWallpaper_Teardown() {
     ++s_epoch;  // 丢弃在途 StandbyWpLoadResult，避免 UAF
     s_alive = false;
-    DetachImage();
-    s_ui = StandbyWpUiState{};
+    FreeDecodedImage();
     MarkLoadDone(StandbyWpLoadState::Idle);
     // 不强制清 s_load_busy：任务结束时 ApplyLoadAsync / 失败路径会清；
     // 若任务仍跑，epoch 不匹配会释放像素且清 busy。
@@ -188,7 +167,7 @@ void StandbyWallpaper_Teardown() {
 
 void StandbyWallpaper_InvalidateDecoded() {
     ++s_epoch;
-    DetachImage();
+    FreeDecodedImage();
     if (s_alive) {
         MarkLoadDone(StandbyWpLoadState::Idle);
     }

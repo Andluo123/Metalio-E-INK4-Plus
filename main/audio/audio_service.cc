@@ -2,6 +2,8 @@
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/idf_additions.h>
@@ -14,7 +16,6 @@
 #endif
 
 #define TAG "AudioService"
-
 
 AudioService::AudioService() {
     event_group_ = xEventGroupCreate();
@@ -41,7 +42,6 @@ AudioService::~AudioService() {
 
 void AudioService::Initialize(AudioCodec* codec) {
     codec_ = codec;
-    codec_->Start();
 
     /* Setup the audio codec */
     opus_decoder_ = std::make_unique<OpusDecoderWrapper>(codec->output_sample_rate(), 1, OPUS_FRAME_DURATION_MS);
@@ -93,6 +93,15 @@ void AudioService::Start() {
         return;
     }
 
+    if (!codec_started_ || !codec_->HardwareReady()) {
+        codec_->Start();
+        codec_started_ = codec_->HardwareReady();
+    }
+    if (!codec_->HardwareReady()) {
+        ESP_LOGE(TAG, "Audio start deferred: I2S resources unavailable");
+        return;
+    }
+    xEventGroupClearBits(event_group_, AS_EVENT_INPUT_EXITED | AS_EVENT_OUTPUT_EXITED | AS_EVENT_OPUS_EXITED);
     service_stopped_ = false;
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
 
@@ -107,7 +116,7 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->AudioInputTask();
-            vTaskDeleteWithCaps(NULL);
+            audio_service->ParkStoppedTask(AS_EVENT_INPUT_EXITED);
         },
         "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0, kStackCaps);
     if (ok_in != pdPASS) {
@@ -116,7 +125,7 @@ void AudioService::Start() {
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
         audio_input_task_handle_ = nullptr;
-        service_stopped_ = true;
+        Stop();
         return;
     }
 
@@ -125,13 +134,13 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->AudioOutputTask();
-            vTaskDeleteWithCaps(NULL);
+            audio_service->ParkStoppedTask(AS_EVENT_OUTPUT_EXITED);
         },
         "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_, kStackCaps);
     if (ok_out != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio_output");
         audio_output_task_handle_ = nullptr;
-        service_stopped_ = true;
+        Stop();
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                            AS_EVENT_AUDIO_PROCESSOR_RUNNING);
         return;
@@ -142,13 +151,13 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->AudioInputTask();
-            vTaskDeleteWithCaps(NULL);
+            audio_service->ParkStoppedTask(AS_EVENT_INPUT_EXITED);
         },
         "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_, kStackCaps);
     if (ok_in != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio_input");
         audio_input_task_handle_ = nullptr;
-        service_stopped_ = true;
+        Stop();
         return;
     }
 
@@ -157,13 +166,13 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->AudioOutputTask();
-            vTaskDeleteWithCaps(NULL);
+            audio_service->ParkStoppedTask(AS_EVENT_OUTPUT_EXITED);
         },
         "audio_output", 2048, this, 4, &audio_output_task_handle_, kStackCaps);
     if (ok_out != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio_output");
         audio_output_task_handle_ = nullptr;
-        service_stopped_ = true;
+        Stop();
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                            AS_EVENT_AUDIO_PROCESSOR_RUNNING);
         return;
@@ -182,7 +191,7 @@ void AudioService::Start() {
     if (opus_codec_stack_ == nullptr || opus_codec_tcb_ == nullptr) {
         ESP_LOGE(TAG, "Failed to alloc opus_codec stack/tcb (stack=%p tcb=%p)",
                  opus_codec_stack_, opus_codec_tcb_);
-        service_stopped_ = true;
+        Stop();
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                            AS_EVENT_AUDIO_PROCESSOR_RUNNING);
         return;
@@ -192,25 +201,25 @@ void AudioService::Start() {
         [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
             audio_service->OpusCodecTask();
-            vTaskDelete(NULL);
+            audio_service->ParkStoppedTask(AS_EVENT_OPUS_EXITED);
         },
         "opus_codec", kOpusCodecStackWords, this, 2, opus_codec_stack_, opus_codec_tcb_);
     if (opus_codec_task_handle_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create opus_codec static task");
-        service_stopped_ = true;
+        Stop();
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                            AS_EVENT_AUDIO_PROCESSOR_RUNNING);
         return;
     }
-    ESP_LOGI(TAG, "Audio tasks started (input/output stack SPIRAM, opus_codec stack %u words SPIRAM)",
-             static_cast<unsigned>(kOpusCodecStackWords));
+    ESP_LOGI(TAG, "Audio tasks started");
 }
 
 void AudioService::Stop() {
-    if (service_stopped_) {
+    if (service_stopped_ && !audio_input_task_handle_ && !audio_output_task_handle_ && !opus_codec_task_handle_) {
+        if (codec_) codec_->ReleaseHardware();
         return;
     }
-    esp_timer_stop(audio_power_timer_);
+    if (audio_power_timer_) esp_timer_stop_blocking(audio_power_timer_, portMAX_DELAY);
     service_stopped_ = true;
     if (audio_processor_ != nullptr) {
         audio_processor_->Stop();
@@ -230,11 +239,33 @@ void AudioService::Stop() {
         audio_queue_cv_.notify_all();
     }
 
-    // Tasks self-delete; brief wait avoids Start() racing a dying task.
-    vTaskDelay(pdMS_TO_TICKS(50));
-    audio_input_task_handle_ = nullptr;
-    audio_output_task_handle_ = nullptr;
-    opus_codec_task_handle_ = nullptr;
+    // Tasks acknowledge that all codec/queue work is complete, then park.
+    // Delete from the owner so static task storage cannot be freed too early.
+    EventBits_t expected = 0;
+    if (audio_input_task_handle_) expected |= AS_EVENT_INPUT_EXITED;
+    if (audio_output_task_handle_) expected |= AS_EVENT_OUTPUT_EXITED;
+    if (opus_codec_task_handle_) expected |= AS_EVENT_OPUS_EXITED;
+    while (expected && (xEventGroupWaitBits(event_group_, expected, pdFALSE, pdTRUE,
+                            pdMS_TO_TICKS(2000)) & expected) != expected) {
+        ESP_LOGW(TAG, "Waiting for audio workers to finish before releasing I2S");
+    }
+    if (audio_input_task_handle_) vTaskDeleteWithCaps(audio_input_task_handle_);
+    if (audio_output_task_handle_) vTaskDeleteWithCaps(audio_output_task_handle_);
+    if (opus_codec_task_handle_) {
+        vTaskSuspend(opus_codec_task_handle_);
+        // Static task stack/TCB are freed below. Make sure neither core still
+        // executes its final event-group call before deleting that storage.
+        for (;;) {
+            bool on_core = false;
+            for (int core = 0; core < portNUM_PROCESSORS; ++core)
+                on_core |= xTaskGetCurrentTaskHandleForCore(core) == opus_codec_task_handle_;
+            if (!on_core) break;
+            vTaskDelay(1);
+        }
+        vTaskDelete(opus_codec_task_handle_);
+    }
+    audio_input_task_handle_ = audio_output_task_handle_ = opus_codec_task_handle_ = nullptr;
+    if (codec_) codec_->ReleaseHardware();
 
     // input 已停后再拆 AFE，避免 Feed 撞已释放实例
     if (audio_processor_initialized_ && audio_processor_ != nullptr) {
@@ -312,6 +343,12 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     return true;
 }
 
+void AudioService::ParkStoppedTask(EventBits_t bit) {
+    xEventGroupSetBits(event_group_, bit);
+    // Owner may delete us immediately after the signal; do no resource work here.
+    for (;;) vTaskSuspend(nullptr);
+}
+
 void AudioService::AudioInputTask() {
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
@@ -329,7 +366,12 @@ void AudioService::AudioInputTask() {
 
         /* Used for audio testing in NetworkConfiguring mode by clicking the BOOT button */
         if (bits & AS_EVENT_AUDIO_TESTING_RUNNING) {
-            if (audio_testing_queue_.size() >= AUDIO_TESTING_MAX_DURATION_MS / OPUS_FRAME_DURATION_MS) {
+            bool testing_full;
+            {
+                std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+                testing_full = audio_testing_queue_.size() >= AUDIO_TESTING_MAX_DURATION_MS / OPUS_FRAME_DURATION_MS;
+            }
+            if (testing_full) {
                 ESP_LOGW(TAG, "Audio testing queue is full, stopping audio testing");
                 EnableAudioTesting(false);
                 continue;
@@ -348,7 +390,11 @@ void AudioService::AudioInputTask() {
                 PushTaskToEncodeQueue(kAudioTaskTypeEncodeToTestingQueue, std::move(data));
                 continue;
             }
+            ESP_LOGE(TAG, "audio-test capture failed; retrying");
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
+
 
         /* Feed the wake word */
         if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
@@ -487,7 +533,14 @@ void AudioService::OpusCodecTask() {
                 }
             } else if (task->type == kAudioTaskTypeEncodeToTestingQueue) {
                 std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-                audio_testing_queue_.push_back(std::move(packet));
+                bool recording = xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_TESTING_RUNNING;
+                if (recording) {
+                    audio_testing_queue_.push_back(std::move(packet));
+                } else {
+                    // Stop can move the recording while this frame is still encoding.
+                    audio_decode_queue_.push_back(std::move(packet));
+                    audio_queue_cv_.notify_all();
+                }
             }
             debug_statistics_.encode_count++;
             lock.lock();
@@ -539,6 +592,9 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
     });
     if (service_stopped_) {
         return;
+    }
+    if (type == kAudioTaskTypeEncodeToTestingQueue) {
+        if (!(xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_TESTING_RUNNING)) return;
     }
     audio_encode_queue_.push_back(std::move(task));
     audio_queue_cv_.notify_all();
@@ -631,11 +687,12 @@ void AudioService::EnableVoiceProcessing(bool enable) {
 void AudioService::EnableAudioTesting(bool enable) {
     ESP_LOGI(TAG, "%s audio testing", enable ? "Enabling" : "Disabling");
     if (enable) {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);
     } else {
-        xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);
         /* Copy audio_testing_queue_ to audio_decode_queue_ */
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING);
         audio_decode_queue_ = std::move(audio_testing_queue_);
         audio_queue_cv_.notify_all();
     }

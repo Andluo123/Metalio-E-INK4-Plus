@@ -2,11 +2,15 @@
 
 #include "lvgl.h"
 
-/** @brief 构建设置→网络页（WiFi 配网入口；本轮无 4G） */
+// 设置 → 网络：
+// - WiFi / 4G 上网切换（切换后重启）
+// - 仅在当前为 WiFi 时显示：进入配网模式
+// - 仅在当前为 4G 时显示：内置卡 / 外置卡切换
 void SettingsNetworkTab_Build(lv_obj_t* page);
-/** @brief 重置网络页 UI 状态 */
 void SettingsNetworkTab_Reset();
-/** @brief 当前网络类型显示名（供壳层日志） */
+
+// 供设置壳层日志使用
 const char* SettingsNetworkTab_CurrentName();
-/** @brief 是否为 WiFi 模式（本轮恒为 true） */
+
+// 仅读取当前网络模式，不访问 NVS。
 bool SettingsNetworkTab_IsWifi();

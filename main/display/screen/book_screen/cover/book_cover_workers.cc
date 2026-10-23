@@ -1,3 +1,4 @@
+#include "epd_content_policy.h"
 #pragma GCC optimize("O1")
 
 #include "book_screen/cover/book_cover_workers.h"
@@ -117,6 +118,7 @@ void ApplyListCoverImage(lv_obj_t* host, reader::RasterImage& cover) {
     lv_obj_clean(host);
     lv_obj_t* img = lv_image_create(host);
     lv_image_set_src(img, &cover.dsc);
+    EpdSetContentRole(img,EpdContentRole::Cover);
     lv_obj_center(img);
     lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
 }
@@ -180,7 +182,7 @@ void ListCoverFillWorker(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(ok ? 15 : 5));
     }
     delete work;
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 void ScheduleListCoverFill() {
@@ -241,6 +243,7 @@ void ApplyDetailCoverImage() {
     Book_DisableScroll(frame);
     lv_obj_t* img = lv_image_create(frame);
     lv_image_set_src(img, &st.detail.detail_cover.dsc);
+    EpdSetContentRole(img,EpdContentRole::Cover);
     lv_obj_center(img);
     lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
 }
@@ -331,7 +334,7 @@ void DetailCoverWorker(void* arg) {
         delete done;
     }
     delete ctx;
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 // 无旁路时后台读文件内封面；有旁路则 CreateDetailScreen 已同步显示。

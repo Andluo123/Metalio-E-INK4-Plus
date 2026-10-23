@@ -1,4 +1,7 @@
 #include "book_screen/book_geom.h"
+#include "book_screen/reader/book_auto_turn.h"
+#include "book_screen/book_nav.h"
+#include "book_screen/settings/book_settings_sheet.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/book_font_runtime.h"
 #include "book_screen/reader/book_reader_prefs.h"
@@ -13,6 +16,11 @@
 
 #include "lv_adapter_display.h"
 #include "reader/reader.h"
+
+lv_coord_t ReaderFooterHeight() {
+    const auto* font=Book_ItemFont();
+    return static_cast<lv_coord_t>(font->line_height+DISPLAY_CONTENT_BOTTOM_INSET);
+}
 
 bool IsReadOverlayChrome(BookUiState::ReadChrome c) {
     using C = BookUiState::ReadChrome;
@@ -32,6 +40,8 @@ void BindSessionLayoutPrefs(reader::BookSession& session) {
     BookReaderPrefsEnsureLoaded();
     BookTapZonesEnsureLoaded();
     session.SetFont(BookFont());
+    session.SetVerticalWriting(BookReaderPrefsWritingMode() == kBookReaderWritingVertical &&
+                               !ReaderPageImagesHint());
     session.SetGaps(static_cast<lv_coord_t>(BookReaderPrefsLineGap()),
                     static_cast<lv_coord_t>(BookReaderPrefsParaGap()));
 }
@@ -39,7 +49,8 @@ void BindSessionLayoutPrefs(reader::BookSession& session) {
 // 正文内容区宽度（阅读页边距）；与沉浸态居中栏宽一致。 书库/详情继续用 Book_ContentWidth()（kListPad），互不影响。
 lv_coord_t ReadContentWidth() {
     BookReaderPrefsEnsureLoaded();
-    const int ml = BookReaderPrefsMarginLeft();
+    const int ml = BookReaderPrefsWritingMode() == kBookReaderWritingVertical && !ReaderPageImagesHint()
+        ? kReaderVerticalLeftInset : BookReaderPrefsMarginLeft();
     const int mr = BookReaderPrefsMarginRight();
     lv_coord_t w = LV_HOR_RES - static_cast<lv_coord_t>(ml + mr);
     return w > 40 ? w : 40;
@@ -80,7 +91,7 @@ void ApplyReaderPageGeometry(ReaderGeomMode mode) {
     BookReaderPrefsEnsureLoaded();
     const bool show_footer =
         (mode == ReaderGeomMode::kOverlayList) || (BookReaderPrefsHideProgress() == 0);
-    const lv_coord_t footer_h = show_footer ? kFooterH : 0;
+    const lv_coord_t footer_h = show_footer ? ReaderFooterHeight() : 0;
     const lv_coord_t body_h = LV_VER_RES - footer_h;
 
     if (st.reader.footer_host != nullptr && lv_obj_is_valid(st.reader.footer_host)) {
@@ -109,7 +120,7 @@ void ApplyReaderPageGeometry(ReaderGeomMode mode) {
 
     const bool page_images = ReaderPageImagesHint();
     const int mt = BookReaderPrefsMarginTop();
-    const int mb = BookReaderPrefsMarginBottom();
+
     if (page_images) {
         lv_obj_set_style_pad_top(st.reader.content, 0, 0);
         lv_obj_set_style_pad_bottom(st.reader.content, 0, 0);
@@ -120,14 +131,15 @@ void ApplyReaderPageGeometry(ReaderGeomMode mode) {
     } else {
         // 左右 pad=0：水平居中由 RenderReaderPage 显式算 x，避免 align/flex 失效时贴左
         lv_obj_set_style_pad_top(st.reader.content, static_cast<lv_coord_t>(mt), 0);
-        lv_obj_set_style_pad_bottom(st.reader.content, static_cast<lv_coord_t>(mb), 0);
+        lv_obj_set_style_pad_bottom(st.reader.content, kReadViewportBottomSlack, 0);
         lv_obj_set_style_pad_left(st.reader.content, 0, 0);
         lv_obj_set_style_pad_right(st.reader.content, 0, 0);
         st.reader.viewport_w = ReadContentWidth();
         lv_coord_t vh =
-            body_h - static_cast<lv_coord_t>(mt + mb) - kReadViewportBottomSlack;
+            body_h - static_cast<lv_coord_t>(mt) - kReadViewportBottomSlack;
         st.reader.viewport_h = vh > 40 ? vh : 40;
     }
+
 }
 
 void ApplyReaderChromeSize() {
@@ -136,7 +148,7 @@ void ApplyReaderChromeSize() {
         lv_obj_set_width(st.reader.status_bar, LV_HOR_RES);
     }
     if (st.reader.footer_host != nullptr && lv_obj_is_valid(st.reader.footer_host)) {
-        lv_obj_set_size(st.reader.footer_host, LV_HOR_RES, kFooterH);
+        lv_obj_set_size(st.reader.footer_host, LV_HOR_RES, ReaderFooterHeight());
         lv_obj_align(st.reader.footer_host, LV_ALIGN_BOTTOM_MID, 0, 0);
         lv_obj_move_foreground(st.reader.footer_host);
     }
@@ -147,11 +159,7 @@ void ApplyReaderChromeSize() {
     if (st.settings.settings_sheet == nullptr || !lv_obj_is_valid(st.settings.settings_sheet)) {
         return;
     }
-    lv_obj_t* sheet = st.settings.settings_sheet;
-    lv_obj_set_width(sheet, LV_HOR_RES - kSheetSidePad * 2);
-    const lv_coord_t top = (st.reader.status_h > 0 ? st.reader.status_h : 40) + 10;
-    lv_obj_align(sheet, LV_ALIGN_TOP_MID, 0, top);
-    Book_DisableScroll(sheet);
+    ResizeReadingBottomSheet();
 }
 
 void StopReadTimeCheckpointTimer() {
@@ -170,6 +178,10 @@ void OnReadTimeCheckpoint(lv_timer_t* /*t*/) {
         return;
     }
     const bool ok = st.reader.session->SaveProgress();
+    if (st.reader.read_chrome == BookUiState::ReadChrome::kSettings && st.settings.reader_tab == 4 &&
+        !st.settings.reader_light_page && !TouchUiFingerIsDown() && !TouchUiHasPendingEdges()) {
+        RequestSettingsSheetPaint();
+    }
     const uint32_t sec = st.reader.session->ReadingSeconds();
     const uint32_t daily = st.reader.session->ReadingDailySeconds();
     const uint32_t min = sec / 60u;
@@ -220,6 +232,7 @@ void EndReadingTimeTracking() {
 
 // 进待机：停累计；退出待机由 ResumeReadingTimeAfterStandby 恢复
 void PauseReadingTimeForStandby() {
+    StopReaderAutoTurn();
     auto& st = Book_State();
     if (!st.reader.session || !st.reader.session->IsReadingClockActive()) {
         return;

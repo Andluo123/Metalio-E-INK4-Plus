@@ -61,7 +61,8 @@ public:
 
     uint8_t intensity() const { return intensity_; }
 
-    void Pulse() {
+    void Pulse(int duration_ms = VIBRATION_MOTOR_PULSE_MS) {
+        if (duration_ms <= 0) return;
         if (!initialized_ || continuous_ || intensity_ == 0 || pulse_timer_ == nullptr) {
             return;
         }
@@ -69,7 +70,7 @@ public:
         ApplyActiveDrive();
         esp_timer_stop(pulse_timer_);
         esp_err_t err = esp_timer_start_once(
-            pulse_timer_, static_cast<uint64_t>(VIBRATION_MOTOR_PULSE_MS) * 1000ULL);
+            pulse_timer_, static_cast<uint64_t>(duration_ms) * 1000ULL);
         if (err != ESP_OK) {
             pulse_active_ = false;
             StopOutput();
@@ -196,6 +197,10 @@ extern "C" void MetalioVibe_Init(void) {
 
 extern "C" void MetalioVibe_Pulse(void) {
     VibeEngine::Instance().Pulse();
+}
+
+extern "C" void MetalioVibe_PulseFor(int duration_ms) {
+    VibeEngine::Instance().Pulse(duration_ms);
 }
 
 extern "C" void MetalioVibe_Set(bool on) {

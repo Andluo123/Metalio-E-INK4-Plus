@@ -104,10 +104,12 @@ void TtfEnsurePanel() {
     lv_obj_set_style_bg_opa(st.ttf.ttf_sheet, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(st.ttf.ttf_sheet, 12, 0);
     lv_obj_set_style_pad_all(st.ttf.ttf_sheet, 16, 0);
-    lv_obj_set_style_pad_row(st.ttf.ttf_sheet, 10, 0);
+    lv_obj_set_style_pad_row(st.ttf.ttf_sheet, 18, 0);
     lv_obj_set_flex_flow(st.ttf.ttf_sheet, LV_FLEX_FLOW_COLUMN);
     lv_obj_add_flag(st.ttf.ttf_sheet, LV_OBJ_FLAG_CLICKABLE);
-    Book_DisableScroll(st.ttf.ttf_sheet);
+    lv_obj_add_flag(st.ttf.ttf_sheet, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(st.ttf.ttf_sheet, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(st.ttf.ttf_sheet, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_move_foreground(st.ttf.ttf_sheet);
     TtfRebuildContent();
 }
@@ -118,6 +120,7 @@ void TtfRebuildContent() {
         return;
     }
     lv_obj_clean(st.ttf.ttf_sheet);
+    ApplyReadingPanelRules(st.ttf.ttf_sheet);
     for (int i = 0; i < kFontListPageSize; ++i) {
         st.ttf.ttf_rows[i] = {};
     }
@@ -169,8 +172,9 @@ void TtfRebuildContent() {
     lv_obj_set_width(head, lv_pct(100));
     lv_obj_set_height(head, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+    lv_obj_set_flex_align(head, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(head, 16, 0);
     lv_obj_clear_flag(head, LV_OBJ_FLAG_CLICKABLE);
     Book_DisableScroll(head);
     const char* title = "";
@@ -181,31 +185,66 @@ void TtfRebuildContent() {
         case BookUiState::TtfMode::kResult: title = st.ttf.ttf_result_ok ? "转换完成" : "转换失败"; break;
         default: break;
     }
+    if (!is_progress) {
+        auto* back = make_action(head, "<", OnTtfClose);
+        lv_obj_set_style_border_width(lv_obj_get_child(back, 0), 0, 0);
+        lv_obj_set_style_pad_all(lv_obj_get_child(back, 0), 0, 0);
+        lv_obj_set_size(back, 48, 48);
+        lv_obj_set_ext_click_area(back, 12);
+        lv_label_set_text(lv_obj_get_child(lv_obj_get_child(back, 0), 0), "");
+        static const lv_point_precise_t left_points[] = {{10, 0}, {0, 12}, {10, 24}};
+        auto* left = lv_line_create(back);
+        lv_obj_add_flag(left, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_line_set_points(left, left_points, 3);
+        lv_obj_set_style_line_width(left, 4, 0);
+        lv_obj_set_style_line_color(left, lv_color_black(), 0);
+        lv_obj_set_style_line_rounded(left, true, 0);
+        lv_obj_clear_flag(left, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_center(left);
+        lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    }
     lv_obj_t* title_lbl = lv_label_create(head);
     lv_label_set_text(title_lbl, title);
     lv_obj_set_style_text_font(title_lbl, Book_ListFont(), 0);
     lv_obj_clear_flag(title_lbl, LV_OBJ_FLAG_CLICKABLE);
-    if (!is_progress) {
-        make_action(head, "关闭", OnTtfClose);
-    }
+
 
     switch (st.ttf.ttf_mode) {
         case BookUiState::TtfMode::kList: {
             if (st.ttf.ttf_files.empty()) {
-                lv_obj_t* empty = lv_label_create(st.ttf.ttf_sheet);
+                lv_obj_update_layout(st.ttf.ttf_sheet);
+                auto* frame = lv_obj_create(st.ttf.ttf_sheet);
+                lv_obj_remove_style_all(frame);
+                lv_obj_set_width(frame, lv_pct(100));
+                // Fill the remaining panel space, including landscape's shorter viewport.
+                const int remaining = lv_obj_get_content_height(st.ttf.ttf_sheet) - lv_obj_get_height(head) - 18;
+                lv_obj_set_height(frame, std::max(100, remaining));
+                lv_obj_set_style_border_width(frame, 1, 0);
+                lv_obj_set_style_border_color(frame, lv_color_black(), 0);
+                lv_obj_set_style_radius(frame, 8, 0);
+                lv_obj_set_style_pad_all(frame, 16, 0);
+                lv_obj_clear_flag(frame, LV_OBJ_FLAG_CLICKABLE);
+                Book_DisableScroll(frame);
+                lv_obj_t* empty = lv_label_create(frame);
                 lv_label_set_text(
                     empty, "未找到 TTF/OTF 字体\n请将字体文件放入 SD 卡 metalio/e-ink/fonts_ttf 目录");
                 lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
                 lv_obj_set_width(empty, lv_pct(100));
                 lv_obj_set_style_text_font(empty, Book_ItemFont(), 0);
-                lv_obj_set_style_text_opa(empty, LV_OPA_70, 0);
+                lv_obj_set_style_text_color(empty, lv_color_black(), 0);
+                lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_center(empty);
                 lv_obj_clear_flag(empty, LV_OBJ_FLAG_CLICKABLE);
                 break;
             }
             lv_obj_t* list = lv_obj_create(st.ttf.ttf_sheet);
             lv_obj_remove_style_all(list);
             lv_obj_set_width(list, lv_pct(100));
-            lv_obj_set_height(list, kFontListRowH * kFontListPageSize);
+            lv_obj_set_height(list, kFontListRowH * kFontListPageSize + 2);
+            lv_obj_set_style_border_width(list, 1, 0);
+            lv_obj_set_style_border_color(list, lv_color_black(), 0);
+            lv_obj_set_style_radius(list, 8, 0);
+            lv_obj_set_style_clip_corner(list, true, 0);
             lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
             lv_obj_clear_flag(list, LV_OBJ_FLAG_CLICKABLE);
             Book_DisableScroll(list);
@@ -415,5 +454,6 @@ void TtfRebuildContent() {
         default:
             break;
     }
+    ApplyReadingPanelRules(st.ttf.ttf_sheet);
 }
 

@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include <cstdlib>
+#include <atomic>
 
 #include <esp_log.h>
 #include <lvgl.h>
@@ -11,7 +12,8 @@ namespace {
 
 constexpr const char* TAG = "DispOrient";
 
-int s_orient = kDisplayUiPortrait;
+std::atomic<int> s_orient = kDisplayUiPortrait;
+bool s_full_screen = false;
 int s_panel_w = 1216; // ED047 物理宽（横置）
 int s_panel_h = 684;  // ED047 物理高
 lv_display_t* s_disp = nullptr;
@@ -26,19 +28,25 @@ int ClampOrient(int orient) {
 void LogicalToPanelAt(int orient, int lx, int ly, int* px, int* py) {
     const int pw = s_panel_w;
     const int ph = s_panel_h;
+    const int left = s_full_screen ? 0 : DISPLAY_CONTENT_LEFT_INSET;
+    const int top = s_full_screen ? 0 : DISPLAY_CONTENT_TOP_INSET;
     switch (ClampOrient(orient)) {
         case kDisplayUiLandLeft:
-            *px = lx;
-            *py = ly;
+            *px = lx + top;
+            *py = ly + left;
             break;
         case kDisplayUiLandRight:
-            *px = pw - 1 - lx;
-            *py = ph - 1 - ly;
+            *px = pw - 1 - lx - top;
+            *py = ph - 1 - ly - left;
+            break;
+        case kDisplayUiPortraitDown:
+            *px = pw - 1 - ly - top;
+            *py = lx + left;
             break;
         case kDisplayUiPortrait:
         default:
-            *px = ly;
-            *py = ph - 1 - lx;
+            *px = ly + top;
+            *py = ph - 1 - lx - left;
             break;
     }
 }
@@ -46,19 +54,25 @@ void LogicalToPanelAt(int orient, int lx, int ly, int* px, int* py) {
 void TouchToLogicalAt(int orient, int tx, int ty, int* lx, int* ly) {
     const int pw = s_panel_w;
     const int ph = s_panel_h;
+    const int left = s_full_screen ? 0 : DISPLAY_CONTENT_LEFT_INSET;
+    const int top = s_full_screen ? 0 : DISPLAY_CONTENT_TOP_INSET;
     switch (ClampOrient(orient)) {
         case kDisplayUiLandLeft:
-            *lx = ty;
-            *ly = ph - 1 - tx;
+            *lx = ty - top;
+            *ly = ph - 1 - tx - left;
             break;
         case kDisplayUiLandRight:
-            *lx = pw - 1 - ty;
-            *ly = tx;
+            *lx = pw - 1 - ty - top;
+            *ly = tx - left;
+            break;
+        case kDisplayUiPortraitDown:
+            *lx = ph - 1 - tx - left;
+            *ly = pw - 1 - ty - top;
             break;
         case kDisplayUiPortrait:
         default:
-            *lx = tx;
-            *ly = ty;
+            *lx = tx - left;
+            *ly = ty - top;
             break;
     }
 }
@@ -69,34 +83,19 @@ void FailCheck(const char* what) {
 }
 
 void SelfCheck() {
-    int px = 0, py = 0, lx = 0, ly = 0;
-    LogicalToPanelAt(kDisplayUiPortrait, 0, 0, &px, &py);
-    if (px != 0 || py != s_panel_h - 1) {
-        FailCheck("portrait (0,0)");
-    }
-    LogicalToPanelAt(kDisplayUiPortrait, s_panel_h - 1, 0, &px, &py);
-    if (px != 0 || py != 0) {
-        FailCheck("portrait (h-1,0)");
-    }
-    LogicalToPanelAt(kDisplayUiLandLeft, 0, 0, &px, &py);
-    if (px != 0 || py != 0) {
-        FailCheck("land-left (0,0)");
-    }
-    LogicalToPanelAt(kDisplayUiLandRight, 0, 0, &px, &py);
-    if (px != s_panel_w - 1 || py != s_panel_h - 1) {
-        FailCheck("land-right (0,0)");
-    }
-    TouchToLogicalAt(kDisplayUiPortrait, 12, 34, &lx, &ly);
-    if (lx != 12 || ly != 34) {
-        FailCheck("touch portrait");
-    }
-    TouchToLogicalAt(kDisplayUiLandLeft, 0, 0, &lx, &ly);
-    if (lx != 0 || ly != s_panel_h - 1) {
-        FailCheck("touch land-left");
-    }
-    LogicalToPanelAt(kDisplayUiLandLeft, lx, ly, &px, &py);
-    if (px != 0 || py != s_panel_h - 1) {
-        FailCheck("touch/panel land-left");
+    for (int orient = 0; orient < kDisplayUiOrientCount; ++orient) {
+        const int w = (orient == kDisplayUiPortrait || orient == kDisplayUiPortraitDown) ? DISPLAY_CONTENT_W : DISPLAY_CONTENT_H;
+        const int h = (orient == kDisplayUiPortrait || orient == kDisplayUiPortraitDown) ? DISPLAY_CONTENT_H : DISPLAY_CONTENT_W;
+        for (int x = 0; x < w; x += w - 1) {
+            for (int y = 0; y < h; y += h - 1) {
+                int px, py, lx, ly;
+                LogicalToPanelAt(orient, x, y, &px, &py);
+                TouchToLogicalAt(orient, s_panel_h - 1 - py, px, &lx, &ly);
+                if (lx != x || ly != y || px < 0 || px >= s_panel_w || py < 0 || py >= s_panel_h) {
+                    FailCheck("orientation round-trip");
+                }
+            }
+        }
     }
 }
 
@@ -109,21 +108,16 @@ void DisplayUiBind(lv_display_t* disp, int panel_w, int panel_h) {
         s_panel_h = panel_h;
     }
     s_orient = kDisplayUiPortrait;
+    s_full_screen = false;
     SelfCheck();
 }
 
 bool DisplayUiSetOrient(int orient) {
     orient = ClampOrient(orient);
-    // S31 LVGL 缓冲按竖屏 content 分配；横屏需改 flush/缓冲，暂锁竖屏
-    if (orient != kDisplayUiPortrait) {
-        ESP_LOGW(TAG, "landscape deferred on S31; keep portrait");
-        orient = kDisplayUiPortrait;
-    }
-    // UI 逻辑分辨率必须是 content 区（已扣 L/R/T/B inset），禁止改回面板全尺寸
-    const int log_w = DISPLAY_CONTENT_W;
-    const int log_h = DISPLAY_CONTENT_H;
     const bool changed = (s_orient != orient);
     s_orient = orient;
+    const int log_w = DisplayUiLogW();
+    const int log_h = DisplayUiLogH();
     if (s_disp != nullptr) {
         if (lv_display_get_horizontal_resolution(s_disp) != log_w ||
             lv_display_get_vertical_resolution(s_disp) != log_h) {
@@ -142,16 +136,26 @@ int DisplayUiGetOrient(void) {
     return s_orient;
 }
 
+void DisplayUiSetFullScreen(bool full_screen) {
+    if (s_full_screen == full_screen) return;
+    s_full_screen = full_screen;
+    DisplayUiSetOrient(s_orient);
+}
+
 bool DisplayUiIsLandscape(void) {
-    return s_orient != kDisplayUiPortrait;
+    return s_orient == kDisplayUiLandLeft || s_orient == kDisplayUiLandRight;
 }
 
 int DisplayUiLogW(void) {
-    return (s_orient == kDisplayUiPortrait) ? DISPLAY_CONTENT_W : DISPLAY_CONTENT_H;
+    const int w = s_full_screen ? s_panel_h : DISPLAY_CONTENT_W;
+    const int h = s_full_screen ? s_panel_w : DISPLAY_CONTENT_H;
+    return DisplayUiIsLandscape() ? h : w;
 }
 
 int DisplayUiLogH(void) {
-    return (s_orient == kDisplayUiPortrait) ? DISPLAY_CONTENT_H : DISPLAY_CONTENT_W;
+    const int w = s_full_screen ? s_panel_h : DISPLAY_CONTENT_W;
+    const int h = s_full_screen ? s_panel_w : DISPLAY_CONTENT_H;
+    return DisplayUiIsLandscape() ? w : h;
 }
 
 void DisplayUiLogicalToPanel(int lx, int ly, int* px, int* py) {

@@ -12,7 +12,7 @@
 #include "metalio_i2c1.h"
 
 #include <driver/gpio.h>
-#include <driver/i2c.h>
+#include <driver/i2c_master.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -49,6 +49,9 @@ static bool s_replay_release = false;   // 回放 PRESSED 后还需一次 RELEAS
 static bool s_ui_suppress = false;
 static volatile int s_feed_pause_depth = 0; // 待机 / 落墨嵌套暂停（ISR 只读）
 static bool s_finger_down = false; // feed 侧：芯片报有触点
+static uint32_t s_samples, s_read_errors, s_irq_count;
+static int s_last_read_error;
+static int s_last_raw_x, s_last_raw_y;
 
 static esp_err_t ft_read(uint8_t reg, uint8_t* buf, size_t n) {
     if (n == 0) {
@@ -57,23 +60,14 @@ static esp_err_t ft_read(uint8_t reg, uint8_t* buf, size_t n) {
     if (!metalio_i2c1_lock(I2C1_LOCK_MS)) {
         return ESP_ERR_TIMEOUT;
     }
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    if (cmd == NULL) {
+    // A pause may start while the feed task is waiting for the shared bus.
+    // Recheck under the bus lock so it cannot start a read after OTA drains it.
+    if (s_feed_pause_depth > 0) {
         metalio_i2c1_unlock();
-        return ESP_ERR_NO_MEM;
+        return ESP_ERR_INVALID_STATE;
     }
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (TOUCH_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (TOUCH_I2C_ADDR << 1) | I2C_MASTER_READ, true);
-    if (n > 1) {
-        i2c_master_read(cmd, buf, n - 1, I2C_MASTER_ACK);
-    }
-    i2c_master_read_byte(cmd, buf + n - 1, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(EPDIY_I2C_PORT, cmd, pdMS_TO_TICKS(50));
-    i2c_cmd_link_delete(cmd);
+    esp_err_t ret = metalio_i2c1_transmit_receive_locked(EPDIY_I2C_PORT, TOUCH_I2C_ADDR,
+                                                        &reg, 1, buf, n, 50);
     metalio_i2c1_unlock();
     return ret;
 }
@@ -82,18 +76,8 @@ static esp_err_t ft_write(uint8_t reg, uint8_t val) {
     if (!metalio_i2c1_lock(I2C1_LOCK_MS)) {
         return ESP_ERR_TIMEOUT;
     }
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    if (cmd == NULL) {
-        metalio_i2c1_unlock();
-        return ESP_ERR_NO_MEM;
-    }
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (TOUCH_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_write_byte(cmd, val, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(EPDIY_I2C_PORT, cmd, pdMS_TO_TICKS(50));
-    i2c_cmd_link_delete(cmd);
+    esp_err_t ret = metalio_i2c1_write_reg_locked(EPDIY_I2C_PORT, TOUCH_I2C_ADDR,
+                                                 reg, &val, 1, 50);
     metalio_i2c1_unlock();
     return ret;
 }
@@ -123,6 +107,7 @@ static void map_to_logical(int raw_x, int raw_y, int* lx, int* ly) {
 }
 
 static void IRAM_ATTR touch_isr(void* /*arg*/) {
+    ++s_irq_count;
     if (s_feed_pause_depth > 0) {
         return;
     }
@@ -133,14 +118,6 @@ static void IRAM_ATTR touch_isr(void* /*arg*/) {
     if (hp == pdTRUE) {
         portYIELD_FROM_ISR();
     }
-}
-
-static void clear_ui_edges_locked(void) {
-    s_ui_pressed = false;
-    s_ui_seen = false;
-    s_replay_press = false;
-    s_replay_release = false;
-    s_finger_down = false;
 }
 
 /** 仅清 LVGL 边沿；保留 s_finger_down，否则盖板键每拍 suppress 会停采、松手收不到 */
@@ -185,14 +162,21 @@ static void publish_ui(bool pressed, int lx, int ly, int raw_x, int raw_y) {
 
 static void feed_one_sample(void) {
     uint8_t buf[6] = {0};
-    if (ft_read(FT_REG_TD_STATUS, buf, sizeof(buf)) != ESP_OK) {
+    esp_err_t read_result = ft_read(FT_REG_TD_STATUS, buf, sizeof(buf));
+    if (read_result == ESP_ERR_INVALID_STATE) {
+        return; // Paused intentionally, not a touch-chip read failure.
+    }
+    ++s_samples;
+    s_last_read_error = read_result;
+    if (read_result != ESP_OK) {
+        ++s_read_errors;
         return;
     }
     const int n = buf[0] & 0x0F;
     if (n == 0 || n > 2) {
         if (s_finger_down) {
             s_finger_down = false;
-            ESP_LOGI(TAG, "touch up");
+            ESP_LOGD(TAG, "touch up");
             publish_ui(false, 0, 0, 0, 0);
             if (s_sample_cb != NULL) {
                 s_sample_cb(0, 0, 0, 0, 0);
@@ -208,6 +192,8 @@ static void feed_one_sample(void) {
 
     const int raw_x = ((buf[1] & 0x0F) << 8) | buf[2];
     const int raw_y = ((buf[3] & 0x0F) << 8) | buf[4];
+    s_last_raw_x = raw_x;
+    s_last_raw_y = raw_y;
     int lx = 0;
     int ly = 0;
     map_to_logical(raw_x, raw_y, &lx, &ly);
@@ -216,7 +202,7 @@ static void feed_one_sample(void) {
     static int s_last_ly = -1;
     const bool edge = !s_finger_down;
     if (edge || lx != s_last_lx || ly != s_last_ly) {
-        ESP_LOGI(TAG, "touch %s raw=(%d,%d) logical=(%d,%d)", edge ? "down" : "move", raw_x, raw_y,
+        ESP_LOGD(TAG, "touch %s raw=(%d,%d) logical=(%d,%d)", edge ? "down" : "move", raw_x, raw_y,
                  lx, ly);
         s_last_lx = lx;
         s_last_ly = ly;
@@ -240,8 +226,8 @@ static void touch_feed_task(void* /*arg*/) {
             vTaskDelay(pdMS_TO_TICKS(TOUCH_FEED_MS));
             continue;
         }
-        // 空闲等 INT；按下后短周期续采（CONTACT / 松手）
-        const TickType_t wait = s_finger_down ? pdMS_TO_TICKS(TOUCH_FEED_MS) : portMAX_DELAY;
+        // IRQ is a latency hint. Poll as fallback so a missed edge cannot disable input.
+        const TickType_t wait = pdMS_TO_TICKS(s_finger_down ? TOUCH_FEED_MS : 20);
         xSemaphoreTake(s_irq_sem, wait);
         if (s_feed_pause_depth > 0) {
             continue;
@@ -350,7 +336,7 @@ void metalio_touch_set_feed_paused(bool paused) {
         if (s_feed_pause_depth < 100) {
             s_feed_pause_depth += 1;
         }
-        clear_ui_edges_locked();
+        // Keep sampled press/release edges while the shared bus is briefly paused.
     } else if (s_feed_pause_depth > 0) {
         s_feed_pause_depth -= 1;
         edge_resume = (s_feed_pause_depth == 0);
@@ -361,7 +347,7 @@ void metalio_touch_set_feed_paused(bool paused) {
         xSemaphoreGive(s_irq_sem);
     }
     if ((paused && s_feed_pause_depth == 1) || edge_resume) {
-        ESP_LOGI(TAG, "feed %s depth=%d", now_paused ? "paused" : "resumed", s_feed_pause_depth);
+        ESP_LOGD(TAG, "feed %s depth=%d", now_paused ? "paused" : "resumed", s_feed_pause_depth);
     }
 }
 
@@ -411,4 +397,14 @@ bool metalio_touch_read(metalio_touch_point_t* out) {
 
 bool metalio_touch_ok(void) {
     return s_ok;
+}
+
+metalio_touch_stats_t metalio_touch_stats(void) {
+    metalio_touch_stats_t stats = {
+        .ok = s_ok, .samples = s_samples, .read_errors = s_read_errors,
+        .irqs = s_irq_count, .last_error = s_last_read_error,
+        .raw_x = s_last_raw_x, .raw_y = s_last_raw_y,
+        .irq_level = gpio_get_level(TOUCH_INT_PIN), .pause_depth = s_feed_pause_depth,
+    };
+    return stats;
 }

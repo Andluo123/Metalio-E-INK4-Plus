@@ -5,44 +5,49 @@
 class AudioCodec;
 
 /**
- * @brief BH1098 + NS4150 板级音频：UART 模式1、I2S duplex、PA_EN
- */
-
-/**
  * @brief 返回板级 AudioCodec（转发 Board::GetAudioCodec）
  */
 AudioCodec* MetalioAudio_GetCodec();
 
 /**
- * @brief 初始化 BT UART 并下发模式1；PA 默认关（I2S 由 GetAudioCodec 惰性创建）
+ * @brief 初始化 UART，后台先复位 BH，再配置并确认模式1；不会等待复位完成
  */
 void MetalioAudio_Init();
+/**
+ * @brief 请求后台初始化；同一电源周期重试耗尽后不重复启动
+ */
+void MetalioAudio_RequestModeInit();
+constexpr int kMetalioAudioInitWaitMs = 20000; // 后台调用方等待初始化的最长时间
+
+/**
+ * @brief 电源关闭时使已确认的音频模式失效
+ */
+void MetalioAudio_OnPowerOff();
+/**
+ * @brief 记录恢复供电时间，供后台初始化等待电源稳定
+ */
+void MetalioAudio_OnPowerRestored();
 
 /**
  * @brief 等待 AT 模式1 就绪
- * @param timeout_ms 最长等待毫秒
+ * @param timeout_ms 最长等待毫秒；等待操作仅供后台任务使用
  * @return true 已就绪
  */
 bool MetalioAudio_WaitModeReady(int timeout_ms = 2000);
 
 /**
- * @brief 等待模式1就绪并启动 codec
- * @return true 可读写麦/喇叭
+ * @brief 模式已就绪时启动 codec，否则请求后台初始化并立即返回
+ * @return true 已启动；false 尚未就绪或启动失败
  */
 bool MetalioAudio_EnsureStarted();
 
 /**
- * @brief UART/codec 已初始化且模式1任务已完成（不保证芯片有回包）
+ * @brief 当前电源周期已收到明确的 SET MODE 1 成功应答
  */
 bool MetalioAudio_ModeReady();
 
 /**
- * @brief 初始化后是否收到过 BT UART 回包
- */
-bool MetalioAudio_BtRxSeen();
-
-/**
- * @brief 功放使能（IO_P4=PA_EN）
+ * @brief 设置板级功放使能状态
  */
 void MetalioAudio_SetPa(bool on);
 
@@ -52,7 +57,7 @@ void MetalioAudio_SetPa(bool on);
 int MetalioAudio_InputRate();
 
 /**
- * @brief 读麦克风 PCM（单声道 int16）
+ * @brief 读取音频输入 PCM，声道布局由板级 codec 决定
  * @return 实际采样点数；超时/失败 ≤0
  */
 int MetalioAudio_ReadMic(int16_t* dest, int samples);

@@ -233,6 +233,7 @@ void ApplyDeleteAsync(void* p) {
     Wallpaper_State().preview.idx = -1;
     ShowMode(UiMode::kList);
     RebuildListPage();
+    Wallpaper_RevealAfterWhite();
     delete msg;
 }
 

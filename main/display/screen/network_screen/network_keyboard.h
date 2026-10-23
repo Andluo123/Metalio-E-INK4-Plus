@@ -4,20 +4,18 @@
 
 /** @brief 密码页取消 */
 void Network_OnPwdCancel(lv_event_t* e);
-/** @brief 显示后再按实际尺寸均分方键 */
-void Network_LayoutCustomKeyboardSquares();
+/** @brief 显示后再按实际尺寸排布按键 */
+void Network_LayoutCustomKeyboard();
 /** @brief 清空当前密码缓冲 */
 void Network_ClearPassword();
-/** @brief 按键外观：模式键高亮等 */
-void Network_StyleKbKey(lv_obj_t* btn, lv_obj_t* lbl, KbAction action, bool active_mode);
-/** @brief 键盘区域尺寸变化时重排方键 */
+/** @brief 键盘区域尺寸变化时重排按键 */
 void Network_OnKbAreaSizeChanged(lv_event_t* e);
-/** @brief 刷新密码掩码显示 */
+/** @brief 刷新密码与末尾静态 I 光标 */
 void Network_RefreshPasswordDisplay();
-/** @brief 退格键长按：连续删字 */
+/** @brief 退格键长按清空密码 */
 void Network_OnBackspaceLongPressed(lv_event_t* e);
 /** @brief 按当前布局填充键位描述表 */
-void Network_FillKbLayout(KbKeyDesc out[kKbRows * kKbCols]);
+void Network_FillKbLayout(KbKeyDesc out[kKbKeysCap]);
 /** @brief 字符/空格/退格：按下即写入 */
 void Network_OnCustomKeyPressed(lv_event_t* e);
 /** @brief 切布局：松手再建盘，避免 PRESSED 里删掉当前键 */

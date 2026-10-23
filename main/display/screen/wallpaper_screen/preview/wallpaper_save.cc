@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <ctime>
 #include <string>
 #include <sys/stat.h>
@@ -89,6 +90,7 @@ bool BuildUniqueSaveAsPath(const FileEntry& src, char* out_path, size_t out_path
         std::memcpy(stem, name, copy);
         stem[copy] = '\0';
     }
+    std::snprintf(ext,sizeof(ext),".a2l8");
     StripTrailingSaveAsStamp(stem);
 
     // out_name: stem + '-' + stamp(14) + 可选 '_NN' + ext
@@ -162,6 +164,7 @@ bool BuildUniqueSaveAsPath(const FileEntry& src, char* out_path, size_t out_path
 
 struct SaveWork {
     uint32_t epoch = 0;
+    uint32_t generation = 0;
     int index = -1;
     uint8_t rot_cw = 0;
     bool mirror_h = false;
@@ -173,6 +176,7 @@ struct SaveWork {
 
 struct SaveResultMsg {
     uint32_t epoch = 0;
+    uint32_t generation = 0;
     int index = -1;
     bool ok = false;
     bool save_as = false;
@@ -181,48 +185,44 @@ struct SaveResultMsg {
     char err[80] = {};
 };
 
-bool SaveTransformedWallpaper(const SaveWork& work, size_t& size_out, std::string& err_out) {
+bool SaveTransformedWallpaper(const SaveWork& work, size_t& size_out, std::string& err_out) try {
     size_out = 0;
     err_out.clear();
     if (work.src_path[0] == '\0' || work.out_path[0] == '\0') {
         err_out = Lang::Strings::WALLPAPER_FILE_INVALID;
         return false;
     }
-    if (work.epoch != Wallpaper_State().epoch) {
+    if (work.epoch != Wallpaper_State().epoch || Wallpaper_State().decode_paused.load() ||
+        work.generation != Wallpaper_State().decode_generation.load()) {
         err_out = Lang::Strings::WALLPAPER_SAVE_FAIL;
         return false;
     }
-    int src_w = 0;
-    int src_h = 0;
-    if (!reader::PeekA2i1FileSize(work.src_path, &src_w, &src_h) || src_w <= 0 || src_h <= 0) {
-        err_out = Lang::Strings::WALLPAPER_FILE_INVALID;
-        return false;
-    }
-    const int max_w = std::min(src_w, kSaveDecodeMaxW);
-    const int max_h = std::min(src_h, kSaveDecodeMaxH);
     reader::RasterImage img;
-    if (!reader::DecodeImageFileToL8(work.src_path, max_w, max_h, img) || img.empty()) {
+    WallpaperDecodeToken token{work.epoch, work.generation};
+    if (!reader::DecodeImageFileToL8(work.src_path, 0, 0, img, Wallpaper_DecodeCancelled, &token) || img.empty()) {
         err_out = Lang::Strings::WALLPAPER_DECODE_FAIL;
         return false;
     }
     TrimBakedLetterbox(img);
-    if (work.epoch != Wallpaper_State().epoch) {
+    if (work.epoch != Wallpaper_State().epoch || Wallpaper_State().decode_paused.load() ||
+        work.generation != Wallpaper_State().decode_generation.load()) {
         err_out = Lang::Strings::WALLPAPER_SAVE_FAIL;
         return false;
     }
     reader::RasterImage oriented;
     ApplyWallpaperOrient(img, work.rot_cw, work.mirror_h, oriented);
-    std::vector<uint8_t> a2i1;
-    if (!reader::EncodeL8ToA2i1(oriented, a2i1) ||
-        !reader::ValidateA2i1Bytes(a2i1.data(), a2i1.size())) {
+    std::vector<uint8_t> encoded;
+    if (!reader::EncodeL8ToA2l8(oriented, encoded) ||
+        !reader::ValidateA2l8Bytes(encoded.data(), encoded.size())) {
         err_out = Lang::Strings::WALLPAPER_SAVE_FAIL;
         return false;
     }
-    if (work.epoch != Wallpaper_State().epoch) {
+    if (work.epoch != Wallpaper_State().epoch || Wallpaper_State().decode_paused.load() ||
+        work.generation != Wallpaper_State().decode_generation.load()) {
         err_out = Lang::Strings::WALLPAPER_SAVE_FAIL;
         return false;
     }
-    if (!reader::WriteFileAtomic(work.out_path, a2i1.data(), a2i1.size())) {
+    if (!reader::WriteFileAtomic(work.out_path, encoded.data(), encoded.size())) {
         err_out = Lang::Strings::WALLPAPER_SAVE_FAIL;
         return false;
     }
@@ -233,8 +233,11 @@ bool SaveTransformedWallpaper(const SaveWork& work, size_t& size_out, std::strin
         // 列表/预览标题读 meta：保留 imageName，originalFilename 跟新落盘名（含更新后的时间戳）
         reader::WriteWallpaperMeta(work.out_path, image_name, work.out_name);
     }
-    size_out = a2i1.size();
+    size_out = encoded.size();
     return true;
+} catch (const std::bad_alloc&) {
+    err_out = Lang::Strings::WALLPAPER_PREVIEW_OOM;
+    return false;
 }
 
 void ApplySaveAsync(void* p) {
@@ -244,8 +247,14 @@ void ApplySaveAsync(void* p) {
     if (msg == nullptr) {
         return;
     }
-    if (!Wallpaper_State().screen_alive || msg->epoch != Wallpaper_State().epoch) {
+    if (!Wallpaper_State().screen_alive || msg->epoch != Wallpaper_State().epoch ||
+        Wallpaper_State().decode_paused.load() || msg->generation != Wallpaper_State().decode_generation.load()) {
         delete msg;
+        if (Wallpaper_State().screen_alive.load() && !Wallpaper_State().decode_paused.load() &&
+            Wallpaper_State().mode == UiMode::kPreview) {
+            UpdateEnableButtonUi();
+            UpdateAdjustUi();
+        }
         return;
     }
     if (!msg->ok) {
@@ -325,6 +334,7 @@ void SaveTask(void* arg) {
         std::snprintf(msg->err, sizeof(msg->err), "%s", Lang::Strings::WALLPAPER_FILE_INVALID);
     } else {
         msg->epoch = work->epoch;
+        msg->generation = work->generation;
         msg->index = work->index;
         msg->save_as = work->save_as;
         std::snprintf(msg->out_name, sizeof(msg->out_name), "%s", work->out_name);
@@ -345,12 +355,12 @@ void SaveTask(void* arg) {
         }
         delete work;
     }
-    if (lv_async_call(ApplySaveAsync, msg) != LV_RESULT_OK) {
+    if (!ScreenLvAsync(ApplySaveAsync, msg)) {
         delete msg;
         Wallpaper_State().workers.save_busy.store(false);
         Wallpaper_State().workers.save_task = nullptr;
     }
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 void ScheduleSaveTransform(bool save_as) {
@@ -371,6 +381,7 @@ void ScheduleSaveTransform(bool save_as) {
     const FileEntry& fe = Wallpaper_State().list.files[static_cast<size_t>(Wallpaper_State().preview.idx)];
     auto* work = new SaveWork{};
     work->epoch = Wallpaper_State().epoch;
+    work->generation = Wallpaper_State().decode_generation.load();
     work->index = Wallpaper_State().preview.idx;
     work->rot_cw = Wallpaper_State().preview.rot_cw;
     work->mirror_h = Wallpaper_State().preview.mirror_h;

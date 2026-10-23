@@ -4,7 +4,7 @@
 #include "cx25601n.h"
 #include "metalio_i2c1.h"
 
-#include <driver/i2c.h>
+#include <driver/i2c_master.h>
 #include <esp_log.h>
 
 #define TAG "MetalioPower"
@@ -19,6 +19,7 @@ power_i2c_t MakeBus() {
         .port = EPDIY_I2C_PORT,
         .lock = metalio_i2c1_lock,
         .unlock = metalio_i2c1_unlock,
+        .device = metalio_i2c1_device_locked,
     };
     return bus;
 }

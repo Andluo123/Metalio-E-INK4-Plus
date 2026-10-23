@@ -1,3 +1,4 @@
+#include "epd_content_policy.h"
 #include "a2ui_image.h"
 
 #include <stdio.h>
@@ -6,6 +7,7 @@
 #include <strings.h>
 
 #include <mutex>
+#include <algorithm>
 
 #include "a2ui_img_cache.h"
 #include "api_http.h"
@@ -13,7 +15,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_lv_adapter.h"
+#include "lv_adapter_epdiy.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "image_util.h"
@@ -21,22 +23,14 @@
 
 static const char *TAG = "a2ui_image";
 
-/** Full-panel 800×480 I1 ≈ 48KB+hdr; default chat images are smaller. Cap peak. */
-#define A2UI_IMG_MAX_DOWNLOAD (64 * 1024)
+/** Bound compressed downloads; normalize new images to the shared L8 envelope. */
+#define A2UI_IMG_MAX_DOWNLOAD (2 * 1024 * 1024)
 /** mem:// local blobs may be A2L8 (~440×280 L8 ≈ 123KB). */
-#define A2UI_IMG_MAX_LOCAL    (400 * 1024)
+#define A2UI_IMG_MAX_LOCAL    (1024 * 1024)
 #define A2UI_IMG_TASK_STACK   (12 * 1024)
 #define A2UI_IMG_TASK_PRIO    4
 
 #pragma pack(push, 1)
-typedef struct {
-    uint32_t magic; /* A2UI_I1_MAGIC */
-    uint16_t width;
-    uint16_t height;
-    uint16_t stride;
-    uint16_t reserved;
-} a2ui_i1_hdr_t;
-
 typedef struct {
     uint32_t magic; /* A2UI_L8_MAGIC */
     uint16_t width;
@@ -427,7 +421,6 @@ esp_err_t a2ui_image_put_local(const char *url, const uint8_t *a2i1, size_t len)
     if (old) {
         heap_caps_free(old);
     }
-    ESP_LOGI(TAG, "put_local %s (%u bytes) slot=%d", url, (unsigned)len, slot);
     return ESP_OK;
 }
 
@@ -488,8 +481,6 @@ esp_err_t a2ui_image_put_local_l8(const char *url, uint16_t w, uint16_t h, const
     if (old) {
         heap_caps_free(old);
     }
-    ESP_LOGI(TAG, "put_local_l8 %s %ux%u (%u bytes) slot=%d", url, (unsigned)w, (unsigned)h,
-             (unsigned)total, slot);
     return ESP_OK;
 }
 
@@ -511,7 +502,6 @@ static esp_err_t http_download(const char *url, uint8_t **out_buf, int *out_len,
     *out_buf = NULL;
     *out_len = 0;
 
-    ESP_LOGD(TAG, "GET %s (Board network Http)", url);
 
     auto network = Board::GetInstance().GetNetwork();
     if (network == nullptr) {
@@ -580,7 +570,7 @@ static esp_err_t http_download(const char *url, uint8_t **out_buf, int *out_len,
     }
     http->Close();
 
-    if (err != ESP_OK || total < static_cast<int>(sizeof(a2ui_i1_hdr_t) + 8)) {
+    if (err != ESP_OK || total < 8) {
         heap_caps_free(buf);
         return err != ESP_OK ? err : ESP_FAIL;
     }
@@ -591,42 +581,14 @@ static esp_err_t http_download(const char *url, uint8_t **out_buf, int *out_len,
     return ESP_OK;
 }
 
-static esp_err_t parse_a2i1(uint8_t *buf, int len, int *w, int *h, uint32_t *stride, uint8_t **payload,
-                            size_t *payload_size)
-{
-    if (len < static_cast<int>(sizeof(a2ui_i1_hdr_t) + 8)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    const a2ui_i1_hdr_t *hdr = reinterpret_cast<const a2ui_i1_hdr_t *>(buf);
-    if (hdr->magic != A2UI_I1_MAGIC) {
-        ESP_LOGE(TAG, "bad magic 0x%08lx (need A2I1 from server)", (unsigned long)hdr->magic);
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (hdr->width == 0 || hdr->height == 0 || hdr->stride == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    size_t need = sizeof(a2ui_i1_hdr_t) + 8u + static_cast<size_t>(hdr->stride) * static_cast<size_t>(hdr->height);
-    if (static_cast<size_t>(len) < need) {
-        ESP_LOGE(TAG, "truncated a2i1 %d < %u", len, (unsigned)need);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    *w = hdr->width;
-    *h = hdr->height;
-    *stride = hdr->stride;
-    *payload = buf + sizeof(a2ui_i1_hdr_t);
-    *payload_size = 8u + static_cast<size_t>(hdr->stride) * static_cast<size_t>(hdr->height);
-    return ESP_OK;
-}
-
 /**
- * 墨水屏上屏：一律 LV_COLOR_FORMAT_L8（与书封/产测同源）。
+ * 内容图片以 L8 绑定对象；是否使用灰阶由显示内容策略决定。
  * owned_blob 可为 A2L8（直挂）或 A2I1（解码后释放原包）；成败均接管释放。
  */
 static bool apply_image(lv_obj_t *img_obj, uint8_t *owned_blob, int blob_len, uint32_t gen,
                         bool already_locked)
 {
-    if (!owned_blob || blob_len <= 0) {
+    if (!owned_blob || blob_len < 4) {
         if (owned_blob) {
             heap_caps_free(owned_blob);
         }
@@ -667,26 +629,15 @@ static bool apply_image(lv_obj_t *img_obj, uint8_t *owned_blob, int blob_len, ui
         l8 = owned_blob + sizeof(a2ui_l8_hdr_t);
         l8_is_owned_blob = true;
     } else {
-        int hdr_w = 0;
-        int hdr_h = 0;
-        uint32_t hdr_stride = 0;
-        uint8_t *payload = NULL;
-        size_t payload_size = 0;
-        if (parse_a2i1(owned_blob, blob_len, &hdr_w, &hdr_h, &hdr_stride, &payload, &payload_size) !=
-            ESP_OK) {
-            ESP_LOGW(TAG, "apply: bad blob magic=0x%08lx len=%d", (unsigned long)magic, blob_len);
-            heap_caps_free(owned_blob);
-            return false;
+        int hdr_w=0,hdr_h=0;
+        if(!reader::PeekRasterSize(owned_blob,blob_len,&hdr_w,&hdr_h)) {
+            heap_caps_free(owned_blob);return false;
         }
-        (void)payload;
-        (void)payload_size;
-        (void)hdr_stride;
-
         reader::RasterImage raster;
-        if (!reader::DecodeImageToL8(owned_blob, static_cast<size_t>(blob_len), hdr_w, hdr_h,
+        if (!reader::DecodeImageToL8(owned_blob, static_cast<size_t>(blob_len), std::min(hdr_w,640), std::min(hdr_h,640),
                                      raster) ||
             raster.empty()) {
-            ESP_LOGW(TAG, "apply: A2I1→L8 failed %dx%d", hdr_w, hdr_h);
+            ESP_LOGW(TAG, "apply: image decode failed %dx%d", hdr_w, hdr_h);
             heap_caps_free(owned_blob);
             return false;
         }
@@ -708,8 +659,9 @@ static bool apply_image(lv_obj_t *img_obj, uint8_t *owned_blob, int blob_len, ui
         raster.Reset();
     }
 
+    auto* adapter = LvAdapterEpdiy::Instance();
     if (!already_locked) {
-        if (esp_lv_adapter_lock(-1) != ESP_OK) {
+        if (adapter == nullptr || !adapter->IsReady() || !adapter->LockUi(-1)) {
             if (l8_is_owned_blob) {
                 heap_caps_free(owned_blob);
             } else {
@@ -726,7 +678,7 @@ static bool apply_image(lv_obj_t *img_obj, uint8_t *owned_blob, int blob_len, ui
             heap_caps_free(l8);
         }
         if (!already_locked) {
-            esp_lv_adapter_unlock();
+            adapter->UnlockUi();
         }
         return false;
     }
@@ -739,7 +691,7 @@ static bool apply_image(lv_obj_t *img_obj, uint8_t *owned_blob, int blob_len, ui
             heap_caps_free(l8);
         }
         if (!already_locked) {
-            esp_lv_adapter_unlock();
+            adapter->UnlockUi();
         }
         return false;
     }
@@ -762,6 +714,7 @@ static bool apply_image(lv_obj_t *img_obj, uint8_t *owned_blob, int blob_len, ui
     surf->dsc.data = l8;
 
     lv_image_set_src(img_obj, &surf->dsc);
+    EpdSetContentRole(img_obj,EpdContentRole::AssistantImage);
     lv_obj_set_size(img_obj, static_cast<lv_coord_t>(out_w), static_cast<lv_coord_t>(out_h));
     lv_obj_set_style_bg_opa(img_obj, LV_OPA_TRANSP, 0);
     lv_obj_remove_flag(img_obj, LV_OBJ_FLAG_HIDDEN);
@@ -772,12 +725,31 @@ static bool apply_image(lv_obj_t *img_obj, uint8_t *owned_blob, int blob_len, ui
     }
 
     if (!already_locked) {
-        esp_lv_adapter_unlock();
+        adapter->UnlockUi();
     }
     (void)s_disp;
     ESP_LOGI(TAG, "shown L8 %ux%u (%s, sync=%d)", (unsigned)out_w, (unsigned)out_h,
-             l8_is_owned_blob ? "A2L8" : "A2I1→L8", already_locked ? 1 : 0);
+             l8_is_owned_blob ? "A2L8" : "decoded L8", already_locked ? 1 : 0);
     return true;
+}
+
+// Normalize new image sources once, before publishing or writing the cache.
+// Legacy A2I1 is never re-encoded or upgraded.
+static esp_err_t normalize_payload(uint8_t*& buffer,int& length) {
+    if(!buffer || length<4) return ESP_FAIL;
+    if(!memcmp(buffer,"A2L8",4))
+        return length<=A2UI_IMG_MAX_LOCAL && reader::ValidateA2l8Bytes(buffer,length) ? ESP_OK : ESP_FAIL;
+    if(!memcmp(buffer,"A2I1",4)) {
+        return reader::ValidateA2i1Bytes(buffer,length) ? ESP_OK : ESP_FAIL;
+    }
+    reader::RasterImage raster;
+    std::vector<uint8_t> encoded;
+    if(!reader::DecodeImageToL8(buffer,length,640,640,raster) ||
+       !reader::EncodeL8ToA2l8(raster,encoded) || encoded.size()>A2UI_IMG_MAX_LOCAL) return ESP_FAIL;
+    auto* converted=static_cast<uint8_t*>(heap_caps_malloc(encoded.size(),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+    if(!converted) return ESP_ERR_NO_MEM;
+    memcpy(converted,encoded.data(),encoded.size());heap_caps_free(buffer);
+    buffer=converted;length=encoded.size();return ESP_OK;
 }
 
 static void image_task(void *arg)
@@ -789,13 +761,7 @@ static void image_task(void *arg)
         uint8_t *buf = NULL;
         size_t len_sz = 0;
         int len = 0;
-        int w = 0;
-        int h = 0;
-        uint32_t stride = 0;
-        uint8_t *payload = NULL;
-        size_t payload_size = 0;
         bool from_cache = false;
-        bool parsed_ok = false;
 
         esp_err_t err = ESP_FAIL;
         /* 1) RAM put_local (mem:// / preloaded file://) */
@@ -839,57 +805,22 @@ static void image_task(void *arg)
             goto next_job;
         }
 
-        parsed_ok = false;
-        if (buf && len >= 4) {
-            const uint32_t magic = static_cast<uint32_t>(buf[0]) | (static_cast<uint32_t>(buf[1]) << 8) |
-                                   (static_cast<uint32_t>(buf[2]) << 16) |
-                                   (static_cast<uint32_t>(buf[3]) << 24);
-            if (magic == A2UI_L8_MAGIC) {
-                parsed_ok = true;
-            }
+        err=normalize_payload(buf,len);
+        if(err!=ESP_OK && from_cache) {
+            a2ui_img_cache_invalidate(job->url);
+            heap_caps_free(buf);buf=nullptr;len=0;
+            if(job_cancelled(gen)) goto next_job;
+            if(url_is_local_path(job->url)) err=file_load(job->url,&buf,&len);
+            else if(strncmp(job->url,"mem://",6)) err=http_download(job->url,&buf,&len,gen);
+            else err=ESP_FAIL;
+            from_cache=false;
+            if(err==ESP_OK) err=normalize_payload(buf,len);
         }
-        if (!parsed_ok) {
-            err = parse_a2i1(buf, len, &w, &h, &stride, &payload, &payload_size);
-            if (err != ESP_OK) {
-                if (from_cache) {
-                    ESP_LOGW(TAG, "cache entry invalid, invalidate + reload");
-                    a2ui_img_cache_invalidate(job->url);
-                    heap_caps_free(buf);
-                    buf = NULL;
-                    if (job_cancelled(gen)) {
-                        goto next_job;
-                    }
-                    if (url_is_local_path(job->url)) {
-                        err = file_load(job->url, &buf, &len);
-                    } else if (strncmp(job->url, "mem://", 6) != 0) {
-                        err = http_download(job->url, &buf, &len, gen);
-                    } else {
-                        err = ESP_FAIL;
-                    }
-                    if (err != ESP_OK || job_cancelled(gen)) {
-                        goto next_job;
-                    }
-                    from_cache = false;
-                    err = parse_a2i1(buf, len, &w, &h, &stride, &payload, &payload_size);
-                }
-                if (err != ESP_OK || job_cancelled(gen)) {
-                    goto next_job;
-                }
-            } else if (job_cancelled(gen)) {
-                goto next_job;
-            }
-            parsed_ok = true;
-        } else if (job_cancelled(gen)) {
-            goto next_job;
-        }
-        (void)parsed_ok;
+        if(err!=ESP_OK || job_cancelled(gen)) goto next_job;
 
         {
-            /* 先落缓存（仅 A2I1），再 apply（A2L8 直显 / A2I1→L8） */
-            const bool is_a2i1 =
-                buf && len >= 4 && buf[0] == 'A' && buf[1] == '2' && buf[2] == 'I' && buf[3] == '1';
-            const bool do_store =
-                (!from_cache && is_a2i1 && a2ui_img_cache_is_ready() && buf && len > 0);
+            /* Cache both lossless gray payloads and legacy binary payloads. */
+            const bool do_store = !from_cache && a2ui_img_cache_is_ready();
             if (do_store) {
                 (void)a2ui_img_cache_store(job->url, buf, static_cast<size_t>(len));
             }
@@ -928,9 +859,6 @@ esp_err_t a2ui_image_load_async(lv_obj_t *img_obj, const char *url, int max_w, i
 
     char *resolved = resolve_image_url(url);
     ESP_RETURN_ON_FALSE(resolved, ESP_ERR_NO_MEM, TAG, "resolve url");
-    if (strcmp(resolved, url) != 0) {
-        ESP_LOGW(TAG, "rewrite %s -> %s", url, resolved);
-    }
 
     /*
      * mem://：put_local / put_local_l8 已就绪。须在当前 LVGL 锁内同步上屏，

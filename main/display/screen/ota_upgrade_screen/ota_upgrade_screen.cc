@@ -1,15 +1,16 @@
 #include "ota_upgrade_screen/ota_upgrade_screen.h"
 
 #include "fontpack_lvgl.h"
+#include "screen_common.h"
 #include "standby_screen/standby_screen.h"
 #include "ui_scale.h"
+#include "lv_adapter_epdiy.h"
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 
 #include <esp_log.h>
-#include <esp_lv_adapter.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -19,16 +20,15 @@
 
 static constexpr const char* TAG = "OtaUpgradeUi";
 
-static constexpr lv_coord_t kBarW = UiSx(320);
 static constexpr lv_coord_t kBarH = UiSy(28);
-static constexpr lv_coord_t kPanelMargin = UiSx(48);
-static constexpr lv_coord_t kLabelMargin = UiSx(64);
-static constexpr lv_coord_t kPanelRowGap = UiSy(16);
+static constexpr lv_coord_t kPanelMargin = UiSx(80);
+static constexpr lv_coord_t kPanelPad = UiSx(20); // 内容与面板边界的间距
+static constexpr lv_coord_t kPanelRowGap = UiSy(12);
 static constexpr lv_coord_t kBarRadius = UiSx(6);
 static constexpr lv_coord_t kBarIndRadius = UiSx(3);
 static constexpr lv_coord_t kBarBorderW = UiSx(2);
 static constexpr lv_coord_t kBarPad = UiSx(3);
-// 局部刷新节流：0%/100% 和跨 5% 的更新必须立即刷新。
+// 局部刷新约每 2 秒更新，开始和完成时立即刷新。
 static constexpr int64_t kProgUiIntervalUs = 2 * 1000 * 1000;
 static constexpr uint32_t kShowTimeoutMs = 5000;
 static constexpr uint32_t kDismissTimeoutMs = 3000;
@@ -43,7 +43,7 @@ static lv_obj_t* s_root = nullptr;
 static lv_obj_t* s_bar = nullptr;
 static lv_obj_t* s_pct_lbl = nullptr;
 static lv_obj_t* s_hint_lbl = nullptr;
-static int s_shown_percent = -1;
+static std::atomic<int> s_shown_percent{-1};
 
 static std::atomic<int> s_pending_percent{-1};
 static std::atomic<bool> s_prog_queued{false};
@@ -154,8 +154,7 @@ static void BuildUi(const char* current_ver, const char* new_ver) {
     lv_obj_remove_style_all(root);
     lv_obj_set_size(root, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_pos(root, 0, 0);
-    lv_obj_set_style_bg_color(root, lv_color_white(), 0);
-    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    ScreenApplyDotBackdrop(root);
     lv_obj_add_flag(root, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_move_foreground(root);
@@ -163,6 +162,12 @@ static void BuildUi(const char* current_ver, const char* new_ver) {
     lv_obj_t* panel = lv_obj_create(root);
     lv_obj_remove_style_all(panel);
     lv_obj_set_size(panel, LV_HOR_RES - kPanelMargin, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(panel, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(panel, UiSx(2), 0);
+    lv_obj_set_style_border_color(panel, lv_color_black(), 0);
+    lv_obj_set_style_radius(panel, UiSx(8), 0);
+    lv_obj_set_style_pad_all(panel, kPanelPad, 0);
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(panel, kPanelRowGap, 0);
@@ -182,8 +187,8 @@ static void BuildUi(const char* current_ver, const char* new_ver) {
     lv_obj_t* cur_lbl = lv_label_create(panel);
     std::snprintf(line, sizeof(line), Lang::Strings::OTA_CUR_VER_FMT, current_ver);
     lv_label_set_text(cur_lbl, line);
-    lv_obj_set_width(cur_lbl, LV_HOR_RES - kLabelMargin);
-    lv_label_set_long_mode(cur_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(cur_lbl, lv_pct(100));
+    lv_label_set_long_mode(cur_lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(cur_lbl, font, 0);
     lv_obj_set_style_text_color(cur_lbl, lv_color_black(), 0);
     lv_obj_set_style_text_align(cur_lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -194,20 +199,16 @@ static void BuildUi(const char* current_ver, const char* new_ver) {
         lv_obj_t* new_lbl = lv_label_create(panel);
         std::snprintf(line, sizeof(line), Lang::Strings::OTA_NEW_VER_FMT, new_ver);
         lv_label_set_text(new_lbl, line);
-        lv_obj_set_width(new_lbl, LV_HOR_RES - kLabelMargin);
-        lv_label_set_long_mode(new_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(new_lbl, lv_pct(100));
+        lv_label_set_long_mode(new_lbl, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_font(new_lbl, font, 0);
         lv_obj_set_style_text_color(new_lbl, lv_color_black(), 0);
         lv_obj_set_style_text_align(new_lbl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_clear_flag(new_lbl, LV_OBJ_FLAG_CLICKABLE);
     }
 
-    lv_coord_t bar_w = kBarW;
-    if (bar_w > LV_HOR_RES - kLabelMargin) {
-        bar_w = LV_HOR_RES - kLabelMargin;
-    }
     lv_obj_t* bar = lv_bar_create(panel);
-    lv_obj_set_size(bar, bar_w, kBarH);
+    lv_obj_set_size(bar, lv_pct(100), kBarH);
     lv_bar_set_range(bar, 0, 100);
     lv_bar_set_mode(bar, LV_BAR_MODE_NORMAL);
     lv_bar_set_value(bar, 0, LV_ANIM_OFF);
@@ -231,8 +232,8 @@ static void BuildUi(const char* current_ver, const char* new_ver) {
 
     lv_obj_t* hint = lv_label_create(panel);
     lv_label_set_text(hint, Lang::Strings::OTA_HINT);
-    lv_obj_set_width(hint, LV_HOR_RES - 64);
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(hint, lv_pct(100));
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(hint, font, 0);
     lv_obj_set_style_text_color(hint, lv_color_black(), 0);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
@@ -251,16 +252,17 @@ static bool LvAsyncCallLocked(lv_async_cb_t cb, void* user_data) {
     if (cb == nullptr) {
         return false;
     }
-    if (!esp_lv_adapter_is_initialized()) {
+    auto* adapter = LvAdapterEpdiy::Instance();
+    if (adapter == nullptr || !adapter->IsReady()) {
         ESP_LOGW(TAG, "adapter not ready");
         return false;
     }
-    if (esp_lv_adapter_lock(-1) != ESP_OK) {
+    if (!adapter->LockUi(-1)) {
         ESP_LOGW(TAG, "adapter lock failed");
         return false;
     }
     const bool ok = (lv_async_call(cb, user_data) == LV_RESULT_OK);
-    esp_lv_adapter_unlock();
+    adapter->UnlockUi();
     if (!ok) {
         ESP_LOGW(TAG, "lv_async_call failed");
     }
@@ -387,9 +389,7 @@ void OtaUpgradeScreen::SetProgress(int percent) {
 
     const int64_t now_us = esp_timer_get_time();
     const int64_t last_us = s_last_prog_ui_us.load(std::memory_order_relaxed);
-    const int shown = s_shown_percent;
-    const bool force = (percent <= 0) || (percent >= 100) || (shown >= 0 && (percent - shown) >= 5) ||
-                       (shown < 0);
+    const bool force = (percent <= 0) || (percent >= 100);
     if (!force && last_us != 0 && (now_us - last_us) < kProgUiIntervalUs) {
         return;
     }

@@ -4,6 +4,10 @@
 #include <cstring>
 
 #include <esp_log.h>
+#ifndef EBOOK_EMULATOR
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 
 #include "html_content.h"
 #include "image_stream.h"
@@ -169,12 +173,16 @@ void EpubDocument::Close() {
 }
 
 bool EpubDocument::Open(const char* path) {
+    error_ = BookReadError::kInvalidData;
     Close();
-    if (path == nullptr || !zip_.Open(path)) {
+    if (path == nullptr) return false;
+    if (!zip_.Open(path)) {
+        error_ = zip_.Error();
         return false;
     }
     path_ = path;
     if (!ParseContainer()) {
+        if (zip_.Error() != BookReadError::kNone) error_ = zip_.Error();
         Close();
         return false;
     }
@@ -363,22 +371,28 @@ bool EpubDocument::DecodeCoverImageToL8(int max_w, int max_h, RasterImage& out,
     return DecodeItemImageToL8(cover_href_.c_str(), max_w, max_h, out, abort);
 }
 
-bool EpubDocument::LoadChapterBlocks(int spine_index, std::vector<ContentBlock>& out, size_t max_html_bytes) {
-    out.clear();
-    const EpubSpineItem* item = SpineItem(spine_index);
-    if (item == nullptr) {
-        return false;
+bool EpubDocument::StreamChapterBlocks(int spine_index, const ContentBlockSink& sink) {
+    error_ = BookReadError::kInvalidData;
+    const auto* item = SpineItem(spine_index);
+    if (!item) return false;
+    if (!zip_.OpenEntryStream(item->href.c_str())) { error_ = zip_.Error(); return false; }
+    struct StreamGuard { ZipReader& zip; ~StreamGuard() { zip.CloseEntryStream(); } } guard{zip_};
+    HtmlBlockParser parser(DirOf(item->href), sink);
+    uint8_t bytes[2048];
+    uint64_t total = 0;
+    while (!zip_.EntryStreamEof() && !zip_.EntryStreamError()) {
+        const size_t got = zip_.EntryStreamRead(bytes, sizeof(bytes));
+        total += got;
+#ifndef EBOOK_EMULATOR
+        if ((total & 16383) == 0) vTaskDelay(1);
+#endif
+        if (total > zip_.EntryStreamUncompSize() || !parser.Feed(bytes, got)) return false;
+        if (got == 0 && !zip_.EntryStreamEof()) return false;
     }
-    std::vector<uint8_t> bytes;
-    if (!zip_.ReadEntry(item->href.c_str(), bytes, max_html_bytes)) {
-        ESP_LOGW(TAG, "chapter read fail %s", item->href.c_str());
-        return false;
-    }
-    // 确保以 '\0' 结尾的安全字符串
-    std::string html = BytesToString(bytes);
-    const std::string base = DirOf(item->href);
-    HtmlToBlocks(html, base, out);
-    return !out.empty();
+    if (zip_.EntryStreamError()) { error_ = zip_.Error(); return false; }
+    if (total != zip_.EntryStreamUncompSize() || !parser.Finish()) return false;
+    error_ = BookReadError::kNone;
+    return true;
 }
 
 }  // namespace reader

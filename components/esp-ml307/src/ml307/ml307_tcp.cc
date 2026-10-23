@@ -115,7 +115,7 @@ bool Ml307Tcp::Connect(const std::string& host, int port) {
     // 等待连接完成
     bits = xEventGroupWaitBits(event_group_handle_, ML307_TCP_CONNECTED | ML307_TCP_ERROR, pdTRUE, pdFALSE, TCP_CONNECT_TIMEOUT_MS / portTICK_PERIOD_MS);
     if (bits & ML307_TCP_ERROR) {
-        ESP_LOGE(TAG, "Failed to connect to %s:%d", host.c_str(), port);
+
         return false;
     }
     return true;

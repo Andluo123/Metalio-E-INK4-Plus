@@ -5,7 +5,7 @@
 #include "power_i2c.h"
 #include "sc7a20h.h"
 
-#include <driver/i2c.h>
+#include <driver/i2c_master.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -20,6 +20,7 @@ power_i2c_t MakeBus() {
         .port = EPDIY_I2C_PORT,
         .lock = metalio_i2c1_lock,
         .unlock = metalio_i2c1_unlock,
+        .device = metalio_i2c1_device_locked,
     };
     return bus;
 }

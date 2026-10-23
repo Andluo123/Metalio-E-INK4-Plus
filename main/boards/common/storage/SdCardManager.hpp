@@ -23,7 +23,7 @@ public:
     /** @brief 挂载 FAT 到 SD_MOUNT_POINT（可重复调用） */
     bool Mount();
     /** @brief 卸载 VFS；若持有 raw card 一并释放 */
-    void Unmount();
+    bool Unmount();
 
     /**
      * @brief 卸 VFS 后重新 sdmmc_card_init，供 TinyUSB MSC 使用
@@ -51,8 +51,12 @@ private:
     static void CallHostDeinit(const sdmmc_host_t* host);
     static sdmmc_slot_config_t MakeSlotConfig();
     static void PreparePinsForMount();
+    static bool CheckDmaBuffer(int slot, const void* buffer, size_t size);
+    bool PrepareDmaBuffer(sdmmc_host_t& host);
+    void ReleaseDmaBuffer();
 
     sdmmc_card_t* card_ = nullptr;
     bool mounted_ = false;
     bool raw_owned_ = false;
+    void* dma_buffer_ = nullptr; // 随卡生命周期复用的对齐传输缓冲
 };

@@ -1,4 +1,5 @@
 #include "epd_display.h"
+#include "waveforms/my_waveform.h"
 
 const EpdDisplay_t ED060SCT = {
     .width = 1448,
@@ -69,6 +70,17 @@ const EpdDisplay_t ED047TC2_1216 = {
     .bus_width = 8,
     .bus_speed = 20,
     .default_waveform = &epdiy_ED047TC2,
+    .display_type = DISPLAY_TYPE_GENERIC,
+};
+
+// E0470A14-AF rev A: 34-pin, 8-bit source bus; use landscape buffer order.
+// MY_WAVEFORM remains an experimental table until the factory LUT is supplied.
+const EpdDisplay_t E0470A14_AF = {
+    .width = 1216,
+    .height = 684,
+    .bus_width = 8,
+    .bus_speed = 20,
+    .default_waveform = &MY_WAVEFORM,
     .display_type = DISPLAY_TYPE_GENERIC,
 };
 

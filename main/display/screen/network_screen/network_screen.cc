@@ -53,7 +53,10 @@ void Network_OpenStatusOverlay(const char* msg) {
 
     lv_obj_t* card = lv_obj_create(mask);
     Network_Strip(card);
-    lv_obj_set_size(card, LV_HOR_RES - kOverlayCardMargin, kOverlayCardH);
+    lv_obj_set_size(card, LV_HOR_RES - kOverlayCardMargin, LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(card, kOverlayCardMinH, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -69,7 +72,6 @@ void Network_OpenStatusOverlay(const char* msg) {
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(lbl, fontpack_lv_font_ui(), 0);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(lbl);
 }
 
 void Network_SetStatusOverlayText(const char* msg) {
@@ -129,7 +131,7 @@ void Network_OnScreenUnload(lv_event_t* /*e*/) {
     Network_CloseStatusOverlay();
     Network_WifiTeardownForScreen();
     Network_ReleaseUiKeepNet();
-    for (int i = 0; i < kKbRows * kKbCols; ++i) {
+    for (int i = 0; i < kKbKeysCap; ++i) {
         Network_State().kb_keys[i] = nullptr;
     }
     Network_State().ui = {};
@@ -321,7 +323,6 @@ lv_obj_t* NetworkScreen::Create() {
     lv_obj_t* scr = lv_obj_create(nullptr);
     Network_State().ui.screen = scr;
     Network_Strip(scr);
-    lv_obj_set_size(scr, LV_HOR_RES, LV_VER_RES);
     lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_add_event_cb(scr, Network_OnScreenUnload, LV_EVENT_SCREEN_UNLOADED, nullptr);

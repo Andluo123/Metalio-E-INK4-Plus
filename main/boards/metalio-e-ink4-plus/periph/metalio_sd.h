@@ -20,7 +20,7 @@ bool MetalioSd_Ok(void);
 /**
  * @brief 卸载 SD 并将 CLK/CMD/D0..D3 推挽置低
  */
-void MetalioSd_HoldPinsLow(void);
+bool MetalioSd_HoldPinsLow(void);
 
 /**
  * @brief 入睡前锁存 SD 脚低电平（须先 HoldPinsLow）

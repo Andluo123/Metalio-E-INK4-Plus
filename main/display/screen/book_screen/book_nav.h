@@ -18,6 +18,8 @@ bool ReaderWorkersBusy();
 void WarnReaderWorkersBusy(const char* where);
 /** @brief 与进百问同源：open_token 失效 worker 回调；opening 时 deferred_cleanup，避免 UAF/泄漏 */
 void ReleaseReaderSessionForLeave();
+/** @brief 系统回首页前清理仍存活的阅读屏（LVGL 任务） */
+void ReleaseReaderForSystemHome();
 /** @brief 从目录/设置等返回已有正文屏 */
 lv_obj_t* ResumeReaderScreen();
 /** @brief 从正文请求打开百问 */
@@ -27,7 +29,7 @@ bool BookLvAsync(void (*cb)(void*), void* user_data = nullptr);
 /** @brief 注册书库相关异步刷屏入口 */
 void EnsureBookPaintFns();
 /** @brief 页码已同步改完后调用：序号合并，积压回调跳过已画过的序号。 */
-void RequestRenderBookshelfPage();
+void RequestRenderBookshelfPage(bool screen_change = false);
 /** @brief 上屏经 ScreenPaintCoalesce：有 pending 则等交完，连点跳到最终页再画 */
 void RequestRenderReaderPage();
 /** @brief 请求重绘目录列表 */

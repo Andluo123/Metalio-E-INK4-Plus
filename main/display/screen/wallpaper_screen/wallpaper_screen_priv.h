@@ -50,8 +50,6 @@ constexpr int kMaxItems = 64;
 // 预览和缩略使用 L8；不要直接用全屏 I1，容易出现白底。
 constexpr int kPreviewMaxW = UiSx(280);
 constexpr int kPreviewMaxH = UiSy(420);
-constexpr int kSaveDecodeMaxW = DISPLAY_WIDTH;
-constexpr int kSaveDecodeMaxH = DISPLAY_HEIGHT;
 constexpr uint32_t kSaveStack = 12 * 1024;
 
 /** @brief 边框内可用边长 */
@@ -106,11 +104,13 @@ struct WallpaperUiState {
         lv_obj_t* dialog_mask = nullptr;
     } ui;
 
-    bool screen_alive = false;
+    std::atomic<bool> screen_alive{false};
     bool sd_ready = false;
     UiMode mode = UiMode::kList;
     // 每次 Create / DELETE 递增，异步回调会带 epoch，避免过期结果访问 UAF。
-    uint32_t epoch = 0;
+    std::atomic<uint32_t> epoch{0};
+    std::atomic<uint32_t> decode_generation{0}; // 返回或待机时作废在途图片解码
+    std::atomic<bool> decode_paused{false}; // 待机时禁止加载图片
     std::string shutdown_name;
     std::string standby_name;
     ScreenPaintCoalesce wp_check_paint{};
@@ -169,3 +169,10 @@ bool Wallpaper_OnVkKeyLongPress(const char* key);
 bool Wallpaper_OnVkKeyPressUp(const char* key);
 /** @brief 壁纸页删除事件 */
 void Wallpaper_OnScreenDeleted(lv_event_t* e);
+
+struct WallpaperDecodeToken {
+    uint32_t epoch; // 页面生命周期
+    uint32_t generation; // 解码生命周期
+};
+/** @brief 检查壁纸解码是否因离页、返回或待机而取消 */
+bool Wallpaper_DecodeCancelled(void* context);

@@ -28,6 +28,7 @@ constexpr lv_coord_t kCalendarGap = UiSx(12);
 constexpr uint32_t kClockTickMs = 1000;
 
 constexpr lv_coord_t kSlashSidePad = UiSx(28);
+constexpr lv_coord_t kSlashPadTop = UiSy(44);
 constexpr lv_coord_t kSlashTimeDateGap = UiSx(20);
 constexpr lv_coord_t kSlashDateRuleW = UiSx(64);
 constexpr lv_coord_t kSlashDateRuleH = UiSy(3);
@@ -46,6 +47,7 @@ struct HomeHeroUiState {
     lv_obj_t* time_lbl = nullptr;
     lv_obj_t* hour_lbl = nullptr;
     lv_obj_t* minute_lbl = nullptr;
+    lv_obj_t* slash_gap = nullptr;
     lv_obj_t* date_lbl = nullptr;
     lv_obj_t* lunar_lbl = nullptr;
     lv_obj_t* weekday_lbl = nullptr;

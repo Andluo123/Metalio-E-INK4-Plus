@@ -12,6 +12,9 @@ std::string Wallpaper_GetActiveFilename();
 /** @brief 当前启用的待机壁纸名；未 hydrate 或文件缺失时返回空。 */
 std::string Wallpaper_GetStandbyFilename();
 
+/** @brief 是否配置待机壁纸；SD 尚未挂载时保留选择，挂载后由 hydrate 校验。 */
+bool Wallpaper_HasStandbySelection();
+
 /** @brief 是否为关机壁纸文件名 */
 bool Wallpaper_IsActiveFilename(const char* filename);
 /** @brief 是否为待机壁纸文件名 */

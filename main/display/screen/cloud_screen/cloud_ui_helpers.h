@@ -30,12 +30,12 @@ void CancelStatusClearTimer();
 void ApplyStatusTipUi();
 /** @brief 设置状态提示文案 */
 void SetStatusTip(const char* text, bool auto_clear);
-/** @brief 资源是否属于当前 Tab */
-bool ItemMatchesTab(const reader::CloudPushResource& item, int tab);
-/** @brief 按 Tab 重建过滤列表 */
+/** @brief 按全部待收重建列表 */
 void RebuildFiltered();
 /** @brief 刷新分区标题 */
 void RefreshSectionTitle();
+/** @brief 刷新 APP 推送框内的类型筛选 */
+void RefreshFilterUi();
 /** @brief Tab 按钮样式 */
 void StyleTabBtn(lv_obj_t* btn, lv_obj_t* lbl, bool on);
 /** @brief 刷新 Tab 选中态 */

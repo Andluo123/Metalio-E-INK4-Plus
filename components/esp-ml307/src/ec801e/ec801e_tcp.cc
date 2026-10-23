@@ -101,7 +101,7 @@ bool Ec801ETcp::Connect(const std::string& host, int port) {
     // 等待连接完成
     auto bits = xEventGroupWaitBits(event_group_handle_, EC801E_TCP_CONNECTED | EC801E_TCP_ERROR, pdTRUE, pdFALSE, TCP_CONNECT_TIMEOUT_MS / portTICK_PERIOD_MS);
     if (bits & EC801E_TCP_ERROR) {
-        ESP_LOGE(TAG, "Failed to connect to %s:%d", host.c_str(), port);
+
         return false;
     }
     return true;

@@ -71,7 +71,7 @@ bool WallpaperPageRepeatStep(int page_delta) {
         return false;
     }
     Wallpaper_State().list.list_page = next;
-    RequestWallpaperListRebuild();
+    RequestWallpaperListRebuild(true);
     return page_delta < 0 ? Wallpaper_State().list.list_page > 0 : Wallpaper_State().list.list_page < last;
 }
 
@@ -120,7 +120,7 @@ bool Wallpaper_OnVkKey(const char* key) {
         if (Wallpaper_State().list.list_page > 0) {
             --Wallpaper_State().list.list_page;
             ESP_LOGI(TAG, "vk_prev list -> page %d queue rebuild", Wallpaper_State().list.list_page + 1);
-            RequestWallpaperListRebuild();
+            RequestWallpaperListRebuild(true);
             return true;
         }
         // 第一页：多选中则退出批量，否则交给默认返回上一屏
@@ -134,7 +134,7 @@ bool Wallpaper_OnVkKey(const char* key) {
         if (Wallpaper_State().list.list_page + 1 < Wallpaper_ListPageCount()) {
             ++Wallpaper_State().list.list_page;
             ESP_LOGI(TAG, "vk_next list -> page %d queue rebuild", Wallpaper_State().list.list_page + 1);
-            RequestWallpaperListRebuild();
+            RequestWallpaperListRebuild(true);
         } else {
             ESP_LOGI(TAG, "vk_next list already last page=%d", Wallpaper_State().list.list_page + 1);
         }
@@ -149,6 +149,7 @@ void Wallpaper_OnScreenDeleted(lv_event_t* e) {
     }
     Wallpaper_State().screen_alive = false;
     ++Wallpaper_State().epoch;  // 作废在飞 preview/thumb/enable/delete/save 回调
+    CancelThumbFill();
     // 先拆掉引用 RasterImage 的控件；缩略图缓存在进程内复用，下次进 app 免白屏
     DetachRasterUsers();
     ClearPreviewImage();
@@ -171,6 +172,7 @@ lv_obj_t* WallpaperScreen::Create() {
     // 旧屏可能仍在 async delete：先拆引用，递增 epoch 丢弃在飞任务；缩略图按文件复用
     Wallpaper_State().screen_alive = false;
     ++Wallpaper_State().epoch;
+    CancelThumbFill();
     DetachRasterUsers();
     ClearPreviewImage();
     Wallpaper_State().ui = {};
@@ -205,7 +207,6 @@ lv_obj_t* WallpaperScreen::Create() {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, Wallpaper_UiFont(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    Wallpaper_DisableScroll(scr);
     Wallpaper_State().ui.screen = scr;
     lv_obj_add_event_cb(scr, Wallpaper_OnScreenDeleted, LV_EVENT_DELETE, nullptr);
 
@@ -235,6 +236,7 @@ lv_obj_t* WallpaperScreen::Create() {
     BuildPreviewBody(scr, status.height);
     BuildFooter(scr);
 
+    Wallpaper_State().decode_paused.store(false);
     Wallpaper_State().screen_alive = true;
     RebuildListPage();
     ShowMode(UiMode::kList);
@@ -245,4 +247,27 @@ lv_obj_t* WallpaperScreen::Create() {
                        VkKeyScreenDesc{WallpaperScreen::Create, Wallpaper_OnVkKey, nullptr, nullptr, nullptr,
                                        nullptr, Wallpaper_OnVkKeyLongPress, Wallpaper_OnVkKeyPressUp});
     return scr;
+}
+
+bool Wallpaper_DecodeCancelled(void* context) {
+    const auto* token = static_cast<const WallpaperDecodeToken*>(context);
+    auto& state = Wallpaper_State();
+    return !state.screen_alive.load() || state.decode_paused.load() ||
+        token->epoch != state.epoch.load() || token->generation != state.decode_generation.load();
+}
+
+void WallpaperScreen::SetDecodePaused(bool paused) {
+    auto& state = Wallpaper_State();
+    state.decode_paused.store(paused);
+    if (!state.screen_alive.load()) return;
+    if (paused) {
+        state.decode_generation.fetch_add(1);
+        CancelThumbFill();
+    } else if (state.mode == UiMode::kPreview) {
+        UpdateEnableButtonUi();
+        UpdateAdjustUi();
+        if (state.preview.raster == nullptr) ScheduleLoadPreview(state.preview.idx);
+    } else {
+        ScheduleThumbFill();
+    }
 }

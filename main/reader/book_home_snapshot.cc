@@ -4,6 +4,10 @@
 #include "settings.h"
 
 #include <atomic>
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <ctime>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +17,7 @@
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <nvs.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/idf_additions.h>
 #include <freertos/task.h>
@@ -42,6 +47,21 @@ bool s_recent_dirty = false;
 bool s_agg_dirty = false;
 std::string s_recent_rel[kRecentMax];
 AggregateStats s_agg;
+struct DayRecord { uint32_t date = 0, seconds = 0; };
+std::array<DayRecord, 14> s_days{};
+uint32_t s_undated_seconds = 0;
+std::atomic<bool> s_persist_days_pending{false};
+
+void AddDayLocked(uint32_t date, uint32_t seconds) {
+    if (date < 20250101 || date > 20991231 || seconds == 0) return;
+    auto slot = std::find_if(s_days.begin(), s_days.end(), [date](const DayRecord& r) { return r.date == date; });
+    if (slot == s_days.end()) {
+        slot = std::min_element(s_days.begin(), s_days.end(), [](const DayRecord& a, const DayRecord& b) { return a.date < b.date; });
+        if (slot->date > date) return;
+        *slot = {date, 0};
+    }
+    slot->seconds = UINT32_MAX - slot->seconds < seconds ? UINT32_MAX : slot->seconds + seconds;
+}
 
 std::atomic<bool> s_persist_recent_pending{false};
 std::atomic<bool> s_persist_agg_pending{false};
@@ -175,10 +195,33 @@ void PersistAggNow() {
     settings.SetInt(kKeyHsOk, snap.valid ? 1 : 0);
 }
 
+bool PersistDaysNow() {
+    std::string value = "1;";
+    {
+        std::lock_guard<std::mutex> lock(s_mu);
+        value += "0:" + std::to_string(s_undated_seconds) + ";";
+        for (const auto& day : s_days) {
+            if (!day.date) continue;
+            char entry[40];
+            std::snprintf(entry, sizeof(entry), "%u:%u;", static_cast<unsigned>(day.date), static_cast<unsigned>(day.seconds));
+            value += entry;
+        }
+    }
+    nvs_handle_t handle;
+    esp_err_t error = nvs_open(kNvsNs, NVS_READWRITE, &handle);
+    if (error != ESP_OK) return false;
+    error = nvs_set_str(handle, "hs_days", value.c_str());
+    if (error == ESP_OK) error = nvs_commit(handle);
+    nvs_close(handle);
+    return error == ESP_OK;
+}
+
 void PersistTask(void* /*arg*/) {
+    HydrateFromNvs(); // merge persisted days before any pending early-boot deltas are written
     // 单任务排空 pending：写完再看一眼，避免「退出窗口」丢尾写；禁止在持 s_mu 时开 NVS
     for (;;) {
         const bool do_recent = s_persist_recent_pending.exchange(false, std::memory_order_acq_rel);
+        const bool do_days = s_persist_days_pending.exchange(false, std::memory_order_acq_rel);
         const bool do_agg = s_persist_agg_pending.exchange(false, std::memory_order_acq_rel);
         if (do_recent) {
             PersistRecentNow();
@@ -188,11 +231,20 @@ void PersistTask(void* /*arg*/) {
             PersistAggNow();
             ESP_LOGI(TAG, "nvs aggregate flushed");
         }
-        if (!do_recent && !do_agg) {
+        if (do_days && !PersistDaysNow()) {
+            // Keep the request for the next existing checkpoint/save; do not spin on Flash failure.
+            s_persist_days_pending.store(true, std::memory_order_release);
+            s_persist_task_running.store(false, std::memory_order_release);
+            ESP_LOGW(TAG, "daily history save failed; pending kept for next save");
+            vTaskDeleteWithCaps(nullptr);
+            return;
+        }
+        if (!do_recent && !do_agg && !do_days) {
             // 先清 running，再二次确认 pending（与 SchedulePersist 的 CAS 对齐）
             s_persist_task_running.store(false, std::memory_order_release);
             if (s_persist_recent_pending.load(std::memory_order_acquire) ||
-                s_persist_agg_pending.load(std::memory_order_acquire)) {
+                s_persist_agg_pending.load(std::memory_order_acquire) ||
+                s_persist_days_pending.load(std::memory_order_acquire)) {
                 bool expected = false;
                 if (s_persist_task_running.compare_exchange_strong(expected, true,
                                                                    std::memory_order_acq_rel)) {
@@ -202,10 +254,11 @@ void PersistTask(void* /*arg*/) {
             break;
         }
     }
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
-void SchedulePersist(bool recent, bool agg) {
+void SchedulePersist(bool recent, bool agg, bool days = false) {
+    if (days) s_persist_days_pending.store(true, std::memory_order_release);
     if (recent) {
         s_persist_recent_pending.store(true, std::memory_order_release);
     }
@@ -254,6 +307,20 @@ void HydrateLocked() {
             const int fin = settings.GetInt(kKeyHsFin, 0);
             s_agg.finished_count = fin < 0 ? 0 : fin;
             s_agg.valid = true;
+        }
+    }
+    const std::string days = settings.GetString("hs_days", "");
+    if (days.compare(0, 2, "1;") == 0) {
+        size_t offset = 2;
+        for (size_t n = 0; n < s_days.size() + 1 && offset < days.size(); ++n) {
+            unsigned date = 0, seconds = 0; int used = 0;
+            if (std::sscanf(days.c_str() + offset, "%u:%u;%n", &date, &seconds, &used) != 2 || used <= 0) break;
+            if (date == 0) {
+                s_undated_seconds = UINT32_MAX - s_undated_seconds < seconds ? UINT32_MAX : s_undated_seconds + seconds;
+            } else {
+                AddDayLocked(date, seconds); // pre-hydration records are increments, not replacements
+            }
+            offset += static_cast<size_t>(used);
         }
     }
     s_hydrated = true;
@@ -377,6 +444,14 @@ void SubtractAggregateContribution(uint32_t reading_seconds, bool finished) {
     }
 }
 
+std::string LoadLatestAbsPath() {
+    std::lock_guard<std::mutex> lock(s_mu);
+    for (const auto& rel : s_recent_rel) {
+        if (!rel.empty()) return RelToAbs(rel);
+    }
+    return {};
+}
+
 size_t LoadRecentAbsPaths(std::vector<std::string>& out) {
     out.clear();
 
@@ -446,6 +521,55 @@ void StoreAggregateStats(uint32_t total_seconds, int finished_count) {
     }
     // 开机 sync 在 DRAM 栈：可同步写；统一走异步亦安全
     SchedulePersist(false, true);
+}
+
+void AddDailyReadingSeconds(uint32_t date, uint32_t seconds) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(s_mu);
+        if (date == 0) {
+            s_undated_seconds = UINT32_MAX - s_undated_seconds < seconds ? UINT32_MAX : s_undated_seconds + seconds;
+            changed = seconds != 0;
+        } else if (date >= 20250101 && date <= 20991231) {
+            // Date recovery assigns the saved undated interval once, never losing offline time.
+            AddDayLocked(date, s_undated_seconds);
+            changed = s_undated_seconds != 0 || seconds != 0;
+            s_undated_seconds = 0;
+            AddDayLocked(date, seconds);
+        }
+    }
+    if (changed) SchedulePersist(false, false, true);
+}
+
+WeekStats LoadWeekStats() {
+    WeekStats result;
+    const time_t now = time(nullptr);
+    tm local{};
+    if (now == static_cast<time_t>(-1) || !localtime_r(&now, &local) ||
+        local.tm_year < 125 || local.tm_year > 199) {
+        std::lock_guard<std::mutex> lock(s_mu);
+        result.undated_seconds = s_undated_seconds;
+        return result;
+    }
+    const uint32_t today = (local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday;
+    AddDailyReadingSeconds(today, 0);
+    local.tm_hour = 12; local.tm_min = 0; local.tm_sec = 0;
+    local.tm_mday -= (local.tm_wday + 6) % 7;
+    for (int i = 0; i < 7; ++i) {
+        local.tm_isdst = -1;
+        if (mktime(&local) == static_cast<time_t>(-1)) return {};
+        result.dates[i] = (local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday;
+        ++local.tm_mday;
+    }
+    std::lock_guard<std::mutex> lock(s_mu);
+    result.valid = s_hydrated;
+    for (int i = 0; i < 7; ++i) {
+        for (const auto& day : s_days) {
+            if (day.date == result.dates[i]) result.seconds[i] = day.seconds;
+        }
+        result.total_seconds += result.seconds[i];
+    }
+    return result;
 }
 
 uint32_t MutationEpoch() {

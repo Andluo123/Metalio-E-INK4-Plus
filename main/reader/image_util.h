@@ -5,18 +5,20 @@
 #include <vector>
 
 #include "reader_types.h"
+#include "jpeg/progressive_jpeg.h"
 
 namespace reader {
 
-// 将 PNG/JPEG 内存图解码并缩放到 max_w/max_h，输出 L8（Bayer 抖动，适配 I1 墨水屏）。
-bool DecodeImageToL8(const uint8_t* data, size_t len, int max_w, int max_h, RasterImage& out);
+/** @brief 解码图片为 L8；max_w、max_h 均为 0 时保留原始尺寸，支持取消回调 */
+bool DecodeImageToL8(const uint8_t* data, size_t len, int max_w, int max_h, RasterImage& out,
+                     ImageDecodeCancelled cancelled = nullptr, void* context = nullptr);
 
-// 从文件路径解码（TXT 旁路插图、书库 .a2i1 封面等）。
-bool DecodeImageFileToL8(const char* path, int max_w, int max_h, RasterImage& out);
+/** @brief 从文件解码为 L8；max_w、max_h 均为 0 时保留原始尺寸，支持取消回调 */
+bool DecodeImageFileToL8(const char* path, int max_w, int max_h, RasterImage& out,
+                     ImageDecodeCancelled cancelled = nullptr, void* context = nullptr);
 
-/** @brief 窥探 A2I1 宽高（文件或内存）；失败返回 false */
+/** @brief 窥探旧 A2I1 缓冲宽高；失败返回 false */
 bool PeekA2i1Size(const uint8_t* data, size_t len, int* w, int* h);
-bool PeekA2i1FileSize(const char* path, int* w, int* h);
 
 /** @brief 将已有 L8 缩小贴入 max 框（不放大）；src/out 可同对象 */
 bool ScaleRasterToFit(const RasterImage& src, int max_w, int max_h, RasterImage& out);
@@ -24,11 +26,13 @@ bool ScaleRasterToFit(const RasterImage& src, int max_w, int max_h, RasterImage&
 // A2I1 文件/缓冲校验（与 tools/a2i1、a2ui 布局一致）。
 bool ValidateA2i1Bytes(const uint8_t* data, size_t len);
 
-// L8（0=黑 255=白）编码为 A2I1 文件字节。
-bool EncodeL8ToA2i1(const RasterImage& l8, std::vector<uint8_t>& out);
-
 // 原子写文件：path.tmp → fflush → unlink(path) → rename；写失败清 .tmp；
 // rename 失败保留 .tmp（勿删），便于调用方回退读取。
 bool WriteFileAtomic(const char* path, const uint8_t* data, size_t len);
 
+// Gray content envelope, compatible with the existing A2UI A2L8 payload.
+bool ValidateA2l8Bytes(const uint8_t* data, size_t len);
+bool EncodeL8ToA2l8(const RasterImage& image, std::vector<uint8_t>& out);
+bool PeekRasterSize(const uint8_t* data, size_t len, int* width, int* height);
+bool PeekRasterFileSize(const char* path, int* width, int* height);
 }  // namespace reader

@@ -1,6 +1,7 @@
 #include "pcf8563.h"
 
 #include <sys/time.h>
+#include <cerrno>
 #include <esp_log.h>
 
 #define TAG "Pcf8563"
@@ -44,6 +45,10 @@ bool Pcf8563::Begin(const power_i2c_t* bus, uint8_t addr) {
 
     ready_ = true;
 
+    uint8_t initial_ctrl[2] = {};
+    if (ReadRegs(kRegCtrl1, initial_ctrl, sizeof(initial_ctrl))) {
+        ESP_LOGI(TAG, "boot CTRL1=0x%02X CTRL2=0x%02X STOP=%d", initial_ctrl[0], initial_ctrl[1], (initial_ctrl[0] & 0x20) != 0);
+    }
     // 清 STOP，保证振荡器运行
     uint8_t ctrl1 = 0x00;
     if (!WriteRegs(kRegCtrl1, &ctrl1, 1)) {
@@ -66,14 +71,18 @@ bool Pcf8563::WriteRegs(uint8_t reg, const uint8_t* data, size_t len) {
     if (!ready_ || !bus_valid_ || data == nullptr || len == 0 || len > 16) {
         return false;
     }
-    return power_i2c_write_reg(&bus_, addr_, reg, data, len, kI2cTimeoutMs) == ESP_OK;
+    const esp_err_t err = power_i2c_write_reg(&bus_, addr_, reg, data, len, kI2cTimeoutMs);
+    if (err != ESP_OK) ESP_LOGW(TAG, "RTC write addr=0x%02X reg=0x%02X len=%u failed: %s", addr_, reg, static_cast<unsigned>(len), esp_err_to_name(err));
+    return err == ESP_OK;
 }
 
 bool Pcf8563::ReadRegs(uint8_t reg, uint8_t* data, size_t len) {
     if (!ready_ || !bus_valid_ || data == nullptr || len == 0) {
         return false;
     }
-    return power_i2c_write_read(&bus_, addr_, reg, data, len, kI2cTimeoutMs) == ESP_OK;
+    const esp_err_t err = power_i2c_write_read(&bus_, addr_, reg, data, len, kI2cTimeoutMs);
+    if (err != ESP_OK) ESP_LOGW(TAG, "RTC read addr=0x%02X reg=0x%02X len=%u failed: %s", addr_, reg, static_cast<unsigned>(len), esp_err_to_name(err));
+    return err == ESP_OK;
 }
 
 bool Pcf8563::GetTime(struct tm& out, bool* valid) {
@@ -128,12 +137,14 @@ bool Pcf8563::ApplyRtcToSystem() {
     struct tm rtc_tm = {};
     bool valid = false;
     if (!GetTime(rtc_tm, &valid)) {
+        ESP_LOGW(TAG, "RTC -> system failed at calendar read (ready=%d bus=%d)", ready_, bus_valid_);
         return false;
     }
     if (!valid) {
         ESP_LOGW(TAG, "RTC VL set, skip ApplyRtcToSystem (time untrusted)");
         return false;
     }
+    ESP_LOGI(TAG, "RTC -> system candidate %04d-%02d-%02d %02d:%02d:%02d wday=%d", rtc_tm.tm_year+1900, rtc_tm.tm_mon+1, rtc_tm.tm_mday, rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec, rtc_tm.tm_wday);
     // 粗检：避免把损坏寄存器灌进系统
     if (rtc_tm.tm_mon < 0 || rtc_tm.tm_mon > 11 || rtc_tm.tm_mday < 1 || rtc_tm.tm_mday > 31 ||
         rtc_tm.tm_hour > 23 || rtc_tm.tm_min > 59 || rtc_tm.tm_sec > 59) {
@@ -143,7 +154,7 @@ bool Pcf8563::ApplyRtcToSystem() {
 
     time_t ts = mktime(&rtc_tm);
     if (ts < 0) {
-        ESP_LOGW(TAG, "mktime failed");
+        ESP_LOGW(TAG, "RTC -> system mktime failed errno=%d", errno);
         return false;
     }
 
@@ -152,9 +163,10 @@ bool Pcf8563::ApplyRtcToSystem() {
         .tv_usec = 0,
     };
     if (settimeofday(&tv, nullptr) != 0) {
-        ESP_LOGW(TAG, "settimeofday failed");
+        ESP_LOGW(TAG, "RTC -> system settimeofday failed errno=%d epoch=%lld", errno, static_cast<long long>(ts));
         return false;
     }
+    ESP_LOGI(TAG, "RTC apply readback epoch=%lld expected=%lld", static_cast<long long>(time(nullptr)), static_cast<long long>(ts));
     ESP_LOGI(TAG, "system time <- RTC %04d-%02d-%02d %02d:%02d:%02d", rtc_tm.tm_year + 1900,
              rtc_tm.tm_mon + 1, rtc_tm.tm_mday, rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
     return true;
@@ -167,6 +179,7 @@ bool Pcf8563::SyncSystemToRtc() {
         return false;
     }
     if (!SetTime(local)) {
+        ESP_LOGW(TAG, "system -> RTC calendar write failed (ready=%d)", ready_);
         return false;
     }
     ESP_LOGI(TAG, "RTC <- system %04d-%02d-%02d %02d:%02d:%02d", local.tm_year + 1900,

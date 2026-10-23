@@ -1,6 +1,8 @@
 #include "esp_tcp.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
+#include <algorithm>
 #include <unistd.h>
 #include <cstring>
 #include <arpa/inet.h>
@@ -60,7 +62,6 @@ bool EspTcp::Connect(const std::string& host, int port) {
     struct hostent *server = gethostbyname(host.c_str());
     if (server == NULL) {
         last_error_ = h_errno;
-        ESP_LOGE(TAG, "Failed to get host by name");
         return false;
     }
     memcpy(&server_addr.sin_addr, server->h_addr, server->h_length);
@@ -78,38 +79,36 @@ bool EspTcp::Connect(const std::string& host, int port) {
     }
 
     int ret = connect(tcp_fd_, (struct sockaddr*)&server_addr, sizeof(server_addr));
-    if (ret < 0 && (errno == EINPROGRESS || errno == EWOULDBLOCK)) {
+    const int connect_error = ret < 0 ? errno : 0;
+    if (ret < 0 && (connect_error == EINPROGRESS || connect_error == EWOULDBLOCK)) {
         fd_set wfds;
         FD_ZERO(&wfds);
         FD_SET(tcp_fd_, &wfds);
         struct timeval tv;
-        tv.tv_sec = kConnectTimeoutSec;
-        tv.tv_usec = 0;
+        const int64_t wait_us = request_deadline_us_ ?
+            std::max<int64_t>(0, std::min<int64_t>(kConnectTimeoutSec * 1000000LL, request_deadline_us_ - esp_timer_get_time())) : kConnectTimeoutSec * 1000000LL;
+        tv.tv_sec = wait_us / 1000000;
+        tv.tv_usec = wait_us % 1000000;
         ret = select(tcp_fd_ + 1, nullptr, &wfds, nullptr, &tv);
+        const int select_error = ret < 0 ? errno : 0;
         if (ret <= 0) {
-            last_error_ = (ret == 0) ? ETIMEDOUT : errno;
-            ESP_LOGD(TAG, "Connect to %s:%d timed out or select failed", host.c_str(), port);
+            last_error_ = (ret == 0) ? ETIMEDOUT : select_error;
             close(tcp_fd_);
             tcp_fd_ = -1;
             return false;
         }
         int so_error = 0;
         socklen_t so_len = sizeof(so_error);
-        getsockopt(tcp_fd_, SOL_SOCKET, SO_ERROR, &so_error, &so_len);
-        if (so_error != 0) {
-            last_error_ = so_error;
-            ESP_LOGD(TAG, "Failed to connect to %s:%d, code=0x%x errno=%d (%s)", host.c_str(),
-                     port, last_error_, last_error_,
-                     strerror(last_error_) != nullptr ? strerror(last_error_) : "?");
+        const int socket_result = getsockopt(tcp_fd_, SOL_SOCKET, SO_ERROR, &so_error, &so_len);
+        const int socket_error = socket_result < 0 ? errno : 0;
+        if (socket_result < 0 || so_error != 0) {
+            last_error_ = socket_result < 0 ? socket_error : so_error;
             close(tcp_fd_);
             tcp_fd_ = -1;
             return false;
         }
     } else if (ret < 0) {
-        last_error_ = errno;
-        ESP_LOGD(TAG, "Failed to connect to %s:%d, code=0x%x errno=%d (%s)", host.c_str(), port,
-                 last_error_, last_error_,
-                 strerror(last_error_) != nullptr ? strerror(last_error_) : "?");
+        last_error_ = connect_error;
         close(tcp_fd_);
         tcp_fd_ = -1;
         return false;
@@ -126,12 +125,18 @@ bool EspTcp::Connect(const std::string& host, int port) {
     }
 
     xEventGroupClearBits(event_group_, ESP_TCP_EVENT_RECEIVE_TASK_EXIT);
-    xTaskCreate([](void* arg) {
+    const auto task_result = xTaskCreate([](void* arg) {
         EspTcp* tcp = (EspTcp*)arg;
         tcp->ReceiveTask();
         xEventGroupSetBits(tcp->event_group_, ESP_TCP_EVENT_RECEIVE_TASK_EXIT);
         vTaskDelete(NULL);
     }, "tcp_receive", 4096, this, 1, &receive_task_handle_);
+    if (task_result != pdPASS) {
+        last_error_ = ENOMEM;
+        ESP_LOGE(TAG, "Failed to create TCP receive task");
+        ShutdownAndJoin();
+        return false;
+    }
     return true;
 }
 
@@ -196,10 +201,23 @@ int EspTcp::Send(const std::string& data) {
     const char* data_ptr = data.data();
 
     while (total_sent < data_size) {
-        int ret = send(fd, data_ptr + total_sent, data_size - total_sent, 0);
+        if (request_deadline_us_) {
+            const int64_t remaining = request_deadline_us_ - esp_timer_get_time();
+            if (remaining <= 0) { last_error_ = ETIMEDOUT; return -1; }
+            timeval timeout{};
+            timeout.tv_sec = remaining / 1000000;
+            timeout.tv_usec = remaining % 1000000;
+            if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+                last_error_ = errno;
+                return -1;
+            }
+        }
+        const size_t write_size = data_size - total_sent;
+        int ret = send(fd, data_ptr + total_sent, write_size, 0);
 
+        const int send_error=ret<0?errno:0;
         if (ret <= 0) {
-            ESP_LOGE(TAG, "Send failed: ret=%d, errno=%d", ret, errno);
+            last_error_ = send_error;
             return ret;
         }
 

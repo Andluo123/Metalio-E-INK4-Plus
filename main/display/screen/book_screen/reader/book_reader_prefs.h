@@ -44,7 +44,8 @@ enum {
     kBookReaderOrientPortrait = 0,  // 竖屏
     kBookReaderOrientLandLeft = 1,  // 左横
     kBookReaderOrientLandRight = 2, // 右横
-    kBookReaderOrientCount = 3, // 方向档位数
+    kBookReaderOrientPortraitDown = 3, // 倒置竖屏
+    kBookReaderOrientCount = 4, // 方向档位数
 };
 
 /** @brief 确保阅读偏好已从 NVS 加载 */
@@ -97,9 +98,9 @@ void BookReaderPrefsSetFooterMask(int mask);
 /** @brief 切换单比特；返回最新 mask */
 int BookReaderPrefsToggleFooterBit(int bit);
 
-/** @brief 抗锯齿偏好（470 阅读展示已强制关；保留读写兼容 NVS） */
+/** @brief 阅读抗锯齿偏好（默认关闭） */
 int BookReaderPrefsAntialias(void);
-/** @brief 设置抗锯齿开关（阅读侧不再生效） */
+/** @brief 设置并保存阅读抗锯齿开关 */
 void BookReaderPrefsSetAntialias(int enabled);
 /**
  * @brief 按是否正文沉浸同步 epd 字形 AA（偏好且 immersive 才开）
@@ -130,3 +131,21 @@ void BookReaderPrefsSetShowShelfProgress(int enabled);
 #ifdef __cplusplus
 }
 #endif
+
+// Reading background: 0 white, 1 grid, 2 dots.
+int BookReaderPrefsBackground();
+void BookReaderPrefsSetBackground(int mode);
+
+// Page presentation: keep existing behavior by default; optional ripple from the right edge.
+enum { kBookReaderPageTurnSlide = 0, kBookReaderPageTurnRipple = 1 };
+int BookReaderPrefsPageTurn();
+void BookReaderPrefsSetPageTurn(int mode);
+
+// Text writing direction, independent of screen orientation.
+enum { kBookReaderWritingHorizontal = 0, kBookReaderWritingVertical = 1 };
+int BookReaderPrefsWritingMode();
+void BookReaderPrefsSetWritingMode(int mode);
+
+// Auto page-turn interval in seconds (5..45); enabling is session-local.
+int BookReaderPrefsAutoTurnSeconds();
+void BookReaderPrefsSetAutoTurnSeconds(int seconds);

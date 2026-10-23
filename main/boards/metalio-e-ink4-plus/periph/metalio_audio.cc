@@ -1,96 +1,234 @@
-/**
- * @file metalio_audio.cc
- * @brief S31 蓝牙音频：UART AT 模式1 + PA_EN（I2S 在 Board::GetAudioCodec）
- */
-
 #include "metalio_audio.h"
 
 #include "audio_codec.h"
 #include "board.h"
 #include "config.h"
 #include "epd_board_metalio_eink4_plus.h"
+#include "power_hw.h"
+#include "power_policy.h"
 #include "simple_uart.hpp"
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <vector>
 #include <esp_log.h>
+#include <esp_timer.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <vector>
+#include <freertos/idf_additions.h>
 
 #define TAG "MetalioAudio"
 
-static std::atomic<bool> s_mode_ready{false};
-static std::atomic<bool> s_bt_rx_seen{false};
-static bool s_codec_started = false;
+namespace {
+constexpr int kRetries = 3; // 首次失败后的最大重试次数
+constexpr int kAckTimeoutMs = 1000; // 模式成功应答等待上限
+constexpr int64_t kBootSettleUs = 700000; // 重新上电后的稳定时间
+std::atomic<bool> s_powered{true}; // BH 供电状态
+std::atomic<unsigned> s_power_epoch{0}; // 当前电源周期
+std::atomic<unsigned> s_ready_epoch{~0U}; // 已确认模式成功的电源周期
+std::atomic<unsigned> s_completed_epoch{~0U}; // 本轮重试已结束的电源周期
+std::atomic<int64_t> s_power_restored_us{0}; // 最近一次恢复供电时间
+std::atomic<bool> s_requested{false}; // 初始化任务已排队或正在执行
+std::atomic<TaskHandle_t> s_worker{nullptr}; // 模式初始化后台任务
+bool s_codec_started = false; // 初始输出音量已设置
+std::mutex s_reply_mutex; // 保护跨任务应答状态
+char s_reply_line[128]{}; // 当前串口应答行
+size_t s_reply_length = 0; // 当前应答行长度
+bool s_reply_overflow = false; // 当前应答行超长
+bool s_applying = false; // 正在执行模式配置
+bool s_expect_mode = false; // 已发送模式命令并等待确认
+bool s_mode_ack = false; // 已收到模式1成功应答
+bool s_command_error = false; // 本次配置收到失败应答
 
-/** @brief 对齐 397 BluetoothScreen::ApplyDefaultMode：阻塞下发模式1 */
-static void ApplyDefaultModeBlocking() {
-    SimpleUart& uart = SimpleUart::getInstance();
-    ESP_LOGI(TAG, "TX: AT+RX=2");
-    uart.sendString("AT+RX=2\r\n");
-    vTaskDelay(pdMS_TO_TICKS(700));
-    ESP_LOGI(TAG, "TX: AT+MODE=1");
-    uart.sendString("AT+MODE=1\r\n");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    if (!s_bt_rx_seen.load()) {
-        ESP_LOGW(TAG, "no BT RX after AT — check UART TX/RX swap (now TX=%d RX=%d)",
-                 BT_AUDIO_TX_PIN, BT_AUDIO_RX_PIN);
+void OnUartData(const std::vector<uint8_t>& data) {
+    std::lock_guard<std::mutex> lock(s_reply_mutex);
+    for (uint8_t c : data) {
+        if (c == '\r' || c == '\n') {
+            s_reply_line[s_reply_length] = 0;
+            if (!s_reply_overflow && s_applying) {
+                const char* mode = strstr(s_reply_line, "SET MODE 1");
+                if (s_expect_mode && mode && (mode[10] == 0 || mode[10] == ' ')) {
+                    s_mode_ack = true;
+                }
+                if (strstr(s_reply_line, "ERROR") || strstr(s_reply_line, "FAIL")) {
+                    s_command_error = true;
+                }
+            }
+            s_reply_length = 0;
+            s_reply_overflow = false;
+        } else if (c >= 32 && c < 127) {
+            if (s_reply_length + 1 < sizeof(s_reply_line)) {
+                s_reply_line[s_reply_length++] = char(c);
+            } else {
+                s_reply_overflow = true;
+            }
+        }
     }
-    s_mode_ready.store(true);
-    ESP_LOGI(TAG, "BT mode1 applied (rx_seen=%d)", s_bt_rx_seen.load() ? 1 : 0);
 }
+
+bool PowerUnchanged(unsigned epoch) {
+    return s_powered.load() && s_power_epoch.load() == epoch;
+}
+
+bool ApplyMode(unsigned epoch) {
+    auto& uart = SimpleUart::getInstance();
+    struct ReplyScope {
+        ~ReplyScope() {
+            std::lock_guard<std::mutex> lock(s_reply_mutex);
+            s_applying = false;
+            s_expect_mode = false;
+        }
+    } scope;
+    {
+        std::lock_guard<std::mutex> lock(s_reply_mutex);
+        s_expect_mode = false;
+        s_mode_ack = false;
+        s_command_error = false;
+        s_applying = true;
+        s_reply_length = 0;
+        s_reply_overflow = false;
+    }
+    if (!PowerUnchanged(epoch) || !uart.sendString("AT+RX=2\r\n")) {
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(700));
+    if (!PowerUnchanged(epoch)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_reply_mutex);
+        if (s_command_error) {
+            return false;
+        }
+        s_reply_length = 0;
+        s_reply_overflow = false;
+        s_expect_mode = true;
+    }
+    if (!uart.sendString("AT+MODE=1\r\n")) {
+        return false;
+    }
+    const int64_t deadline = esp_timer_get_time() + kAckTimeoutMs * 1000;
+    while (PowerUnchanged(epoch) && esp_timer_get_time() < deadline) {
+        {
+            std::lock_guard<std::mutex> lock(s_reply_mutex);
+            if (s_command_error) {
+                return false;
+            }
+            if (s_mode_ack) {
+                return true;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return false;
+}
+
+void ModeWorker(void*) {
+    bool boot_reset = true;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        PowerNeedHold power(PowerNeed::PeripheralReset);
+        unsigned epoch = s_power_epoch.load();
+        bool success = false;
+        for (int attempt = 0; attempt <= kRetries; ++attempt) {
+            const char* stage = "reset";
+            bool reset_ok = true;
+            if (boot_reset) {
+                reset_ok = power_hw_bt_power_reset() == ESP_OK;
+                epoch = s_power_epoch.load();
+                if (reset_ok) {
+                    boot_reset = false;
+                }
+            }
+            if (reset_ok) {
+                if (!PowerUnchanged(epoch)) {
+                    break;
+                }
+                const int64_t settle = kBootSettleUs - (esp_timer_get_time() - s_power_restored_us.load());
+                if (settle > 0) {
+                    vTaskDelay(pdMS_TO_TICKS((settle + 999) / 1000));
+                }
+                if (ApplyMode(epoch)) {
+                    success = true;
+                    break;
+                }
+                stage = "mode_ack";
+            }
+            ESP_LOGW(TAG, "Audio initialization failed stage=%s attempt=%d/%d", stage, attempt + 1, kRetries + 1);
+            if (attempt == kRetries || (reset_ok && !PowerUnchanged(epoch))) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        if (s_power_epoch.load() == epoch) {
+            s_ready_epoch.store(success ? epoch : ~0U);
+            // 同一电源周期失败后不因轮询重新启动一轮重试。
+            s_completed_epoch.store(epoch);
+        }
+        s_requested.store(false);
+        if (!success) {
+            ESP_LOGE(TAG, "Audio mode unavailable after initialization");
+        }
+    }
+}
+} // namespace
 
 AudioCodec* MetalioAudio_GetCodec() {
     return Board::GetInstance().GetAudioCodec();
 }
 
-void MetalioAudio_Init() {
-    epd_board_metalio_eink4_plus_pa_set(false);
-
-    SimpleUart& uart = SimpleUart::getInstance();
-    if (!uart.begin(BT_AUDIO_TX_PIN, BT_AUDIO_RX_PIN, 115200, UART_NUM_1)) {
-        ESP_LOGE(TAG, "BT UART fail TX=%d RX=%d", BT_AUDIO_TX_PIN, BT_AUDIO_RX_PIN);
+void MetalioAudio_RequestModeInit() {
+    const auto worker = s_worker.load();
+    if (!worker || !s_powered.load() || s_completed_epoch.load() == s_power_epoch.load()) {
         return;
     }
-    ESP_LOGI(TAG, "BT UART ready TX=%d RX=%d", BT_AUDIO_TX_PIN, BT_AUDIO_RX_PIN);
+    bool expected = false;
+    if (s_requested.compare_exchange_strong(expected, true)) {
+        xTaskNotifyGive(worker);
+    }
+}
 
-    uart.registerCallback([](const std::vector<uint8_t>& data) {
-        s_bt_rx_seen.store(true);
-        std::string line;
-        line.reserve(data.size());
-        for (uint8_t b : data) {
-            if (b == '\r' || b == '\n') {
-                line.push_back(' ');
-            } else if (b >= 0x20 && b < 0x7F) {
-                line.push_back(static_cast<char>(b));
-            } else {
-                line.push_back('.');
-            }
-        }
-        ESP_LOGI(TAG, "BT RX (%u): %s", static_cast<unsigned>(data.size()), line.c_str());
-    });
+void MetalioAudio_Init() {
+    epd_board_metalio_eink4_plus_pa_set(false);
+    auto& uart = SimpleUart::getInstance();
+    if (!uart.begin(BT_AUDIO_TX_PIN, BT_AUDIO_RX_PIN, 115200, UART_NUM_1)) {
+        ESP_LOGE(TAG, "BT UART initialization failed");
+        return;
+    }
+    uart.registerObserver(OnUartData);
+    TaskHandle_t worker = nullptr;
+    if (xTaskCreatePinnedToCoreWithCaps(ModeWorker, "bt_mode_init", 4096, nullptr, 5, &worker, 0,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGE(TAG, "Audio mode worker creation failed");
+        return;
+    }
+    s_worker.store(worker);
+    MetalioAudio_RequestModeInit();
+}
 
-    s_mode_ready.store(false);
-    ApplyDefaultModeBlocking();
+void MetalioAudio_OnPowerOff() {
+    s_powered.store(false);
+    s_power_epoch.fetch_add(1);
+    s_ready_epoch.store(~0U);
+    s_completed_epoch.store(~0U);
+}
+
+void MetalioAudio_OnPowerRestored() {
+    s_power_restored_us.store(esp_timer_get_time());
+    s_powered.store(true);
 }
 
 bool MetalioAudio_WaitModeReady(int timeout_ms) {
-    if (s_mode_ready.load()) {
-        return true;
-    }
-    if (timeout_ms < 0) {
-        timeout_ms = 0;
-    }
-    constexpr int kStepMs = 50;
-    int waited = 0;
-    while (!s_mode_ready.load()) {
-        if (waited >= timeout_ms) {
-            ESP_LOGW(TAG, "BT mode1 not ready after %dms", timeout_ms);
+    MetalioAudio_RequestModeInit();
+    const int64_t deadline = esp_timer_get_time() + int64_t(timeout_ms > 0 ? timeout_ms : 0) * 1000;
+    while (!MetalioAudio_ModeReady()) {
+        if (!s_worker.load() || s_completed_epoch.load() == s_power_epoch.load() || esp_timer_get_time() >= deadline) {
             return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(kStepMs));
-        waited += kStepMs;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        MetalioAudio_RequestModeInit();
     }
     return true;
 }
@@ -100,24 +238,20 @@ bool MetalioAudio_EnsureStarted() {
     if (codec == nullptr) {
         return false;
     }
-    if (!MetalioAudio_WaitModeReady(2000)) {
+    if (!MetalioAudio_ModeReady()) {
+        MetalioAudio_RequestModeInit();
         return false;
     }
     if (!s_codec_started) {
         codec->SetOutputVolume(80);
-        codec->Start();
         s_codec_started = true;
-        ESP_LOGI(TAG, "codec started");
     }
-    return true;
+    codec->Start();
+    return codec->HardwareReady();
 }
 
 bool MetalioAudio_ModeReady() {
-    return s_mode_ready.load();
-}
-
-bool MetalioAudio_BtRxSeen() {
-    return s_bt_rx_seen.load();
+    return s_powered.load() && s_ready_epoch.load() == s_power_epoch.load();
 }
 
 void MetalioAudio_SetPa(bool on) {

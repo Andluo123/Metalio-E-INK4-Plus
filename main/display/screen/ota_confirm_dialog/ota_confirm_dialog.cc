@@ -6,6 +6,8 @@
 #include "screen_common.h"
 #include "standby_screen/standby_screen.h"
 #include "ui_scale.h"
+#include "power_policy.h"
+#include "lv_adapter_epdiy.h"
 
 #include <atomic>
 #include <cstdio>
@@ -14,7 +16,6 @@
 #include <new>
 
 #include <esp_log.h>
-#include <esp_lv_adapter.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <lvgl.h>
@@ -28,14 +29,11 @@ static constexpr size_t kMsgCap = 160;
 static constexpr lv_coord_t kBorderW = UiSx(2);
 static constexpr lv_coord_t kRadius = UiSx(8);
 static constexpr lv_coord_t kBtnH = UiSy(44);
-static constexpr lv_coord_t kCardMargin = UiSx(48);
-static constexpr lv_coord_t kCardHBoot = UiSy(320);
-static constexpr lv_coord_t kCardHNormal = UiSy(240);
-static constexpr lv_coord_t kCardPad = UiSx(14);
-static constexpr lv_coord_t kCardRowGap = UiSy(12);
+static constexpr lv_coord_t kCardMargin = UiSx(80);
+static constexpr lv_coord_t kCardMinH = UiSy(144); // 短文案弹窗的最小高度
+static constexpr lv_coord_t kCardPad = UiSx(20);
+static constexpr lv_coord_t kCardRowGap = UiSy(20);
 static constexpr lv_coord_t kBtnRowExtra = UiSy(4);
-static constexpr lv_coord_t kBtnWCompact = UiSx(120);
-static constexpr lv_coord_t kBtnMargin = UiSx(96);
 static constexpr lv_coord_t kColRowGap = UiSy(10);
 
 static std::atomic<bool> s_input_locked{false};
@@ -43,14 +41,13 @@ static std::atomic<bool> s_ui_alive{false};
 static std::atomic<uint32_t> s_gen{0};
 
 static lv_obj_t* s_root = nullptr;
+static bool s_power_held = false;
 
 static SemaphoreHandle_t s_choice_done = nullptr;
 
 struct OtaConfirmSyncState {
     uint32_t gen = 0;
-    OtaConfirmDialog::Mode mode = OtaConfirmDialog::Mode::Boot;
-    OtaConfirmDialog::Choice choice = OtaConfirmDialog::Choice::RemindLater;
-    bool ok = false;
+    OtaConfirmDialog::Choice choice = OtaConfirmDialog::Choice::Failed;
     char current[kVerCap] = {};
     char next[kVerCap] = {};
 };
@@ -92,32 +89,36 @@ static bool LvAsyncCallLocked(lv_async_cb_t cb, void* user_data) {
     if (cb == nullptr) {
         return false;
     }
-    if (!esp_lv_adapter_is_initialized()) {
+    auto* adapter = LvAdapterEpdiy::Instance();
+    if (adapter == nullptr || !adapter->IsReady()) {
         ESP_LOGW(TAG, "adapter not ready");
         return false;
     }
-    if (esp_lv_adapter_lock(-1) != ESP_OK) {
+    if (!adapter->LockUi(-1)) {
         ESP_LOGW(TAG, "adapter lock failed");
         return false;
     }
     const bool ok = (lv_async_call(cb, user_data) == LV_RESULT_OK);
-    esp_lv_adapter_unlock();
+    adapter->UnlockUi();
     if (!ok) {
         ESP_LOGW(TAG, "lv_async_call failed");
     }
     return ok;
 }
 
-static void ClearWidgetPtrs() {
-    s_root = nullptr;
-}
-
 static void TeardownUi() {
+    if (s_power_held) {
+        PowerPolicy::GetInstance().Release(PowerNeed::OtaDownload);
+        s_power_held = false;
+    }
     lv_obj_t* root = s_root;
-    ClearWidgetPtrs();
+    s_root = nullptr;
     s_ui_alive.store(false, std::memory_order_release);
     if (root != nullptr && lv_obj_is_valid(root)) {
         lv_obj_delete(root);
+        if (auto* adapter = LvAdapterEpdiy::Instance()) {
+            adapter->RequestFullOnNextCommit();
+        }
     }
 }
 
@@ -130,6 +131,7 @@ void FinishChoice(OtaConfirmDialog::Choice choice) {
         return;
     }
 
+    ESP_LOGD(TAG, "user choice=%d", static_cast<int>(choice));
     s_sync.choice = choice;
     TeardownUi();
     s_input_locked.store(false, std::memory_order_release);
@@ -184,6 +186,7 @@ static lv_obj_t* MakeButton(lv_obj_t* parent, const char* text, lv_event_cb_t cb
     lv_obj_set_style_border_width(btn, kBorderW, 0);
     lv_obj_set_style_radius(btn, kRadius, 0);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
     HapticAttachClick(btn);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
 
@@ -221,11 +224,11 @@ void BuildUi(const char* current_ver, const char* new_ver, OtaConfirmDialog::Mod
 
     const bool boot = (mode == OtaConfirmDialog::Mode::Boot);
     const bool sd = (mode == OtaConfirmDialog::Mode::Sd);
-    const lv_coord_t card_h = boot ? kCardHBoot : kCardHNormal;
 
     lv_obj_t* card = lv_obj_create(root);
     lv_obj_remove_style_all(card);
-    lv_obj_set_size(card, LV_HOR_RES - kCardMargin, card_h);
+    lv_obj_set_size(card, LV_HOR_RES - kCardMargin, LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(card, kCardMinH, 0);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -234,6 +237,7 @@ void BuildUi(const char* current_ver, const char* new_ver, OtaConfirmDialog::Mod
     lv_obj_set_style_radius(card, kRadius, 0);
     lv_obj_set_style_pad_all(card, kCardPad, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(card, kCardRowGap, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
@@ -244,7 +248,7 @@ void BuildUi(const char* current_ver, const char* new_ver, OtaConfirmDialog::Mod
     if (sd) {
         std::snprintf(msg, sizeof(msg), Lang::Strings::OTA_SD_CONFIRM_FMT, current_ver);
     } else {
-        std::snprintf(msg, sizeof(msg), Lang::Strings::OTA_CONFIRM_FMT, current_ver, new_ver);
+        std::snprintf(msg, sizeof(msg), Lang::Strings::OTA_CONFIRM_FMT, new_ver);
     }
 
     lv_obj_t* lbl = lv_label_create(card);
@@ -267,7 +271,7 @@ void BuildUi(const char* current_ver, const char* new_ver, OtaConfirmDialog::Mod
         lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE);
 
-        const lv_coord_t btn_w = LV_HOR_RES - kBtnMargin;
+        const lv_coord_t btn_w = lv_pct(100);
         MakeButton(col, Lang::Strings::OTA_UPGRADE_NOW, OnUpgradeClicked, btn_w);
         MakeButton(col, Lang::Strings::OTA_IGNORE_VERSION, OnIgnoreClicked, btn_w);
         MakeButton(col, Lang::Strings::OTA_REMIND_LATER, OnRemindClicked, btn_w);
@@ -282,10 +286,18 @@ void BuildUi(const char* current_ver, const char* new_ver, OtaConfirmDialog::Mod
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
 
-        MakeButton(row, Lang::Strings::OTA_UPGRADE_NOW, OnUpgradeClicked, kBtnWCompact);
-        MakeButton(row, Lang::Strings::COMMON_CANCEL, OnRemindClicked, kBtnWCompact);
+        MakeButton(row, Lang::Strings::OTA_UPGRADE_NOW, OnUpgradeClicked, lv_pct(46));
+        MakeButton(row, Lang::Strings::COMMON_CANCEL, OnRemindClicked, lv_pct(46));
     }
 
+    lv_obj_update_layout(root);
+    lv_obj_center(card);
+    if (auto* adapter = LvAdapterEpdiy::Instance()) {
+        adapter->RequestFullOnNextCommit();
+    }
+    lv_obj_invalidate(root);
+    PowerPolicy::GetInstance().Acquire(PowerNeed::OtaDownload);
+    s_power_held = true;
     s_root = root;
     s_ui_alive.store(true, std::memory_order_release);
     ESP_LOGI(TAG, "shown mode=%s cur=%s new=%s", boot ? "boot" : (sd ? "sd" : "about"),
@@ -297,7 +309,6 @@ struct OtaConfirmBuildMsg {
     OtaConfirmDialog::Mode mode = OtaConfirmDialog::Mode::Boot;
     char current[kVerCap] = {};
     char next[kVerCap] = {};
-    bool signal_choice_sem = false;
 };
 
 static void AsyncBuild(void* p) {
@@ -310,10 +321,10 @@ static void AsyncBuild(void* p) {
     if (still) {
         BuildUi(msg->current, msg->next, msg->mode);
     }
-    if (msg->signal_choice_sem && s_choice_done != nullptr &&
+    if (s_choice_done != nullptr &&
         (!still || !s_ui_alive.load(std::memory_order_acquire))) {
-        // 建页失败：放行阻塞等待，按 RemindLater
-        s_sync.choice = OtaConfirmDialog::Choice::RemindLater;
+        // 建页失败：通知调用方重试，不伪造用户选择
+        s_sync.choice = OtaConfirmDialog::Choice::Failed;
         s_input_locked.store(false, std::memory_order_release);
         xSemaphoreGive(s_choice_done);
     }
@@ -334,9 +345,7 @@ bool BeginShow(const char* current_version, const char* new_version, OtaConfirmD
     s_input_locked.store(true, std::memory_order_release);
     const uint32_t gen = s_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
     s_sync.gen = gen;
-    s_sync.mode = mode;
-    s_sync.choice = OtaConfirmDialog::Choice::RemindLater;
-    s_sync.ok = false;
+    s_sync.choice = OtaConfirmDialog::Choice::Failed;
     CopyCapped(s_sync.current, sizeof(s_sync.current), current_version);
     CopyCapped(s_sync.next, sizeof(s_sync.next), new_version);
 
@@ -347,7 +356,7 @@ bool BeginShow(const char* current_version, const char* new_version, OtaConfirmD
         s_async_cb = std::make_unique<OtaConfirmDialog::ChoiceCallback>(std::move(cb));
     }
 
-    // About：调用方已在 LVGL 任务（点击回调）→ 同步建页，避免 adapter 锁自死锁
+    // About 在 LVGL 回调内直接建页，不能等待同一任务的异步结果。
     if (!blocking) {
         BuildUi(s_sync.current, s_sync.next, mode);
         if (!s_ui_alive.load(std::memory_order_acquire)) {
@@ -365,7 +374,6 @@ bool BeginShow(const char* current_version, const char* new_version, OtaConfirmD
     }
     msg->gen = gen;
     msg->mode = mode;
-    msg->signal_choice_sem = true;
     CopyCapped(msg->current, sizeof(msg->current), current_version);
     CopyCapped(msg->next, sizeof(msg->next), new_version);
 
@@ -381,15 +389,10 @@ bool BeginShow(const char* current_version, const char* new_version, OtaConfirmD
 OtaConfirmDialog::Choice OtaConfirmDialog::ShowBlocking(const char* current_version,
                                                         const char* new_version, Mode mode) {
     if (!BeginShow(current_version, new_version, mode, true, nullptr)) {
-        return Choice::RemindLater;
+        return Choice::Failed;
     }
-    if (s_choice_done == nullptr) {
-        s_input_locked.store(false, std::memory_order_release);
-        return Choice::RemindLater;
-    }
-    const bool got = (xSemaphoreTake(s_choice_done, pdMS_TO_TICKS(kShowTimeoutMs)) == pdTRUE);
-    if (!got) {
-        ESP_LOGW(TAG, "ShowBlocking timeout → RemindLater");
+    if (xSemaphoreTake(s_choice_done, pdMS_TO_TICKS(kShowTimeoutMs)) != pdTRUE) {
+        ESP_LOGI(TAG, "confirmation timed out; remind later");
         Dismiss();
         return Choice::RemindLater;
     }
@@ -420,16 +423,16 @@ void OtaConfirmDialog::Dismiss() {
         }
     };
 
-    // 已在 LVGL（如切关于 tab）：adapter 非阻塞锁失败则直接拆，避免自死锁
-    if (esp_lv_adapter_is_initialized()) {
-        if (esp_lv_adapter_lock(0) == ESP_OK) {
+    // EPDiy 使用递归锁，LVGL 回调内可重入；其他任务也必须持锁拆 UI。
+    auto* adapter = LvAdapterEpdiy::Instance();
+    if (adapter != nullptr && adapter->IsReady()) {
+        if (adapter->LockUi(-1)) {
             finish();
-            esp_lv_adapter_unlock();
+            adapter->UnlockUi();
             ESP_LOGI(TAG, "dismissed (locked)");
             return;
         }
-        finish();
-        ESP_LOGI(TAG, "dismissed (lvgl nested)");
+        ESP_LOGW(TAG, "dismiss: adapter lock failed");
         return;
     }
 

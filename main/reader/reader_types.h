@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <string>
+#include <functional>
+#include "book_read_error.h"
 #include <vector>
 
 #include "lvgl.h"
@@ -35,10 +37,16 @@ struct ContentBlock {
     std::string text;       // kText
     std::string image_href; // kImage：相对 EPUB 根或绝对文件路径
     bool chapter_title = false; // 章名段：分页后加粗居中；可含「第N章」换行接章节名
+    bool continuation = false; // 同一段正文的后续片段
+    bool continues = false; // 此片段之后同一段正文还有内容
 };
+
+using ContentBlockSink = std::function<bool(ContentBlock&&)>; // 同步消费正文，返回 false 停止读取
 
 // 一页上的一个绘制单元
 struct PageItem {
+    uint32_t source_block = UINT32_MAX;
+    uint32_t source_begin = 0, source_end = 0;
     ContentKind kind = ContentKind::kText;
     std::string text;
     std::string image_href;

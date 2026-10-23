@@ -113,7 +113,7 @@ public:
     virtual void OnNetworkTimeSynced() {}
     // 短震触觉反馈（虚拟键/点击等）；无马达的板为空实现。
     // 业务侧请走 HapticPulseIfEnabled()，以便尊重设置中的按键震动开关。
-    virtual void PulseVibration() {}
+    virtual void PulseVibration(int duration_ms = 50) {}
     // 常开/关闭马达（产测老化等）；绕过按键震动开关。无马达板为空实现。
     virtual void SetVibration(bool on) { (void)on; }
 

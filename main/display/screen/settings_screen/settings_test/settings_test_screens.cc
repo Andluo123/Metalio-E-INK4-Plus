@@ -1,14 +1,20 @@
+#include "assets/lang_cellular.h"
 /**
  * @file settings_test_screens.cc
- * @brief S31 测试子页：自动 / 老化（触摸、电池见独立文件；无 4G）
+ * @brief S31 测试子页：自动 / 老化（触摸、电池见独立文件；4G 双卡测试）
  */
 
 #include "settings_test_screens.h"
 
 #include "settings_test_audio.h"
+#include "settings_test_camera.h"
+#include "settings_test_common.h"
+#include "settings_test_cell.h"
+#include "settings_test_wifi.h"
 
 #include "assets/lang_config.h"
 #include "board.h"
+#include "power_policy.h"
 #include "bq27220_gauge.h"
 #include "cx25601n.h"
 #include "fontpack_lvgl.h"
@@ -17,6 +23,7 @@
 #include "sc7a20h.h"
 #include "screen_common.h"
 #include "settings_common.h"
+#include "settings_network_signal.h"
 #include "ui_scale.h"
 #include "vk_key_handler.h"
 
@@ -36,7 +43,6 @@ static lv_obj_t* MakeScr(const char* title) {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, fontpack_lv_font_ui(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     EpdStatusBar status = ScreenCreateStatusBar(scr);
     const lv_coord_t body_h = LV_VER_RES - status.height;
@@ -96,6 +102,12 @@ static void OnAutoDeleted(lv_event_t* e) {
     if (lv_event_get_target(e) != s_auto_scr) {
         return;
     }
+    PowerPolicy::GetInstance().Release(PowerNeed::UiKeepNet);
+    SettingsTest_BeginShutdown();
+    SettingsTestCamera_Teardown();
+    SettingsTestWifi_Teardown();
+    SettingsTestCell_StopStartTimer();
+    SettingsTestCell_StopRetryTimer();
     SettingsTestAudio_Teardown();
     s_auto_scr = nullptr;
 }
@@ -103,6 +115,7 @@ static void OnAutoDeleted(lv_event_t* e) {
 lv_obj_t* SettingsTestAutoScreen::Create() {
     lv_obj_t* scr = MakeScr(Lang::Strings::SETTINGS_TEST_AUTO);
     s_auto_scr = scr;
+    PowerPolicy::GetInstance().Acquire(PowerNeed::UiKeepNet);
     lv_obj_t* body = BodyOf(scr);
     lv_obj_add_event_cb(scr, OnAutoDeleted, LV_EVENT_DELETE, nullptr);
 
@@ -156,66 +169,25 @@ lv_obj_t* SettingsTestAutoScreen::Create() {
         set_row("SC7A20H", ok, d);
     }
 
+    SettingsNetworkSignal_Build(body);
     SettingsTestAudio_BuildRow(body, scr);
 
-    AddStatusRow(body, "WiFi", Lang::Strings::SETTINGS_TEST_SKIP);
-    AddStatusRow(body, "4G", Lang::Strings::SETTINGS_TEST_SKIP);
-    AddStatusRow(body, Lang::Strings::SETTINGS_TEST_CAMERA, Lang::Strings::SETTINGS_TEST_SKIP);
+    auto& test_ui = SettingsTest_Ui();
+    SettingsTest_BeginSession();
+    test_ui.cell_busy = false;
+    test_ui.root_scr = scr;
+    test_ui.cell_auto = false;
+    test_ui.cell_state = SettingsTestCellState::Idle;
+    test_ui.sim_int = SettingsTest_CreateRow(body, Lang::Strings::SETTINGS_TEST_CELL_INT, nullptr);
+    test_ui.sim_ext = SettingsTest_CreateRow(body, Lang::Strings::SETTINGS_TEST_CELL_EXT, nullptr);
+    test_ui.wifi = SettingsTest_CreateRow(body, "WiFi", SettingsTestWifi_OnRowClicked);
+    SettingsTestWifi_ScheduleScan();
+    SettingsTestCell_StartAutoSequence();
+    SettingsTestCamera_BuildRow(body);
 
     VkKey_AttachScreen(scr, kAutoScreenId, VkKeyScreenDesc{SettingsTestAutoScreen::Create});
     SettingsTestAudio_OnLoad();
+    SettingsTestCamera_OnLoad();
     return scr;
 }
 
-struct AgingUi {
-    lv_obj_t* scr = nullptr;
-    lv_obj_t* lbl = nullptr;
-    lv_timer_t* timer = nullptr;
-    bool vibe_on = false;
-    uint32_t ticks = 0;
-};
-
-static AgingUi s_aging;
-
-static void AgingTick(lv_timer_t* /*t*/) {
-    ++s_aging.ticks;
-    if ((s_aging.ticks % 11) == 1) {
-        Board::GetInstance().PulseVibration();
-        s_aging.vibe_on = true;
-    } else {
-        s_aging.vibe_on = false;
-    }
-    if (s_aging.lbl != nullptr) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), Lang::Strings::SETTINGS_TEST_AGING_TICK_FMT,
-                      (unsigned)s_aging.ticks, s_aging.vibe_on ? 1 : 0);
-        lv_label_set_text(s_aging.lbl, buf);
-    }
-}
-
-static void OnAgingDeleted(lv_event_t* e) {
-    if (lv_event_get_target(e) != s_aging.scr) {
-        return;
-    }
-    Board::GetInstance().SetVibration(false);
-    if (s_aging.timer != nullptr) {
-        lv_timer_delete(s_aging.timer);
-    }
-    s_aging = {};
-}
-
-lv_obj_t* SettingsTestAgingScreen::Create() {
-    s_aging = {};
-    lv_obj_t* scr = MakeScr(Lang::Strings::SETTINGS_TEST_AGING);
-    s_aging.scr = scr;
-    lv_obj_t* body = BodyOf(scr);
-    lv_obj_add_event_cb(scr, OnAgingDeleted, LV_EVENT_DELETE, nullptr);
-
-    s_aging.lbl = lv_label_create(body);
-    lv_label_set_text(s_aging.lbl, Lang::Strings::SETTINGS_TEST_AGING_RUNNING);
-    lv_obj_set_style_text_font(s_aging.lbl, fontpack_lv_font_ui(), 0);
-    lv_obj_clear_flag(s_aging.lbl, LV_OBJ_FLAG_CLICKABLE);
-
-    s_aging.timer = lv_timer_create(AgingTick, 1000, nullptr);
-    return scr;
-}

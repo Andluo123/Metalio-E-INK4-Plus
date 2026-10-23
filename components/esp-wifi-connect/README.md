@@ -1,79 +1,19 @@
 # ESP32 Wi-Fi Connect
 
-This component helps with Wi-Fi connection for the device.
+本项目维护的 STA 连接组件，提供已保存网络的连接、重连、SSID 管理和扫网租约。
+Wi-Fi 凭证由「设置 → 网络 → 配置 WIFI 网络」机上界面维护，存储在 NVS 的 `wifi` 命名空间。
+未保存网络或连接失败时，不启动网页配网热点；原网页、配网 AP、SmartConfig 及专用 DNS 已移除。
+传输页的 AP 文件管理由 `main/display/screen/cloud_screen/ap/` 独立实现，见 [AP 文件管理](../../docs/ap-file-transfer.md)。
 
-It first tries to connect to a Wi-Fi network using the credentials stored in the flash. If this fails, it starts an access point and a web server to allow the user to connect to a Wi-Fi network.
+已有凭证时通过 `WifiStation::GetInstance().Start()` 启动 STA；浅睡暂停和唤醒恢复使用其 `PauseForLp()` / `ResumeFromLp()`。
 
-The URL to access the web server is `http://192.168.4.1`.
+## 兼容性与 OTA 恢复
 
-### Screenshot: Wi-Fi Configuration
+当前 STA 配置关闭 Wi-Fi 省电和 802.11ax，保留 b/g/n 自动速率。470 的 STA 和 AP 文件传输使用固定 TX 功率请求上限 12 dBm（SDK 原始值 48，无界面配置）。S31 的 Wi-Fi/lwIP 缓冲、邮箱及 TX/RX 聚合按对照启动日志调整，具体参数及 SDK 约束见 [AP 文件管理](../../docs/ap-file-transfer.md)。
 
-<img src="assets/ap_v3.png" width="320" alt="Wi-Fi Configuration">
+连接采用全信道扫描和 RSSI 排序，不固定 BSSID。驱动可能回退到其他候选 AP，不能保证总是选择此前扫描记录中信号最强的 AP。
 
-### Screenshot: Advanced Options
+TCP 分段由协议栈处理。独立日志上传不再修改 TCP MSS，也不再强制单次写入上限为 512 字节；仍按 1 KiB 读取发送，处理部分写入并保留超时和取消检查。
 
-<img src="assets/ap_v3_advanced.png" width="320" alt="Advanced Configuration">
-
-## Changelog: v2.6.0
-
-- Add support for ESP32C5 5G mode.
-
-## Changelog: v2.4.0
-
-- Add ja / zh-TW languages.
-- Add advanced tab.
-- Add "Connection: close" headers to save open sockets.
-
-## Changelog: v2.3.0
-
-- Add support for language request.
-
-## Changelog: v2.2.0
-
-- Add support for ESP32 SmartConfig(ESPTouch v2)
-
-## Changelog: v2.1.0
-
-- Improve Wi-Fi connection logic.
-
-## Changelog: v2.0.0
-
-- Add support for multiple Wi-Fi SSID management.
-- Auto switch to the best Wi-Fi network.
-- Captive portal for Wi-Fi configuration.
-- Support for multiple languages (English, Chinese).
-
-## Configuration
-
-The Wi-Fi credentials are stored in the flash under the "wifi" namespace.
-
-The keys are "ssid", "ssid1", "ssid2" ... "ssid9", "password", "password1", "password2" ... "password9".
-
-## Usage
-
-```cpp
-// Initialize the default event loop
-ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-// Initialize NVS flash for Wi-Fi configuration
-esp_err_t ret = nvs_flash_init();
-if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    ret = nvs_flash_init();
-}
-ESP_ERROR_CHECK(ret);
-
-// Get the Wi-Fi configuration
-auto& ssid_list = SsidManager::GetInstance().GetSsidList();
-if (ssid_list.empty()) {
-    // Start the Wi-Fi configuration AP
-    auto& ap = WifiConfigurationAp::GetInstance();
-    ap.SetSsidPrefix("ESP32");
-    ap.Start();
-    return;
-}
-
-// Otherwise, connect to the Wi-Fi network
-WifiStation::GetInstance().Start();
-```
+OTA 版本检测和激活配置检查使用原自定义 HTTP 客户端。每次检查最多尝试 3 次，单次预算 8 秒、总预算 30 秒，重试等待 500/1000 毫秒，每次重建 HTTP 连接。只有网络未就绪才调用现有网络恢复逻辑，不强制重新关联仍连接的 Wi-Fi。网络错误、超时、无效响应及 408/429/5xx 可重试，其他 HTTP 错误直接返回。预算不是硬实时保证，底层调用和任务调度可能产生额外耗时。
 

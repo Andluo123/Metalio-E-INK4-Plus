@@ -1,8 +1,10 @@
 #include "book_screen/book_vk.h"
+#include "book_screen/reader/book_auto_turn.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/shelf/book_bookshelf.h"
 #include "book_screen/shelf/book_detail.h"
 #include "book_screen/settings/book_font_multi.h"
+#include "book_screen/settings/book_settings_sheet.h"
 #include "book_screen/book_font_runtime.h"
 #include "book_screen/book_geom.h"
 #include "book_screen/shelf/book_home.h"
@@ -13,6 +15,12 @@
 #include "book_screen/book_nav.h"
 #include "book_screen/reader/book_reader_overlay.h"
 #include "book_screen/reader/book_reader_prefs.h"
+#include "book_screen/reader/book_layout_worker.h"
+#include "book_screen/reader/book_layout_debounce.h"
+#include "book_screen/reader/book_page_image.h"
+#include "standby_screen/standby_screen.h"
+#include "sd_access.h"
+#include <optional>
 
 #include <lvgl.h>
 #include <algorithm>
@@ -71,7 +79,7 @@ bool BookPageRepeatStep(int page_delta) {
             return false;
         }
         st.shelf.list_page = next;
-        RequestRenderBookshelfPage();
+        RequestRenderBookshelfPage(true);
         return page_delta < 0 ? st.shelf.list_page > 0 : st.shelf.list_page < last;
     }
 
@@ -132,10 +140,14 @@ bool BookScreen::OnVkKeyLongPress(const char* key_name) {
     if (key_name == nullptr) {
         return false;
     }
-    // 盖板 vk_home 长按不进百问（仅 BOOT）；交默认策略一键回系统首页
+    // 与 397 一致：先退出阅读并恢复竖屏，再回系统首页。
     if (std::strcmp(key_name, "vk_home") == 0) {
-        return false;
+        if (!ScreenLvAsyncUrgent(GoHomeFromBookAsync)) {
+            RequestBackHome();
+        }
+        return true;
     }
+    if (BookmarkMessageVisible()) return true;
     return VkPageRepeatTryStart(key_name, BookPageRepeatStep);
 }
 
@@ -156,9 +168,16 @@ bool BookScreen::OnVkKey(const char* key_name) {
     }
     const char* screen = VkKey_ActiveScreen();
     auto& st = Book_State();
+    if (BookmarkMessageVisible()) {
+        if (std::strcmp(key_name, "vk_prev") == 0 || std::strcmp(key_name, "vk_home") == 0)
+            BookLvAsync([](void*) { CloseBookmarkMessage(); });
+        return true;
+    }
 
     if (std::strcmp(screen, kScreenRead) == 0) {
-        // 正文 vk_home 短按：设置/目录浮层→收起；长按由 VkKey 默认回系统首页
+        if (std::strcmp(key_name, "vk_prev") == 0 || std::strcmp(key_name, "vk_next") == 0)
+            ReaderAutoTurnManualInput();
+        // 正文 vk_home 短按：设置/目录浮层→收起；长按经阅读退出清理回系统首页
         if (std::strcmp(key_name, "vk_home") == 0) {
             if (st.reader.read_chrome != BookUiState::ReadChrome::kReading) {
                 BookLvAsync(AsyncHideReadChrome);
@@ -276,7 +295,7 @@ bool BookScreen::OnVkKey(const char* key_name) {
         if (std::strcmp(key_name, "vk_prev") == 0) {
             if (st.shelf.list_page > 0) {
                 --st.shelf.list_page;
-                RequestRenderBookshelfPage();
+                RequestRenderBookshelfPage(true);
                 return true;
             }
             // 列表模式：子目录先退回上层（扫盘禁止在 touch_feed 同步做）
@@ -297,7 +316,7 @@ bool BookScreen::OnVkKey(const char* key_name) {
         if (std::strcmp(key_name, "vk_next") == 0) {
             if (st.shelf.list_page + 1 < Book_ListPageCount()) {
                 ++st.shelf.list_page;
-                RequestRenderBookshelfPage();
+                RequestRenderBookshelfPage(true);
             }
             return true;
         }
@@ -306,32 +325,79 @@ bool BookScreen::OnVkKey(const char* key_name) {
     return true;
 }
 
+namespace {
+std::optional<sd_access::Transaction> s_reader_standby_hold; // 资源收尾完成前阻止 SD 卸卡
+}
+
 void BookScreen::OnEnterStandby() {
+    CancelReadFontScan();
+    CloseBookmarkMessage();
+    ResetBookmarkSelection();
     PauseReadingTimeForStandby();
-    // 浅睡会卸 SD：先关 epdfont/书文件句柄，避免醒后 FILE* 悬空 → 翻页全白
     auto& st = Book_State();
-    if (st.reader.session && st.reader.session->IsOpen()) {
-        ReleaseBookFont();
-        st.reader.session->DetachSdHandles();
+    if (st.reader.standby_paused) return;
+    st.reader.standby_paused = true;
+    s_reader_standby_hold.emplace();
+    st.reader.layout_token.fetch_add(1);
+    st.reader.chapter_pages_token.fetch_add(1);
+    CancelPageImageLoad();
+    // 打开任务独占 session，先让其完成，避免同时修改尚未建好的文档状态。
+    if (st.reader.session && !st.reader.opening.load()) st.reader.session->SetBackgroundPaused(true);
+    st.reader.layout_again = st.reader.layout_again || st.reader.layout_debounce_timer != nullptr;
+    st.reader.layout_reload_font = st.reader.layout_reload_font || st.reader.layout_debounce_reload_font;
+    CancelLayoutDebounce();
+    StopLayoutHintTimer();
+    ScreenPaintCoalesceReset(&s_reader_paint);
+    ScreenPaintCoalesceReset(&s_toc_paint);
+    ScreenPaintCoalesceReset(&s_settings_sheet_paint);
+    s_reader_page_delta.store(0);
+    PollStandbyWork();
+}
+
+void BookScreen::PollStandbyWork() {
+    auto& st = Book_State();
+    if (!st.reader.standby_paused || ReaderWorkersBusy()) return;
+    if (st.reader.deferred_cleanup) FinishDeferredCleanup();
+    if (StandbyScreen::IsActive()) {
+        if (!st.reader.standby_detached) {
+            if (st.reader.session) st.reader.session->DetachSdHandles();
+            ReleaseBookFont();
+            st.reader.standby_detached = true;
+            s_reader_standby_hold.reset();
+        }
+        return;
     }
+    if (st.reader.session && st.reader.session->IsOpen()) {
+        EnsureBookFont();
+        if (st.reader.standby_detached) st.reader.session->ReattachSdHandles();
+        st.reader.session->SetFont(BookFont());
+        st.reader.session->SetBackgroundPaused(false);
+    }
+    st.reader.standby_paused = st.reader.standby_detached = false;
+    if (st.reader.read_chrome == BookUiState::ReadChrome::kSettings && st.settings.reader_tab == 1)
+        StartReadFontScan();
+    s_reader_standby_hold.reset();
+    if (st.reader.deferred_cleanup || !st.reader.session || !st.reader.session->IsOpen() ||
+        !st.reader.read_scr || !lv_obj_is_valid(st.reader.read_scr)) return;
+    ResumeReadingTimeAfterStandby();
+    if (DisplayUiSetOrient(BookReaderPrefsOrient())) {
+        ApplyReaderChromeSize();
+        if (auto* disp = LVAdapterDisplay::Instance()) disp->RequestFullOnNextCommit();
+    }
+    if (st.reader.layout_again) {
+        const bool reload = st.reader.layout_reload_font;
+        st.reader.layout_again = st.reader.layout_reload_font = false;
+        ApplyReaderLayoutLive(reload);
+    } else if (st.reader.session->LiveRelayoutPending()) {
+        st.reader.layout_anchor = st.reader.session->CaptureLayoutAnchor();
+        StartLayoutWorker();
+    } else {
+        StartChapterPageWorker();
+    }
+    RequestRenderReaderPage();
+    if (st.reader.read_chrome == BookUiState::ReadChrome::kSettings) RequestSettingsSheetPaint();
 }
 
 void BookScreen::OnResumeFromStandby() {
-    ResumeReadingTimeAfterStandby();
-    auto& st = Book_State();
-    if (st.reader.session && st.reader.session->IsOpen()) {
-        EnsureBookFont();
-        st.reader.session->ReattachSdHandles();
-        st.reader.session->SetFont(BookFont());
-    }
-    if (st.reader.read_scr == nullptr || !lv_obj_is_valid(st.reader.read_scr)) {
-        return;
-    }
-    RequestRenderReaderPage();
-    if (DisplayUiSetOrient(BookReaderPrefsOrient())) {
-        if (auto* disp = LVAdapterDisplay::Instance()) {
-            disp->RequestNextFullRefresh();
-        }
-    }
+    PollStandbyWork();
 }
-

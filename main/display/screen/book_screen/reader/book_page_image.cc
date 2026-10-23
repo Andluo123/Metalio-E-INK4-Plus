@@ -1,9 +1,12 @@
+#include "epd_content_policy.h"
 #pragma GCC optimize("O1")
 
 #include "book_screen/reader/book_page_image.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/book_nav.h"
 #include "book_screen/reader/book_reader_body.h"
+#include "book_screen/reader/book_layout_worker.h"
+#include "book_screen/reader/book_layout_debounce.h"
 
 #include <freertos/FreeRTOS.h>
 #include <lvgl.h>
@@ -17,6 +20,7 @@
 #include <freertos/idf_additions.h>
 
 #include "reader/reader.h"
+#include "sd_access.h"
 #include "screen_common.h"
 
 struct PageImageDoneMsg {
@@ -51,6 +55,7 @@ void AttachPageImageToSlot(lv_obj_t* slot, reader::RasterImage* heap_img, bool p
     heap_img->BindDsc();
     lv_obj_t* image = lv_image_create(slot);
     lv_image_set_src(image, &heap_img->dsc);
+    EpdSetContentRole(image,EpdContentRole::Illustration);
     lv_obj_set_user_data(image, heap_img);
     lv_obj_add_event_cb(
         image,
@@ -93,56 +98,59 @@ void PageImageWorker(void* arg) {
     auto* ctx = static_cast<PageImageWorkerArg*>(arg);
     auto& st = Book_State();
 
-    // EPUB：独立打开 ZIP，避免长时间占用 session 的 ZipReader 锁堵翻页
-    std::unique_ptr<reader::EpubDocument> epub_doc;
-    if (ctx->format == reader::BookFormat::kEpub && !ctx->book_path.empty()) {
-        epub_doc = std::make_unique<reader::EpubDocument>();
-        if (!epub_doc->Open(ctx->book_path.c_str())) {
-            ESP_LOGW(TAG, "book_pimg epub open fail");
+    {
+        sd_access::Permit permit;
+        // EPUB：独立打开 ZIP，避免长时间占用 session 的 ZipReader 锁堵翻页
+        std::unique_ptr<reader::EpubDocument> epub_doc;
+        if (ctx->format == reader::BookFormat::kEpub && !ctx->book_path.empty()) {
+            epub_doc = std::make_unique<reader::EpubDocument>();
+            if (!epub_doc->Open(ctx->book_path.c_str())) {
+                ESP_LOGW(TAG, "book_pimg epub open fail");
+                epub_doc.reset();
+            }
+        }
+
+        for (const auto& item : ctx->items) {
+            if (ctx->token != st.reader.page_image_token.load()) {
+                break;
+            }
+            auto* img = new reader::RasterImage();
+            bool ok = false;
+            if (epub_doc) {
+                ok = epub_doc->DecodeItemImageToL8(item.href.c_str(), item.max_w, item.max_h, *img,
+                                                   &st.reader.page_image_abort) &&
+                     !img->empty();
+            } else if (st.reader.session) {
+                ok = st.reader.session->LoadPageImage(item.href, item.max_w, item.max_h, *img) && !img->empty();
+            }
+            if (st.reader.page_image_abort.load(std::memory_order_relaxed) ||
+                ctx->token != st.reader.page_image_token.load()) {
+                delete img;
+                break;
+            }
+            auto* done = new PageImageDoneMsg{};
+            done->token = ctx->token;
+            done->slot = item.slot;
+            done->href = item.href;
+            done->ok = ok;
+            done->page_images = ctx->page_images;
+            if (ok) {
+                done->image = img;
+            } else {
+                delete img;
+                done->image = nullptr;
+            }
+            if (!ScreenLvAsync(AsyncPageImageDone, done)) {
+                delete done->image;
+                delete done;
+            }
+        }
+        if (epub_doc) {
+            epub_doc->Close();
             epub_doc.reset();
         }
-    }
 
-    for (const auto& item : ctx->items) {
-        if (ctx->token != st.reader.page_image_token.load()) {
-            break;
-        }
-        auto* img = new reader::RasterImage();
-        bool ok = false;
-        if (epub_doc) {
-            ok = epub_doc->DecodeItemImageToL8(item.href.c_str(), item.max_w, item.max_h, *img,
-                                               &st.reader.page_image_abort) &&
-                 !img->empty();
-        } else if (st.reader.session) {
-            ok = st.reader.session->LoadPageImage(item.href, item.max_w, item.max_h, *img) && !img->empty();
-        }
-        if (st.reader.page_image_abort.load(std::memory_order_relaxed) ||
-            ctx->token != st.reader.page_image_token.load()) {
-            delete img;
-            break;
-        }
-        auto* done = new PageImageDoneMsg{};
-        done->token = ctx->token;
-        done->slot = item.slot;
-        done->href = item.href;
-        done->ok = ok;
-        done->page_images = ctx->page_images;
-        if (ok) {
-            done->image = img;
-        } else {
-            delete img;
-            done->image = nullptr;
-        }
-        if (!ScreenLvAsync(AsyncPageImageDone, done)) {
-            delete done->image;
-            delete done;
-        }
     }
-    if (epub_doc) {
-        epub_doc->Close();
-        epub_doc.reset();
-    }
-
     auto* finish = new uint32_t(ctx->token);
     if (!ScreenLvAsync(
             [](void* p) {
@@ -150,11 +158,18 @@ void PageImageWorker(void* arg) {
                 auto& st = Book_State();
                 st.reader.page_image_busy.store(false);
                 st.reader.page_image_again = false;
+                if (st.reader.standby_paused) { delete tok; return; }
                 (void)tok;
                 if (st.reader.deferred_cleanup && !ReaderWorkersBusy()) {
                     FinishDeferredCleanup();
+                } else if (st.reader.layout_again) {
+                    const bool reload = st.reader.layout_reload_font;
+                    st.reader.layout_again = st.reader.layout_reload_font = false;
+                    ApplyReaderLayoutLive(reload);
                 } else if (!st.reader.page_image_pending.empty()) {
                     StartPageImageWorker();
+                } else {
+                    StartChapterPageWorker();
                 }
                 delete tok;
             },
@@ -163,12 +178,19 @@ void PageImageWorker(void* arg) {
         delete finish;
     }
     delete ctx;
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 void StartPageImageWorker() {
     auto& st = Book_State();
+    if (st.reader.standby_paused) return;
     if (st.reader.page_image_pending.empty() || !st.reader.session) {
+        return;
+    }
+    if (st.reader.opening.load() || st.reader.layout_busy.load() ||
+        st.reader.session->LiveRelayoutPending()) return;
+    if (st.reader.chapter_pages_busy.load()) {
+        st.reader.session->InvalidateChapterPageTable();
         return;
     }
     if (st.reader.page_image_busy.load()) {

@@ -1,6 +1,7 @@
 #include "http_client.h"
 #include "network_interface.h"
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <cstring>
 #include <cstdlib>
 #include <sstream>
@@ -9,6 +10,11 @@
 #include <cctype>
 
 static const char *TAG = "HttpClient";
+
+int HttpClient::RemainingTimeoutMs() const {
+    if (!request_deadline_us_) return timeout_ms_;
+    return int(std::max<int64_t>(0, std::min<int64_t>(timeout_ms_, (request_deadline_us_ - esp_timer_get_time()) / 1000)));
+}
 
 HttpClient::HttpClient(NetworkInterface* network, int connect_id) : network_(network), connect_id_(connect_id) {
     event_group_handle_ = xEventGroupCreate();
@@ -68,7 +74,6 @@ bool HttpClient::ParseUrl(const std::string& url) {
     // 解析 URL: protocol://host:port/path
     size_t protocol_end = url.find("://");
     if (protocol_end == std::string::npos) {
-        ESP_LOGE(TAG, "Invalid URL format: %s", url.c_str());
         return false;
     }
 
@@ -96,7 +101,7 @@ bool HttpClient::ParseUrl(const std::string& url) {
             if (endptr != port_str.c_str() && *endptr == '\0' && port > 0 && port <= 65535) {
                 port_ = static_cast<int>(port);
             } else {
-                ESP_LOGE(TAG, "Invalid port: %s", port_str.c_str());
+                ESP_LOGE(TAG, "Invalid port");
                 return false;
             }
         } else {
@@ -112,7 +117,7 @@ bool HttpClient::ParseUrl(const std::string& url) {
             if (endptr != port_str.c_str() && *endptr == '\0' && port > 0 && port <= 65535) {
                 port_ = static_cast<int>(port);
             } else {
-                ESP_LOGE(TAG, "Invalid port: %s", port_str.c_str());
+                ESP_LOGE(TAG, "Invalid port");
                 return false;
             }
         } else {
@@ -120,8 +125,6 @@ bool HttpClient::ParseUrl(const std::string& url) {
         }
     }
 
-    ESP_LOGD(TAG, "Parsed URL: protocol=%s, host=%s, port=%d, path=%s",
-             protocol_.c_str(), host_.c_str(), port_, path_.c_str());
     return true;
 }
 
@@ -168,7 +171,6 @@ std::string HttpClient::BuildHttpRequest() {
 
     // 结束头部
     request << "\r\n";
-    ESP_LOGD(TAG, "HTTP request headers:\n%s", request.str().c_str());
 
     // 请求体
     if (has_content) {
@@ -179,6 +181,7 @@ std::string HttpClient::BuildHttpRequest() {
 }
 
 bool HttpClient::Open(const std::string& method, const std::string& url) {
+    if (cancelled_.load()) return false;
     method_ = method;
     url_ = url;
     
@@ -190,13 +193,11 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
     bool can_reuse = IsConnectionReusable(host_, port_);
     
     if (can_reuse) {
-        ESP_LOGD(TAG, "Reusing existing connection to %s:%d", host_.c_str(), port_);
         // 只重置请求状态，不关闭连接（不会清空 content_）
         ResetRequestState();
     } else {
         // 旧连接即使已被对端关掉，也要 join 接收任务，再换新的 Tcp 对象
         if (tcp_) {
-            ESP_LOGD(TAG, "Closing previous connection (host or port changed, or connection not reusable)");
             connected_ = false;
             write_cv_.notify_all();
             cv_.notify_all();
@@ -211,6 +212,11 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
             tcp_ = network_->CreateSsl(connect_id_);
         } else {
             tcp_ = network_->CreateTcp(connect_id_);
+        }
+
+        if (!tcp_ || cancelled_.load()) return false;
+        if (request_deadline_us_) {
+            tcp_->SetRequestDeadline(request_deadline_us_);
         }
 
         // 设置 TCP 数据接收回调
@@ -230,9 +236,9 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
         }
         
         connected_ = true;
-        ESP_LOGD(TAG, "Established new connection to %s:%d", host_.c_str(), port_);
     }
     
+    if (cancelled_.load()) return false;
     request_chunked_ = (method_ == "POST" || method_ == "PUT") && !content_.has_value();
 
     // 构建并发送 HTTP 请求
@@ -251,6 +257,22 @@ bool HttpClient::Open(const std::string& method, const std::string& url) {
     headers_.clear();
 
     return true;
+}
+
+void HttpClient::Cancel() {
+    // Never reset/disconnect tcp_ concurrently with the owning worker.
+    {
+        std::lock_guard<std::mutex> lock(read_mutex_);
+        cancelled_.store(true);
+    }
+    write_cv_.notify_all();
+    // ReadAll waits with mutex_, while Read/receive backpressure use read_mutex_.
+    // Release read_mutex_ and wake backpressure before taking mutex_.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+    }
+    cv_.notify_all();
+    xEventGroupSetBits(event_group_handle_, EC801E_HTTP_EVENT_ERROR);
 }
 
 void HttpClient::Close() {
@@ -278,10 +300,11 @@ void HttpClient::OnTcpData(const std::string& data) {
             for (const auto& chunk : body_chunks_) {
                 total_size += chunk.data.size();
             }
-            return total_size < MAX_BODY_CHUNKS_SIZE || !connected_;
+            return cancelled_.load() || total_size < MAX_BODY_CHUNKS_SIZE || !connected_;
         });
     }
 
+    if (cancelled_.load()) return;
     rx_buffer_.append(data);
     ProcessReceivedData();
     cv_.notify_one();
@@ -338,10 +361,8 @@ void HttpClient::ProcessReceivedData() {
                         std::transform(conn_value.begin(), conn_value.end(), conn_value.begin(), ::tolower);
                         if (conn_value.find("keep-alive") != std::string::npos) {
                             server_keep_alive_ = true;
-                            ESP_LOGD(TAG, "Server supports Keep-Alive");
                         } else if (conn_value.find("close") != std::string::npos) {
                             server_keep_alive_ = false;
-                            ESP_LOGD(TAG, "Server will close connection");
                         }
                     }
                     
@@ -360,7 +381,7 @@ void HttpClient::ProcessReceivedData() {
                             if (endptr != cl_it->second.value.c_str() && *endptr == '\0') {
                                 content_length_ = static_cast<size_t>(length);
                             } else {
-                                ESP_LOGE(TAG, "Invalid Content-Length: %s", cl_it->second.value.c_str());
+                                ESP_LOGE(TAG, "Invalid Content-Length");
                                 content_length_ = 0;
                             }
                         }
@@ -448,7 +469,6 @@ void HttpClient::ProcessReceivedData() {
         parse_state_ = ParseState::COMPLETE;
         eof_ = true;
         xEventGroupSetBits(event_group_handle_, EC801E_HTTP_EVENT_COMPLETE);
-        ESP_LOGD(TAG, "HTTP response body received: %u/%u bytes", total_body_received_, content_length_);
     }
 }
 
@@ -458,7 +478,6 @@ bool HttpClient::ParseStatusLine(const std::string& line) {
     std::string version, status_str, reason;
 
     if (!(iss >> version >> status_str)) {
-        ESP_LOGE(TAG, "Invalid status line: %s", line.c_str());
         return false;
     }
 
@@ -469,19 +488,17 @@ bool HttpClient::ParseStatusLine(const std::string& line) {
     long status = strtol(status_str.c_str(), &endptr, 10);
 
     if (endptr == status_str.c_str() || *endptr != '\0' || status < 100 || status > 999) {
-        ESP_LOGE(TAG, "Parse status code failed: %s", status_str.c_str());
+        ESP_LOGE(TAG, "Parse status code failed");
         return false;
     }
 
     status_code_ = static_cast<int>(status);
-    ESP_LOGD(TAG, "HTTP status code: %d", status_code_);
     return true;
 }
 
 bool HttpClient::ParseHeaderLine(const std::string& line) {
     size_t colon_pos = line.find(':');
     if (colon_pos == std::string::npos) {
-        ESP_LOGE(TAG, "Invalid header line: %s", line.c_str());
         return false;
     }
 
@@ -532,7 +549,7 @@ size_t HttpClient::ParseChunkSize(const std::string& chunk_size_line) {
     unsigned long chunk_size = strtoul(size_str.c_str(), &endptr, 16);
 
     if (endptr == size_str.c_str() || *endptr != '\0') {
-        ESP_LOGE(TAG, "Parse chunk size failed: %s", size_str.c_str());
+        ESP_LOGE(TAG, "Parse chunk size failed");
         return 0;
     }
 
@@ -566,7 +583,9 @@ void HttpClient::SetError() {
 }
 
 int HttpClient::Read(char* buffer, size_t buffer_size) {
+    if (cancelled_.load()) return -1;
     std::unique_lock<std::mutex> read_lock(read_mutex_);
+    if (cancelled_.load()) return -1;
 
     // 如果连接异常断开，返回错误
     if (connection_error_) {
@@ -606,11 +625,12 @@ int HttpClient::Read(char* buffer, size_t buffer_size) {
     }
 
     // 等待数据或连接关闭
-    auto timeout = std::chrono::milliseconds(timeout_ms_);
+    auto timeout = std::chrono::milliseconds(RemainingTimeoutMs());
     bool received = cv_.wait_for(read_lock, timeout, [this] {
-        return !body_chunks_.empty() || eof_ || !connected_ || connection_error_;
+        return cancelled_.load() || !body_chunks_.empty() || eof_ || !connected_ || connection_error_;
     });
 
+    if (cancelled_.load()) return -1;
     if (!received) {
         ESP_LOGE(TAG, "Wait for HTTP content receive timeout");
         return -1;
@@ -645,6 +665,7 @@ int HttpClient::Read(char* buffer, size_t buffer_size) {
 }
 
 int HttpClient::Write(const char* buffer, size_t buffer_size) {
+    if (cancelled_.load()) return -1;
     if (!connected_) {
         ESP_LOGE(TAG, "Cannot write: connection closed");
         return -1;
@@ -677,12 +698,13 @@ int HttpClient::Write(const char* buffer, size_t buffer_size) {
 }
 
 int HttpClient::GetStatusCode() {
+    if (cancelled_.load()) return -1;
     if (!headers_received_) {
         // 等待头部接收
         auto bits = xEventGroupWaitBits(event_group_handle_,
                                         EC801E_HTTP_EVENT_HEADERS_RECEIVED | EC801E_HTTP_EVENT_ERROR,
                                         pdFALSE, pdFALSE,
-                                        pdMS_TO_TICKS(timeout_ms_));
+                                        pdMS_TO_TICKS(RemainingTimeoutMs()));
 
         if (bits & EC801E_HTTP_EVENT_ERROR) {
             return -1;
@@ -693,7 +715,7 @@ int HttpClient::GetStatusCode() {
         }
     }
 
-    return status_code_;
+    return cancelled_.load() ? -1 : status_code_;
 }
 
 std::string HttpClient::GetResponseHeader(const std::string& key) const {
@@ -742,11 +764,12 @@ std::string HttpClient::ReadAll() {
     std::unique_lock<std::mutex> lock(mutex_);
 
     // 等待完成或出错
-    auto timeout = std::chrono::milliseconds(timeout_ms_);
+    auto timeout = std::chrono::milliseconds(RemainingTimeoutMs());
     bool completed = cv_.wait_for(lock, timeout, [this] {
-        return eof_ || connection_error_;
+        return cancelled_.load() || eof_ || connection_error_;
     });
 
+    if (cancelled_.load()) return "";
     if (!completed) {
         ESP_LOGE(TAG, "Wait for HTTP content receive complete timeout");
         return "";  // 超时返回空字符串

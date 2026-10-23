@@ -33,12 +33,16 @@ typedef struct {
     int current_frame;
     /// number of frames in the current update cycle
     int cycle_frames;
+    // First streaming fault; written without logging/allocation in the ISR.
+    int fault_reason,fault_phase,fault_line,fault_thread,fault_ready;
+    int fault_write[NUM_RENDER_THREADS],fault_read[NUM_RENDER_THREADS];
 
     TaskHandle_t feed_tasks[NUM_RENDER_THREADS];
     SemaphoreHandle_t feed_done_smphr[NUM_RENDER_THREADS];
     SemaphoreHandle_t frame_done;
-    /// Line buffers for feed tasks
-    uint8_t* feed_line_buffers[NUM_RENDER_THREADS];
+    // Set by the update owner; feeders must acknowledge through feed_done
+    // before any per-update buffer can be released or reused.
+    atomic_bool feed_cancelled;
 
     /// index of the waveform mode when using vendor waveforms.
     /// This is not necessarily the mode number if the waveform header
@@ -59,6 +63,9 @@ typedef struct {
     size_t conversion_lut_size;
     // Lookup table space.
     uint8_t* conversion_lut;
+    uint8_t* spatial_luts;
+    uint8_t* spatial_bands;
+    bool spatial_by_y;
 
     /// LUT lookup function. Must not be NULL.
     lut_func_t lut_lookup_func;
@@ -68,6 +75,7 @@ typedef struct {
     /// 每线程一条短环形行队列（流式预填）
     LineQueue_t line_queues[NUM_RENDER_THREADS];
     uint8_t* line_threads;
+    uint8_t* line_ready; // Release/acquire publication after committing each row.
 
     // Output line mask
     uint8_t* line_mask;

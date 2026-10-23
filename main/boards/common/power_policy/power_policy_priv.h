@@ -29,10 +29,7 @@ inline constexpr int kIdleToStandbySecDefault = 3 * 60;         // 无操作 →
 inline constexpr int kNetGraceSecDefault = 30;                  // 断网前暂留默认秒数
 inline constexpr int kStandbyToShutdownSecDefault = 30 * 60;    // 浅睡累计 → 关机默认秒数
 inline constexpr uint64_t kLightSleepSliceUs = 60ULL * 1000 * 1000; // 单次浅睡切片上限
-inline constexpr int kStandbyUiSettleMs = 2000;                 // 进待机攒帧上限（就绪即提前 Park）
 inline constexpr bool kStandbyLpUseLightSleep = true; // true=浅睡；false=vTaskDelay（串口排查）
-/** 浅睡切片诊断：PSRAM 记 wake/awake，退出待机一次性 ESP_LOG（串口浅睡会掉） */
-inline constexpr bool kStandbyLpSleepTrace = true;
 
 extern Board* board;                         // 当前板实例
 extern SemaphoreHandle_t mu;                 // 策略互斥锁
@@ -112,8 +109,6 @@ void EnsureTouchSleepLocked();
 bool StandbyUiLongEnoughLocked();
 /** @brief 待机超时：打日志并 BeginPowerOff */
 void RequestShutdownLocked();
-/** @brief S31 无 iot_button；占位以保持与调度层 API 对称 */
-void ResumeIotKeysIfNeeded();
 /** @brief 标记退出待机并清累计（挡重进） */
 void PrepareStandbyWakeExitLocked();
 /** @brief 持锁准备退出并异步 Dismiss Overlay */

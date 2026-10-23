@@ -1,6 +1,8 @@
+#include "firmware_memory.h"
 #include "metalio_sys_mon.h"
 
 #include "bq27220_gauge.h"
+#include "display/epd_flash_guard.h"
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -58,9 +60,9 @@ void MetalioPeriph_StartSystemMonitor() {
                          usage[0], core1_usage, avg_usage);
 
                 const unsigned free_kb =
-                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024);
                 const unsigned min_free_kb = static_cast<unsigned>(
-                    heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024);
+                    heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024);
                 const unsigned psram_free_kb =
                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
                 const unsigned psram_min_kb = static_cast<unsigned>(
@@ -69,6 +71,14 @@ void MetalioPeriph_StartSystemMonitor() {
                          min_free_kb);
                 ESP_LOGI(kMonitorTag, "@@@PSRAM | 剩余: %6u KB | 历史最小: %6u KB",
                          psram_free_kb, psram_min_kb);
+
+                {
+                    // largest-free-block walks the heap under its critical
+                    // section. Serialize that walk with the LCD waveform so
+                    // monitoring cannot delay bounce-buffer refill interrupts.
+                    EpdFlashGuard display_guard;
+                    FirmwareMemoryCheckpoint("system-monitor");
+                }
 
                 auto& gauge = Bq27220Gauge::GetInstance();
                 int battery_level = 0;

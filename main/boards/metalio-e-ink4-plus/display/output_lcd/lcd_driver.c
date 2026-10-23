@@ -6,6 +6,7 @@ int __DECLARE_RCC_ATOMIC_ENV __attribute__((unused));
 #endif
 
 #include "../output_common/render_method.h"
+#include "../output_common/white_border.h"
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "esp_intr_alloc.h"
@@ -139,8 +140,7 @@ static portMUX_TYPE frame_start_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
     lcd_hal_context_t hal;
-    intr_handle_t vsync_intr;
-    intr_handle_t done_intr;
+    intr_handle_t lcd_intr;
 
     frame_done_func_t frame_done_cb;
     line_cb_func_t line_source_cb;
@@ -149,6 +149,7 @@ typedef struct {
 
     int line_length_us;
     int ckv_period_us; // CKV 一行周期；S31 探测拉伸时可大于 line_length_us
+    uint32_t ckv_tick_hz;
     int line_cycles;
     int lcd_res_h;
 
@@ -198,9 +199,13 @@ typedef struct {
 
     /// The number of lines of the display
     int display_lines;
+    int native_height;
 } s3_lcd_t;
 
 static s3_lcd_t lcd = { 0 };
+static bool border_whitening=false;
+void epd_lcd_prime_white_border(bool enable) { border_whitening=enable; }
+int epd_lcd_white_border_pixels(void) { return lcd.config.white_border_pixels; }
 
 void IRAM_ATTR epd_lcd_line_source_cb(line_cb_func_t line_source, void* payload) {
     lcd.line_source_cb = line_source;
@@ -217,12 +222,14 @@ static IRAM_ATTR void lcd_finish_frame_from_isr(void) {
         return;
     }
     lcd.frame_finishing = true;
+    lcd_ll_enable_interrupt(lcd.hal.dev, LCD_LL_EVENT_VSYNC_END | LCD_LL_EVENT_TRANS_DONE, false);
     if (lcd.frame_t0_us > 0) {
         lcd.last_frame_us = esp_timer_get_time() - lcd.frame_t0_us;
     }
     lcd.line_source_cb = NULL;
     lcd_ll_stop(lcd.hal.dev);
     gdma_stop(lcd.dma_chan);
+    lcd_ll_clear_interrupt_status(lcd.hal.dev, lcd_ll_get_interrupt_status(lcd.hal.dev));
     if (lcd.frame_done_cb != NULL) {
         lcd.frame_done_cb(lcd.frame_cb_payload);
     }
@@ -232,12 +239,21 @@ void epd_lcd_abort_frame(void) {
     lcd_finish_frame_from_isr();
 }
 
+void epd_lcd_get_stream_stats(int* max_eof_gap_us,int* max_eof_work_us) {
+    *max_eof_gap_us=(int)lcd.eof_dt_max_us;
+    *max_eof_work_us=(int)lcd.eof_work_max_us;
+}
+
 static IRAM_ATTR bool fill_bounce_buffer(uint8_t* buffer) {
     bool task_awoken = false;
 
     for (int i = 0; i < BOUNCE_BUF_LINES; i++) {
         // 8bit 时 dummy 占前 1 字节；仍走 line_source 以免队列饿死。
         int buffer_offset = i * (lcd.line_bytes + lcd.dummy_bytes) + (lcd.dummy_bytes % 2);
+        if (lcd.lines_fed >= (size_t)lcd.display_lines) {
+            memset(&buffer[buffer_offset], 0x00, lcd.line_bytes);
+            continue;
+        }
         if (lcd.line_source_cb != NULL) {
             task_awoken |= lcd.line_source_cb(lcd.line_cb_payload, &buffer[buffer_offset]);
         } else {
@@ -250,6 +266,8 @@ static IRAM_ATTR bool fill_bounce_buffer(uint8_t* buffer) {
             line[b] = (b & 1) ? 0x00 : 0x01;
         }
 #endif
+        epd_filter_white_border(&buffer[buffer_offset],(int)lcd.lines_fed,
+            lcd.line_bytes,lcd.native_height,lcd.config.white_border_pixels,border_whitening);
         lcd.lines_fed += 1;
     }
 
@@ -259,10 +277,8 @@ static IRAM_ATTR bool fill_bounce_buffer(uint8_t* buffer) {
     }
 #endif
 
-    // VSYNC 未到时靠行计数收尾，避免 GDMA 环链 EOF 在 ISR 里空转触发 INT WDT
-    if (!lcd.frame_finishing && lcd.lines_fed >= (size_t)lcd.display_lines) {
-        lcd_finish_frame_from_isr();
-    }
+    // Feeding the last buffer is not completion: DMA still has two buffers
+    // in flight. The EOF handler finishes only after the tail is transmitted.
     return task_awoken;
 }
 
@@ -284,17 +300,17 @@ static void start_ckv_cycles(int cycles) {
 
 /**
  * Build the RMT signal according to the timing set in the lcd object.
- * 时长单位为「通道 tick」；init_ckv_rmt() 保证 1 tick = 1us。
+ * Convert the 0.1us configuration using the measured RMT source clock.
  */
 static void ckv_rmt_build_signal() {
     // 门极一行周期必须等于 LCD 一行时间；若偏短会出现「一行数据多次 CKV」→ 格子被拉扁。
     const int period_us = lcd.ckv_period_us > 0 ? lcd.ckv_period_us : 1;
-    const int high_us = (lcd.config.ckv_high_time + 5) / 10; // 配置里是 0.1us 单位
-    int high = high_us > 0 ? high_us : 1;
-    if (high >= period_us) {
-        high = period_us - 1;
-    }
-    const int low = period_us - high;
+    const int period=(int)(((uint64_t)period_us*lcd.ckv_tick_hz+500000)/1000000);
+    const int minimum=(lcd.ckv_tick_hz+999999)/1000000; // E0470A14-AF: high/low >=1us.
+    if (period<2*minimum) return; // init precedes calculating the real line length.
+    int high=(int)(((uint64_t)lcd.config.ckv_high_time*lcd.ckv_tick_hz+5000000)/10000000);
+    high=max(minimum,min(high,period-minimum));
+    const int low=period-high;
 
     volatile rmt_item32_t* rmt_mem_ptr = &(RMTMEM.chan[RMT_CKV_CHAN].data32[0]);
     rmt_mem_ptr->duration0 = high;
@@ -337,8 +353,8 @@ static void init_ckv_rmt() {
     if (clk_err != ESP_OK || src_hz == 0) {
         src_hz = 80000000;
     }
-    // 目标 1MHz 通道时钟：1 tick = 1us，避免再假设「APB/8 → 0.1us」
-    uint32_t chan_div = (src_hz + 500000) / 1000000;
+    // 10MHz preserves sub-microsecond gate widths; never assume an APB rate.
+    uint32_t chan_div = (src_hz + 5000000) / 10000000;
     if (chan_div < 1) {
         chan_div = 1;
     }
@@ -346,6 +362,7 @@ static void init_ckv_rmt() {
         chan_div = 255;
     }
     rmt_ll_tx_set_channel_clock_div(&RMT, RMT_CKV_CHAN, chan_div);
+    lcd.ckv_tick_hz=src_hz/chan_div;
     // 与厂商一致：2 个 mem block（S31 每通道 48 word，足够）
     rmt_ll_tx_set_mem_blocks(&RMT, RMT_CKV_CHAN, 2);
     rmt_ll_tx_fix_idle_level(&RMT, RMT_CKV_CHAN, RMT_IDLE_LEVEL_LOW, true);
@@ -371,7 +388,7 @@ static void init_ckv_rmt() {
         lcd.config.bus.ckv, rmt_periph_signals.groups[0].channels[RMT_CKV_CHAN].tx_sig, false, 0
     );
 #endif
-    ESP_LOGI(TAG, "CKV RMT src=%uHz div=%u → %uHz (1 tick=1us)", (unsigned)src_hz,
+    ESP_LOGI(TAG, "CKV RMT src=%uHz div=%u → %uHz", (unsigned)src_hz,
              (unsigned)chan_div, (unsigned)(src_hz / chan_div));
 #endif
 
@@ -395,44 +412,44 @@ static void deinit_ckv_rmt() {
     gpio_reset_pin(lcd.config.bus.ckv);
 }
 
-__attribute__((optimize("O3"))) IRAM_ATTR static void lcd_isr_vsync(void* args) {
-    bool need_yield = false;
+__attribute__((optimize("O3"))) IRAM_ATTR static void lcd_isr(void* args) {
+    (void)args;
 
     uint32_t intr_status = lcd_ll_get_interrupt_status(lcd.hal.dev);
     lcd_ll_clear_interrupt_status(lcd.hal.dev, intr_status);
+    if (lcd.frame_finishing) {
+        return;
+    }
 
     if (intr_status & LCD_LL_EVENT_VSYNC_END) {
         int batches_needed = (lcd.display_lines + LINE_BATCH - 1) / LINE_BATCH;
         if (batches_needed < 1) {
             batches_needed = 1;
         }
-        if (lcd.batches + 1 >= (size_t)batches_needed) {
-            lcd_finish_frame_from_isr();
-        } else {
-            int ckv_cycles = 0;
-            // last batch
-            if (lcd.batches == batches_needed - 1) {
-                lcd_ll_enable_auto_next_frame(lcd.hal.dev, false);
-                lcd_ll_set_vertical_timing(lcd.hal.dev, 1, 0, lcd.display_lines % LINE_BATCH, 10);
-                ckv_cycles = lcd.display_lines % LINE_BATCH + 10;
-            } else {
-                lcd_ll_set_vertical_timing(lcd.hal.dev, 1, 0, LINE_BATCH, 1);
-                ckv_cycles = LINE_BATCH + 1;
-            }
+        const size_t completed_batches = lcd.batches + 1;
+        lcd.batches = completed_batches;
+
+        // DMA EOF 只表示数据进入 LCD 缓冲；末批须等扫描完成再停机。
+        if (completed_batches < (size_t)batches_needed) {
+            const int lines_done = (int)completed_batches * LINE_BATCH;
+            const int lines_left = lcd.display_lines - lines_done;
+            const int next_lines = min(LINE_BATCH, lines_left);
+            const bool next_is_last = completed_batches + 1 >= (size_t)batches_needed;
+            const int tail_lines = next_is_last ? 10 : 1;
+
+            lcd_ll_enable_auto_next_frame(lcd.hal.dev, !next_is_last);
+            lcd_ll_set_vertical_timing(lcd.hal.dev, 1, 0, next_lines, tail_lines);
             // apparently, this is needed for the new timing to take effect.
             lcd_ll_start(lcd.hal.dev);
 
             // skip the LCD front porch line, which is not actual data
             esp_rom_delay_us(lcd.ckv_period_us);
-            start_ckv_cycles(ckv_cycles);
+            start_ckv_cycles(next_lines + tail_lines);
+        } else {
+            lcd_finish_frame_from_isr();
         }
-
-        lcd.batches += 1;
     }
 
-    if (need_yield) {
-        portYIELD_FROM_ISR();
-    }
 };
 
 // ISR handling bounce buffer refill
@@ -467,6 +484,7 @@ static IRAM_ATTR bool lcd_rgb_panel_eof_handler(
     // 与 esp_lcd RGB 一致：用 EOF 计数选 buffer，AXI 下 desc 指针不可靠
     int bb = (int)(lcd.bb_eof_count & 1u);
     lcd.bb_eof_count += 1;
+    // 尾部继续补无驱动数据，让 LCD 排空缓冲并完成末行扫描。
     const bool awoken = fill_bounce_buffer(lcd.bounce_buffer[bb]);
     // AXI-GDMA：补数后交还 DMA，否则 check_owner 时描述符停在 CPU
     lcd.dma_nodes[bb].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
@@ -506,6 +524,7 @@ static esp_err_t init_dma_trans_link() {
 
     // alloc DMA channel and connect to LCD peripheral
     gdma_channel_alloc_config_t dma_chan_config = {
+        .intr_priority = 3,
 #if CONFIG_LCD_RGB_ISR_IRAM_SAFE
         .flags.isr_cache_safe = true,
 #endif
@@ -685,6 +704,9 @@ static void assign_lcd_parameters_from_config(
 ) {
     // copy over the configuraiton object
     memcpy(&lcd.config, config, sizeof(LcdEpdConfig_t));
+    assert(config->white_border_pixels>=0 && config->white_border_pixels%4==0);
+    assert(config->white_border_pixels*2<display_width && config->white_border_pixels*2<display_height);
+    lcd.native_height=display_height;
 
     // Make sure the bounce buffers divide the display height evenly.
     lcd.display_lines = (((display_height + 7) / 8) * 8);
@@ -806,21 +828,17 @@ static esp_err_t init_lcd_peripheral() {
 #endif
     ESP_RETURN_ON_ERROR(ret, TAG, "set source clock failed");
 
-    // install interrupt service, (LCD peripheral shares the interrupt source with Camera by
-    // different mask)
+    // Install one handler for the shared LCD source.  Registering VSYNC and
+    // TRANS_DONE separately let the first handler clear the second event before
+    // its shared handler observed it.
     int flags = ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_INTRDISABLED | ESP_INTR_FLAG_SHARED
                 | ESP_INTR_FLAG_LOWMED;
 
     int source = LCD_PERIPH_PANEL.irq_id;
     uint32_t status = (uint32_t)lcd_ll_get_interrupt_status_reg(lcd.hal.dev);
     ret = esp_intr_alloc_intrstatus(
-        source, flags, status, LCD_LL_EVENT_VSYNC_END, lcd_isr_vsync, NULL, &lcd.vsync_intr
-    );
-    ESP_RETURN_ON_ERROR(ret, TAG, "install interrupt failed");
-
-    status = (uint32_t)lcd_ll_get_interrupt_status_reg(lcd.hal.dev);
-    ret = esp_intr_alloc_intrstatus(
-        source, flags, status, LCD_LL_EVENT_TRANS_DONE, lcd_isr_vsync, NULL, &lcd.done_intr
+        source, flags, status, LCD_LL_EVENT_VSYNC_END | LCD_LL_EVENT_TRANS_DONE,
+        lcd_isr, NULL, &lcd.lcd_intr
     );
     ESP_RETURN_ON_ERROR(ret, TAG, "install interrupt failed");
 
@@ -867,21 +885,17 @@ static esp_err_t init_lcd_peripheral() {
     // send next frame automatically in stream mode
     lcd_ll_enable_auto_next_frame(lcd.hal.dev, false);
 
-    lcd_ll_enable_interrupt(lcd.hal.dev, LCD_LL_EVENT_VSYNC_END, true);
-    lcd_ll_enable_interrupt(lcd.hal.dev, LCD_LL_EVENT_TRANS_DONE, true);
+    lcd_ll_enable_interrupt(lcd.hal.dev, LCD_LL_EVENT_VSYNC_END | LCD_LL_EVENT_TRANS_DONE, false);
 
     // enable intr
-    esp_intr_enable(lcd.vsync_intr);
-    esp_intr_enable(lcd.done_intr);
+    esp_intr_enable(lcd.lcd_intr);
     return ret;
 }
 
 static void deinit_lcd_peripheral() {
     // disable and free interrupts
-    esp_intr_disable(lcd.vsync_intr);
-    esp_intr_disable(lcd.done_intr);
-    esp_intr_free(lcd.vsync_intr);
-    esp_intr_free(lcd.done_intr);
+    esp_intr_disable(lcd.lcd_intr);
+    esp_intr_free(lcd.lcd_intr);
 
     lcd_ll_fifo_reset(lcd.hal.dev);
     lcd_ll_reset(lcd.hal.dev);
@@ -1019,16 +1033,30 @@ void epd_lcd_set_pixel_clock_MHz(int frequency) {
     const uint32_t pclk = freq > 0 ? freq : (uint32_t)requested_hz;
     lcd.config.pixel_clock = (int)pclk;
     // Use 8-bit-equivalent line length for CKV/frame rate; lcd_res_h stays bus-width aware for DMA.
-    lcd.line_length_us = (lcd.line_bytes + lcd.config.le_high_time + lcd.config.line_front_porch - 1)
+    lcd.line_length_us = (lcd.line_bytes + lcd.config.le_high_time + lcd.config.line_front_porch
+                             + lcd.config.dummy_clocks_after_data - 1)
                              * 1000000 / pclk
                          + 1;
     lcd.line_cycles = lcd.line_length_us * pclk / 1000000;
     // EOF 逐脉冲对比度崩；×2/×6 自由跑会撕成多列。先 1:1 自由跑保清晰，拉伸另查。
     lcd.ckv_period_us = lcd.line_length_us;
+    if (lcd.config.dummy_clocks_after_data) {
+        // Apply Pico's data-window calculation to our 8-bit bus. Keep this
+        // panel's >=1us low interval and ten post-data clocks (not Pico's pins
+        // or 16-bit bus timings). CKV is expressed in tenths of a microsecond.
+        const int data_clocks=lcd.lcd_res_h+lcd.config.le_high_time+lcd.config.line_front_porch;
+        const int data_end=(int)(((int64_t)data_clocks*10000000+pclk-1)/pclk);
+        lcd.config.ckv_high_time=max(10,min(data_end,lcd.line_length_us*10-10));
+    }
     ESP_LOGI(TAG, "line width: %dus, %d cycles", lcd.line_length_us, lcd.line_cycles);
 
     ckv_rmt_build_signal();
-    ESP_LOGI(TAG, "CKV period=%dus (should match line width)", lcd.ckv_period_us);
+    ESP_LOGI("EpdTiming", "line=%dus CKV high=%d.%dus low=%d.%dus tail=%d clocks RMT=%uHz",
+        lcd.ckv_period_us,lcd.config.ckv_high_time/10,lcd.config.ckv_high_time%10,
+        (lcd.ckv_period_us*10-lcd.config.ckv_high_time)/10,
+        (lcd.ckv_period_us*10-lcd.config.ckv_high_time)%10,
+        lcd.line_cycles-lcd.lcd_res_h-lcd.config.le_high_time-lcd.config.line_front_porch,
+        (unsigned)lcd.ckv_tick_hz);
     ESP_LOGI(TAG,
              "PROBE bounce=%d always_on=%d d0_toggle=%d | expect EOF≈%dus | scope: D0=GPIO8 "
              "XCL=GPIO%d XLE=GPIO%d CKV=GPIO%d",
@@ -1116,6 +1144,7 @@ void IRAM_ATTR epd_lcd_start_frame() {
     lcd.last_h_active = h_active;
     lcd.last_h_end = end_line;
     lcd.last_h_total = h_hsync + h_back + h_active + end_line;
+    assert(end_line>=lcd.config.dummy_clocks_after_data);
     lcd_ll_set_horizontal_timing(lcd.hal.dev, h_hsync, h_back, h_active, end_line);
     lcd_ll_set_vertical_timing(lcd.hal.dev, 1, 0, initial_lines, 1);
 
@@ -1125,8 +1154,9 @@ void IRAM_ATTR epd_lcd_start_frame() {
     // reset FIFO of DMA and LCD, incase there remains old frame data
     gdma_reset(lcd.dma_chan);
     lcd_ll_stop(lcd.hal.dev);
+    lcd_ll_clear_interrupt_status(lcd.hal.dev, lcd_ll_get_interrupt_status(lcd.hal.dev));
     lcd_ll_fifo_reset(lcd.hal.dev);
-    lcd_ll_enable_auto_next_frame(lcd.hal.dev, true);
+    lcd_ll_enable_auto_next_frame(lcd.hal.dev, lcd.display_lines > LINE_BATCH);
 
     lcd.batches = 0;
     lcd.bb_eof_count = 0;
@@ -1184,6 +1214,10 @@ void IRAM_ATTR epd_lcd_start_frame() {
 
     // start LCD engine
     lcd.frame_t0_us = esp_timer_get_time();
+    lcd_ll_clear_interrupt_status(lcd.hal.dev, lcd_ll_get_interrupt_status(lcd.hal.dev));
+    lcd_ll_enable_interrupt(
+        lcd.hal.dev, LCD_LL_EVENT_VSYNC_END | LCD_LL_EVENT_TRANS_DONE, true
+    );
     lcd_ll_start(lcd.hal.dev);
 
     taskEXIT_CRITICAL(&frame_start_spinlock);

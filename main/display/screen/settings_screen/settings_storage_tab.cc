@@ -3,10 +3,11 @@
 #include "SdCardManager.hpp"
 #include "assets/lang_config.h"
 #include "fontpack_lvgl.h"
-#include "reader/file_size.h"
 #include "sd_paths.h"
-#include "settings_common.h"
+#include "haptic_feedback.h"
+#include "ui_scale.h"
 #include "usb_virtual_disk.h"
+#include "screen_common.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -64,14 +65,12 @@ static void RefreshStorageUi() {
         } else {
             uint64_t total_bytes = 0;
             uint64_t free_bytes = 0;
-            char total_str[32];
-            char free_str[32];
             char line[96];
             if (QueryCapacity(&total_bytes, &free_bytes)) {
-                reader::FormatFileSize(total_str, sizeof(total_str), total_bytes);
-                reader::FormatFileSize(free_str, sizeof(free_str), free_bytes);
-                std::snprintf(line, sizeof(line), Lang::Strings::SETTINGS_STORAGE_CAP_FMT, free_str,
-                              total_str);
+                const double gb = 1024.0 * 1024.0 * 1024.0;
+                std::snprintf(line, sizeof(line), Lang::Strings::SETTINGS_STORAGE_CAP_FMT,
+                              static_cast<double>(free_bytes) / gb,
+                              static_cast<double>(total_bytes) / gb);
                 lv_label_set_text(s_ui.capacity_lbl, line);
             } else {
                 lv_label_set_text(s_ui.capacity_lbl, Lang::Strings::SETTINGS_STORAGE_CAP_FAIL);
@@ -85,7 +84,11 @@ static void RefreshStorageUi() {
                                                 : Lang::Strings::SETTINGS_STORAGE_USB_ON);
     }
     if (s_ui.usb_btn != nullptr) {
-        SettingsStyleSelectable(s_ui.usb_btn, s_ui.usb_btn_lbl, vd.IsGadgetActive());
+        const bool on = vd.IsGadgetActive();
+        lv_obj_set_style_bg_color(s_ui.usb_btn, on ? lv_color_black() : lv_color_white(), 0);
+        if (s_ui.usb_btn_lbl != nullptr) {
+            lv_obj_set_style_text_color(s_ui.usb_btn_lbl, on ? lv_color_white() : lv_color_black(), 0);
+        }
         // 忙时仍可点：翻转期望态，避免反复开关时点击被吞掉。
         const bool can_click =
             vd.IsSupported() && (vd.IsGadgetActive() || has_card || vd.IsBusy());
@@ -114,8 +117,8 @@ static void OnUsbUiNotifyAsync(void* /*user_data*/) {
 }
 
 static void OnUsbVirtualDiskNotify() {
-    if (lv_async_call(OnUsbUiNotifyAsync, nullptr) != LV_RESULT_OK) {
-        ESP_LOGW(TAG, "lv_async_call failed for usb notify");
+    if (!ScreenLvAsync(OnUsbUiNotifyAsync)) {
+        ESP_LOGW(TAG, "usb ui enqueue failed");
     }
 }
 
@@ -135,46 +138,47 @@ void SettingsStorageTab_Reset() {
     s_ui = {};
 }
 
+static lv_obj_t* AddCenterLabel(lv_obj_t* page, const char* text) {
+    lv_obj_t* lbl = lv_label_create(page);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_width(lbl, lv_pct(100));
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(lbl, fontpack_lv_font_ui(), 0);
+    lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
+    lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+    return lbl;
+}
+
 void SettingsStorageTab_Build(lv_obj_t* page) {
     s_ui = {};
     s_ui.alive = true;
 
-    lv_obj_t* title = lv_label_create(page);
-    lv_label_set_text(title, Lang::Strings::SETTINGS_STORAGE_TITLE);
-    lv_obj_set_style_text_font(title, fontpack_lv_font_ui(), 0);
-    lv_obj_set_style_text_color(title, lv_color_black(), 0);
-    lv_obj_clear_flag(title, LV_OBJ_FLAG_CLICKABLE);
+    AddCenterLabel(page, Lang::Strings::CLOUD_USB_WAY);
 
-    s_ui.status_lbl = lv_label_create(page);
-    lv_label_set_text(s_ui.status_lbl, "");
-    lv_obj_set_width(s_ui.status_lbl, lv_pct(100));
-    lv_label_set_long_mode(s_ui.status_lbl, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_font(s_ui.status_lbl, fontpack_lv_font_ui(), 0);
-    lv_obj_set_style_text_color(s_ui.status_lbl, lv_color_black(), 0);
-    lv_obj_clear_flag(s_ui.status_lbl, LV_OBJ_FLAG_CLICKABLE);
+    s_ui.usb_btn = lv_obj_create(page);
+    lv_obj_remove_style_all(s_ui.usb_btn);
+    lv_obj_set_width(s_ui.usb_btn, lv_pct(100));
+    lv_obj_set_height(s_ui.usb_btn, UiSy(64));
+    lv_obj_set_style_bg_opa(s_ui.usb_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_ui.usb_btn, lv_color_black(), 0);
+    lv_obj_set_style_border_width(s_ui.usb_btn, UiSx(2), 0);
+    lv_obj_set_style_radius(s_ui.usb_btn, UiSx(16), 0);
+    lv_obj_clear_flag(s_ui.usb_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_ui.usb_btn, LV_OBJ_FLAG_CLICKABLE);
+    HapticAttachClick(s_ui.usb_btn);
+    lv_obj_add_event_cb(s_ui.usb_btn, OnUsbButtonClicked, LV_EVENT_CLICKED, nullptr);
+    s_ui.usb_btn_lbl = lv_label_create(s_ui.usb_btn);
+    lv_label_set_text(s_ui.usb_btn_lbl, Lang::Strings::SETTINGS_STORAGE_USB_ON);
+    lv_obj_set_style_text_font(s_ui.usb_btn_lbl, fontpack_lv_font_ui(), 0);
+    lv_obj_center(s_ui.usb_btn_lbl);
+    lv_obj_clear_flag(s_ui.usb_btn_lbl, LV_OBJ_FLAG_CLICKABLE);
 
-    s_ui.capacity_lbl = lv_label_create(page);
-    lv_label_set_text(s_ui.capacity_lbl, "");
-    lv_obj_set_width(s_ui.capacity_lbl, lv_pct(100));
-    lv_label_set_long_mode(s_ui.capacity_lbl, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_font(s_ui.capacity_lbl, fontpack_lv_font_ui(), 0);
-    lv_obj_set_style_text_color(s_ui.capacity_lbl, lv_color_black(), 0);
-    lv_obj_clear_flag(s_ui.capacity_lbl, LV_OBJ_FLAG_CLICKABLE);
-
-    s_ui.usb_btn =
-        SettingsCreateSelectableOption(page, Lang::Strings::SETTINGS_STORAGE_USB_ON, OnUsbButtonClicked, 0);
-    s_ui.usb_btn_lbl = lv_obj_get_child(s_ui.usb_btn, 0);
-
-    s_ui.hint_lbl = lv_label_create(page);
-    lv_label_set_text(s_ui.hint_lbl, "");
-    lv_obj_set_width(s_ui.hint_lbl, lv_pct(100));
-    lv_label_set_long_mode(s_ui.hint_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_font(s_ui.hint_lbl, fontpack_lv_font_ui(), 0);
-    lv_obj_set_style_text_color(s_ui.hint_lbl, lv_color_black(), 0);
-    lv_obj_clear_flag(s_ui.hint_lbl, LV_OBJ_FLAG_CLICKABLE);
+    s_ui.hint_lbl = AddCenterLabel(page, "");
+    s_ui.status_lbl = AddCenterLabel(page, "");
+    s_ui.capacity_lbl = AddCenterLabel(page, "");
 
     auto& vd = UsbVirtualDisk::GetInstance();
-    vd.Init();
     vd.SetUiNotify(OnUsbVirtualDiskNotify);
     RefreshStorageUi();
 }

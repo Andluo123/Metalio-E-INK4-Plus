@@ -7,7 +7,7 @@
 #include "power_i2c.h"
 
 #include <atomic>
-#include <driver/i2c.h>
+#include <driver/i2c_master.h>
 #include <esp_log.h>
 
 #define TAG "MetalioRtc"
@@ -25,6 +25,7 @@ power_i2c_t MakeBus() {
         .port = EPDIY_I2C_PORT,
         .lock = metalio_i2c1_lock,
         .unlock = metalio_i2c1_unlock,
+        .device = metalio_i2c1_device_locked,
     };
     return bus;
 }
@@ -51,6 +52,7 @@ void SampleRtcIntEdge(void) {
 } // namespace
 
 void MetalioRtc_Init(void) {
+    ESP_LOGI(TAG, "boot RTC time restore begin (does not require network)");
     power_i2c_t bus = MakeBus();
     auto& rtc = Pcf8563::GetInstance();
     if (!rtc.Begin(&bus, PCF8563_I2C_ADDR)) {
@@ -58,9 +60,15 @@ void MetalioRtc_Init(void) {
     } else if (rtc.ApplyRtcToSystem()) {
         ESP_LOGI(TAG, "boot time source: PCF8563");
     } else {
-        ESP_LOGW(TAG, "PCF8563 online but time invalid (VL); wait NTP/set then SyncSystemToRtc");
+        ESP_LOGW(TAG, "PCF8563 detected but RTC -> system failed; see Pcf8563 logs for read/VL/calendar/settimeofday cause");
     }
 
+    const time_t system_now=time(nullptr);
+    struct tm system_local={};
+    const bool decoded=localtime_r(&system_now,&system_local)!=nullptr;
+    ESP_LOGI(TAG,"boot RTC restore result ready=%d epoch=%lld local=%04d-%02d-%02d %02d:%02d:%02d calendar_valid=%d",
+             rtc.IsReady(),static_cast<long long>(system_now),system_local.tm_year+1900,system_local.tm_mon+1,system_local.tm_mday,
+             system_local.tm_hour,system_local.tm_min,system_local.tm_sec,decoded && system_local.tm_year>=125 && system_local.tm_year<=199);
     s_p16_ok = epd_board_metalio_eink4_plus_ioexp_ok();
     if (s_p16_ok) {
         s_last_event = RtcIntActive();

@@ -13,8 +13,6 @@ void BootKey_OnLongPress();
 
 /** @brief 电源键短按：进入低功耗待机 Overlay */
 void PowerKey_OnClick();
-/** @brief 电源键长按：请求关机 */
-void PowerKey_OnLongPress();
 
 /** @brief 当前 BOOT 键是否仍按住 */
 bool BootKey_IsHeld();

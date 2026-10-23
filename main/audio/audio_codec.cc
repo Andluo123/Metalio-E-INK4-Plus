@@ -15,11 +15,18 @@ AudioCodec::~AudioCodec() {
 }
 
 void AudioCodec::OutputData(std::vector<int16_t>& data) {
-    Write(data.data(), data.size());
+    int written = Write(data.data(), data.size());
+    if (written != static_cast<int>(data.size())) {
+        ESP_LOGE(TAG, "Output short write: expected=%u actual=%d", static_cast<unsigned>(data.size()), written);
+    }
 }
 
 bool AudioCodec::InputData(std::vector<int16_t>& data) {
     int samples = Read(data.data(), data.size());
+    if (samples != static_cast<int>(data.size())) {
+        ESP_LOGE(TAG, "Input short read: expected=%u actual=%d; discard frame", static_cast<unsigned>(data.size()), samples);
+        return false;
+    }
     if (samples > 0) {
         return true;
     }

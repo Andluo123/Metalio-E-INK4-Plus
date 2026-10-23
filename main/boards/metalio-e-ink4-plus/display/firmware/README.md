@@ -28,5 +28,3 @@ LVGL 和后台监控启动之前执行，独占 I2C1。
 
 协议依据供应商 `Focaltech_Touch_FT6336U_I2C_V4.1_20230424(1).zip` 中
 `focaltech_upgrade_ft6336u.c` 及 `focaltech_flash.c`；实现没有直接复制 Linux 驱动代码。
-
-离线检查：`python tools/test_ft6336u_upgrade_host.py`。

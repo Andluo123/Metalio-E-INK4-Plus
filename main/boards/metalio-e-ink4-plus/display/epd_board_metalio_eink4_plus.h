@@ -5,6 +5,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <stdbool.h>
+#include <esp_err.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +29,12 @@ bool epd_board_metalio_eink4_plus_ioexp_ok(void);
  */
 void epd_board_metalio_eink4_plus_tp_reset(void);
 
+/** Lease shared P12 against touch resets; verify P5/P12 are already high.
+ * Does not write TCA outputs or take ownership of the shared power rail.
+ * A successful acquire must be paired with release on the same task. */
+esp_err_t epd_board_metalio_eink4_plus_camera_acquire(uint32_t timeout_ms);
+void epd_board_metalio_eink4_plus_camera_release(void);
+
 /**
  * @brief 震动马达输出（TCA P0.3），高有效；与 TPS 控制脚同口锁存
  * @param on true 开，false 关
@@ -39,6 +46,8 @@ void epd_board_metalio_eink4_plus_motor_set(bool on);
  * @param on true 开，false 关
  */
 void epd_board_metalio_eink4_plus_pa_set(bool on);
+/** @brief P14 共享电源拉低 3 秒后拉高；调用方须阻止待机。 */
+esp_err_t epd_board_metalio_eink4_plus_bt_power_reset(void);
 
 /**
  * @brief 模拟开关（ESP GPIO36=ANA_SW）；虚拟 U 盘时置低，关闭后置高

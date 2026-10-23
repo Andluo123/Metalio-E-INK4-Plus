@@ -5,18 +5,47 @@
 #include "a2ui_math.h"
 #include "text_encoding.h"
 
-#include <cstring>
-#include <string>
 #include <string_view>
-#include <vector>
 
 #include <esp_log.h>
 
+namespace {
+struct YunxinPaginationCache {
+    bool valid = false;
+    size_t flow_index = 0;
+    const lv_font_t* font = nullptr;
+    lv_coord_t width = 0, height = 0, letter_space = 0, line_height = 0;
+    ChatString text;
+    ChatVector<std::pair<size_t, size_t>> ranges;
+    size_t page = 0, page_first_line = 0, page_flow_begin = 0;
+    lv_coord_t page_text_y = 0;
+    FlowList page_prefix;
+} yunxin_cache;
+
+ChatVector<std::pair<size_t, size_t>> LineRanges(
+    const ChatString& full, const ChatVector<ChatString>& lines, size_t offset = 0) {
+    ChatVector<std::pair<size_t, size_t>> ranges;
+    ranges.reserve(lines.size());
+    size_t scan = offset;
+    for (const auto& line : lines) {
+        const size_t begin = scan;
+        scan += line.size();
+        ranges.push_back({begin, scan});
+        if (scan < full.size() && full[scan] == '\n') { ++scan; }
+    }
+    return ranges;
+}
+} // namespace
+
+void Assistant_ResetYunxinPagination() {
+    yunxin_cache = YunxinPaginationCache{};
+}
+
 // 按视口宽把 UTF-8 文本折成物理行（含 letter_space）。
 void WrapTextToLines(std::string_view text, const lv_font_t* font, lv_coord_t letter_space,
-                     lv_coord_t viewport_w, std::vector<std::string>& lines) {
+                     lv_coord_t viewport_w, ChatVector<ChatString>& lines) {
     lines.clear();
-    std::string line;
+    ChatString line;
     lv_coord_t line_w = 0;
     const uint8_t* data = reinterpret_cast<const uint8_t*>(text.data());
     size_t i = 0;
@@ -52,8 +81,8 @@ void WrapTextToLines(std::string_view text, const lv_font_t* font, lv_coord_t le
     }
 }
 
-std::string JoinLines(const std::vector<std::string>& lines, size_t begin, size_t end) {
-    std::string out;
+ChatString JoinLines(const ChatVector<ChatString>& lines, size_t begin, size_t end) {
+    ChatString out;
     for (size_t i = begin; i < end && i < lines.size(); ++i) {
         if (i > begin) {
             out.push_back('\n');
@@ -88,8 +117,8 @@ SpirVec<SpanRun> SliceSpans(const SpirVec<SpanRun>& spans, size_t byte_begin,
     return out;
 }
 
-std::string SpansConcat(const SpirVec<SpanRun>& spans) {
-    std::string s;
+ChatString SpansConcat(const SpirVec<SpanRun>& spans) {
+    ChatString s;
     for (const auto& sp : spans) {
         s.append(sp.text.data(), sp.text.size());
     }
@@ -142,13 +171,13 @@ lv_coord_t EstimateItemHeight(const FlowItem& item, lv_coord_t viewport_w, lv_co
             return h;
         }
         case FlowKind::Text: {
-            std::vector<std::string> lines;
+            ChatVector<ChatString> lines;
             WrapTextToLines(item.text, Assistant_FontFor(item.bold), Assistant_VariantLetterSpace(item.variant.c_str()),
                             viewport_w, lines);
             return static_cast<lv_coord_t>(lines.size()) * line_h;
         }
         case FlowKind::RichText: {
-            std::vector<std::string> lines;
+            ChatVector<ChatString> lines;
             // 折行宽度按 regular 估算（bold 略宽，偏保守多留一行）
             WrapTextToLines(SpansConcat(item.spans), Assistant_UiFont(),
                             Assistant_VariantLetterSpace(item.variant.c_str()), viewport_w, lines);
@@ -225,8 +254,8 @@ void PaginateTextLike(const FlowItem& item, FlowList& cur, lv_coord_t& y,
                       lv_coord_t viewport_w, lv_coord_t viewport_h, int card_depth,
                       int* first_page_out) {
     const lv_coord_t line_h = Assistant_FontLineHeight(Assistant_UiFont());
-    std::vector<std::string> lines;
-    std::string full;
+    ChatVector<ChatString> lines;
+    ChatString full;
     if (item.kind == FlowKind::RichText) {
         full = SpansConcat(item.spans);
         WrapTextToLines(full, Assistant_UiFont(), Assistant_VariantLetterSpace(item.variant.c_str()), viewport_w, lines);
@@ -236,40 +265,38 @@ void PaginateTextLike(const FlowItem& item, FlowList& cur, lv_coord_t& y,
                         viewport_w, lines);
     }
 
-    // 与 Wrap 同步扫描：建立每物理行在 full 中的字节区间
-    std::vector<std::pair<size_t, size_t>> ranges;
-    ranges.reserve(lines.size());
-    size_t scan = 0;
-    for (size_t li = 0; li < lines.size(); ++li) {
-        const std::string& ln = lines[li];
-        if (ln.empty()) {
-            ranges.push_back({scan, scan});
-            if (scan < full.size() && full[scan] == '\n') {
-                ++scan;
-            }
-            continue;
-        }
-        if (scan + ln.size() <= full.size() && full.compare(scan, ln.size(), ln) == 0) {
-            ranges.push_back({scan, scan + ln.size()});
-            scan += ln.size();
-        } else {
-            const size_t begin = full.find(ln, scan);
-            if (begin == std::string::npos) {
-                ranges.push_back({scan, scan});
-            } else {
-                ranges.push_back({begin, begin + ln.size()});
-                scan = begin + ln.size();
-            }
-        }
-        if (scan < full.size() && full[scan] == '\n') {
-            ++scan;
-        }
-    }
+    const auto ranges = LineRanges(full, lines);
 
+    const bool cache_yunxin = card_depth == 0 && item.kind == FlowKind::RichText &&
+        item.spans.size() == 2 && item.spans[0].text == "AI：" &&
+        item.spans[1].text == Assistant_State().stream.yunxin_formatter.Text().c_str() &&
+        !Assistant_State().stream.yunxin_text.empty() &&
+        Assistant_State().layout.building_flow_fi + 1 == Assistant_State().layout.flow.size();
+    if (cache_yunxin) {
+        yunxin_cache.valid = true;
+        yunxin_cache.flow_index = Assistant_State().layout.building_flow_fi;
+        yunxin_cache.font = Assistant_UiFont();
+        yunxin_cache.width = viewport_w;
+        yunxin_cache.height = viewport_h;
+        yunxin_cache.letter_space = Assistant_VariantLetterSpace(item.variant.c_str());
+        yunxin_cache.line_height = line_h;
+        yunxin_cache.text = full;
+        yunxin_cache.ranges = ranges;
+    }
     size_t i = 0;
     while (i < lines.size()) {
         if (y + line_h > viewport_h && !cur.empty()) {
             PushPage(cur, card_depth, y);
+        }
+        if (cache_yunxin) {
+            yunxin_cache.page = Assistant_State().layout.pages.size();
+            yunxin_cache.page_first_line = i;
+            yunxin_cache.page_prefix = cur;
+            yunxin_cache.page_text_y = y;
+            yunxin_cache.page_flow_begin = Assistant_State().layout.open_page_flow_begin;
+            if (yunxin_cache.page_flow_begin == static_cast<size_t>(-1)) {
+                yunxin_cache.page_flow_begin = yunxin_cache.flow_index;
+            }
         }
         size_t take = 0;
         lv_coord_t used = 0;
@@ -292,7 +319,7 @@ void PaginateTextLike(const FlowItem& item, FlowList& cur, lv_coord_t& y,
             slice.spans = SliceSpans(item.spans, b0, b1);
             slice.text.clear();
         } else {
-            const std::string joined = JoinLines(lines, i, i + take);
+            const ChatString joined = JoinLines(lines, i, i + take);
             slice.text.assign(joined.data(), joined.size());
         }
         cur.push_back(std::move(slice));
@@ -376,7 +403,8 @@ void Assistant_ClampPageIndex() {
     }
 }
 
-void Assistant_RebuildPages() {
+void Assistant_RebuildPages() try {
+    Assistant_ResetYunxinPagination();
     Assistant_State().layout.pages.clear();
     Assistant_State().layout.page_flow_begin.clear();
     Assistant_State().layout.open_page_flow_begin = static_cast<size_t>(-1);
@@ -398,12 +426,91 @@ void Assistant_RebuildPages() {
         Assistant_State().layout.page_flow_begin.push_back(0);
     }
     Assistant_ClampPageIndex();
-    ESP_LOGI(TAG, "paginated %u pages (flow=%u, vw=%d vh=%d)",
+    ESP_LOGD(TAG, "paginated %u pages (flow=%u, vw=%d vh=%d)",
              static_cast<unsigned>(Assistant_State().layout.pages.size()), static_cast<unsigned>(Assistant_State().layout.flow.size()),
              static_cast<int>(vw), static_cast<int>(vh));
+} catch (const std::bad_alloc&) {
+    Assistant_ResetYunxinPagination();
+    Assistant_State().layout.pages.clear();
+    Assistant_State().layout.page_flow_begin.clear();
+    ESP_LOGW(TAG, "Pagination deferred: PSRAM exhausted");
 }
 
-int Assistant_RebuildPagesTail() {
+int Assistant_RebuildYunxinTextTail() try {
+    auto& st = Assistant_State();
+    auto& cache = yunxin_cache;
+    const lv_coord_t vw = st.layout.viewport_w > 0 ? st.layout.viewport_w : (LV_HOR_RES - kContentPadX * 2);
+    const lv_coord_t vh = st.layout.viewport_h > 0 ? st.layout.viewport_h : (LV_VER_RES - kFooterH - kContentPadY * 2);
+    if (!cache.valid || st.layout.flow.empty() || cache.flow_index + 1 != st.layout.flow.size() ||
+        cache.font != Assistant_UiFont() || cache.width != vw || cache.height != vh ||
+        cache.line_height != Assistant_FontLineHeight(Assistant_UiFont()) ||
+        cache.page + 1 != st.layout.pages.size() ||
+        st.layout.page_flow_begin.size() != st.layout.pages.size() || cache.ranges.empty()) {
+        Assistant_RebuildPages();
+        return 0;
+    }
+    const auto& item = st.layout.flow.back();
+    const ChatString full = SpansConcat(item.spans);
+    if (item.kind != FlowKind::RichText || item.spans.size() != 2 || item.spans[0].text != "AI：" ||
+        cache.letter_space != Assistant_VariantLetterSpace(item.variant.c_str()) ||
+        full.size() < cache.text.size() || full.compare(0, cache.text.size(), cache.text) != 0) {
+        Assistant_RebuildPages();
+        return 0;
+    }
+    // Only the final physical line can change on append. Previous glyph widths
+    // and UTF-8 line/page boundaries stay valid.
+    const size_t restart = cache.ranges.back().first;
+    ChatVector<ChatString> tail_lines;
+    WrapTextToLines(std::string_view(full).substr(restart), cache.font, cache.letter_space, vw, tail_lines);
+    auto tail_ranges = LineRanges(full, tail_lines, restart);
+    cache.ranges.pop_back();
+    cache.ranges.insert(cache.ranges.end(), tail_ranges.begin(), tail_ranges.end());
+    cache.text = full;
+
+    // Retain completed pages verbatim; rebuild only the old final page and any
+    // newly added pages, including any earlier messages sharing that final page.
+    const int reflow_page = static_cast<int>(cache.page);
+    st.layout.pages.resize(cache.page);
+    st.layout.page_flow_begin.resize(cache.page);
+    st.layout.building_flow_fi = cache.flow_index;
+    st.layout.open_page_flow_begin = cache.page_flow_begin;
+    FlowList cur = cache.page_prefix;
+    lv_coord_t y = cache.page_text_y;
+    size_t i = cache.page_first_line;
+    while (i < cache.ranges.size()) {
+        if (y + cache.line_height > vh && !cur.empty()) { PushPage(cur, 0, y); }
+        cache.page = st.layout.pages.size();
+        cache.page_first_line = i;
+        cache.page_prefix = cur;
+        cache.page_text_y = y;
+        cache.page_flow_begin = st.layout.open_page_flow_begin;
+        if (cache.page_flow_begin == static_cast<size_t>(-1)) { cache.page_flow_begin = cache.flow_index; }
+        size_t take = 0;
+        lv_coord_t used = 0;
+        while (i + take < cache.ranges.size() && y + used + cache.line_height <= vh) {
+            used += cache.line_height;
+            ++take;
+        }
+        if (take == 0) { take = 1; used = cache.line_height; }
+        FlowItem slice = item;
+        slice.spans = SliceSpans(item.spans, cache.ranges[i].first, cache.ranges[i + take - 1].second);
+        slice.text.clear();
+        cur.push_back(std::move(slice));
+        NotePageContent(cache.flow_index);
+        y += used;
+        i += take;
+        if (i < cache.ranges.size()) { PushPage(cur, 0, y); }
+    }
+    CommitPage(cur);
+    Assistant_ClampPageIndex();
+    return reflow_page;
+} catch (const std::bad_alloc&) {
+    Assistant_RebuildPages();
+    return 0;
+}
+
+int Assistant_RebuildPagesTail() try {
+    Assistant_ResetYunxinPagination();
     if (Assistant_State().layout.pages.empty() || Assistant_State().layout.page_flow_begin.size() != Assistant_State().layout.pages.size()) {
         Assistant_RebuildPages();
         return 0;
@@ -459,9 +566,12 @@ int Assistant_RebuildPagesTail() {
         page0 = 0;
     }
     Assistant_ClampPageIndex();
-    ESP_LOGI(TAG, "paginated tail flow=%u page=%d -> %u pages (flow=%u)",
+    ESP_LOGD(TAG, "paginated tail flow=%u page=%d -> %u pages (flow=%u)",
              static_cast<unsigned>(fi0), page0, static_cast<unsigned>(Assistant_State().layout.pages.size()),
              static_cast<unsigned>(Assistant_State().layout.flow.size()));
     return page0;
+} catch (const std::bad_alloc&) {
+    Assistant_RebuildPages();
+    return 0;
 }
 

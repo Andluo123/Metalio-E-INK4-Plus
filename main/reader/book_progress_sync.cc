@@ -183,18 +183,15 @@ bool PostProgressReport(const std::string& body, std::string& err_out) {
     }
     http->SetTimeout(kHttpTimeoutMs);
     api::ApplyJsonHeaders(http);
-    api::LogHttpRequest(TAG, "POST", url, body);
     http->SetContent(std::string(body));
     if (!http->Open("POST", url)) {
         err_out = Lang::Strings::CLOUD_REQUEST_FAIL;
-        api::LogHttpResponse(TAG, -1, err_out);
         return false;
     }
 
     const int status = http->GetStatusCode();
     const std::string resp = http->ReadAll();
     http->Close();
-    api::LogHttpResponse(TAG, status, api::RedactClawUrlsForLog(resp));
 
     if (status < 200 || status >= 300) {
         err_out = "HTTP " + std::to_string(status);
@@ -325,7 +322,7 @@ void WorkerTask(void* /*arg*/) {
         } else if (!WaitWarmupReady()) {
             ESP_LOGW(TAG, "library/sync 上报: 跳过(进度缓存未就绪/超时)");
         } else {
-            (void)PostOnceFromCache();
+            PostOnceFromCache();
         }
         ESP_LOGI(TAG, "library/sync 上报: 结束");
     }

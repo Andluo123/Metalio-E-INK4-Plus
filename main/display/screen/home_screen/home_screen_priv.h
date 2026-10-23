@@ -27,22 +27,20 @@ constexpr lv_coord_t HOME_PAGE_INDICATOR_H = UiSy(36);
 #define HOME_SLASH_ROWS 3
 constexpr lv_coord_t HOME_SLASH_SIDE_PAD = UiSx(16);
 constexpr lv_coord_t HOME_SLASH_ROW_GAP = UiSy(10);
-constexpr lv_coord_t HOME_SLASH_BOTTOM_PAD = HOME_SLASH_ROW_GAP;
+constexpr lv_coord_t HOME_SLASH_BOTTOM_PAD = UiSy(38);
 constexpr lv_coord_t HOME_SLASH_SLANT = UiSx(22);
 constexpr lv_coord_t HOME_SLASH_COL_GAP = HOME_SLASH_ROW_GAP;
-constexpr lv_coord_t HOME_SLASH_ICON = UiSx(70);
 constexpr lv_coord_t HOME_SLASH_PAD_OUTER = UiSx(18);
 constexpr lv_coord_t HOME_SLASH_PAD_V = UiSy(8);
 constexpr lv_coord_t HOME_SLASH_PAD_SLANT = UiSx(10);
 constexpr lv_coord_t HOME_SLASH_PAD_COL = UiSx(14);
 constexpr lv_coord_t HOME_SLASH_NAME_NUDGE_R = UiSx(12);
-constexpr lv_coord_t HOME_SLASH_BORDER_W = 2; // ≥2px 减轻 DU 残影
+constexpr lv_coord_t HOME_SLASH_BORDER_W = UiSx(4);
 constexpr lv_coord_t HOME_SLASH_ROW_MIN_H = UiSy(110);
-#define HOME_APP_CARD_STYLE_DEFAULT HomeScreen::kCardStyleBorder
+#define HOME_APP_CARD_STYLE_DEFAULT HomeScreen::kCardStyleBorder // 默认首页主题：黑色描边
 
 constexpr const char* TAG = "HomeScreen";
 constexpr const char* kScreenId = "home";
-constexpr lv_coord_t kIconSize = UiSx(70);
 constexpr lv_coord_t kCardRadius = UiSx(20);
 constexpr int kColsPerRow = 3;
 constexpr int kRowsPerPage = 4;

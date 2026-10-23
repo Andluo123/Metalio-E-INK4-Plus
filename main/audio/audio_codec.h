@@ -27,6 +27,10 @@ public:
     virtual void OutputData(std::vector<int16_t>& data);
     virtual bool InputData(std::vector<int16_t>& data);
     virtual void Start();
+    /** @brief 查询硬件是否就绪，支持派生类按需管理 DMA 生命周期 */
+    virtual bool HardwareReady() const { return true; }
+    /** @brief 释放按需申请的硬件资源，常驻 codec 默认无需处理 */
+    virtual void ReleaseHardware() {}
 
     inline bool duplex() const { return duplex_; }
     inline bool input_reference() const { return input_reference_; }

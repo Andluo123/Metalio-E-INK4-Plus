@@ -96,7 +96,7 @@
 | 4 | `PAGE_IMAGES` | 整页转图书（`--pdf-pages-as-images`）：阅读端从显示区 `(0,0)` 全屏铺满，无左右边距；每页一图 |
 | 5–15 | — | 保留，写 0 |
 
-**转换：超大章拆分**：写出前若单章解压合计（文本 UTF-8+`0x1E` + ImagePayload）超过 `chapter_max_bytes`（默认 **256KB**），按段落/块边界拆成多章，标题形如 `原名 (1/N)`。须严格小于固件硬上限 **384KB**（`DEVICE_CHAPTER_MAX_UNCOMP` / `kMaxChapterUncompForPaginate`）；可用 `--no-chapter-size-split` 关闭（调试）。已转换旧书不受影响，需重转才拆章。
+**转换：超大章拆分**：写出前若单章解压合计（文本 UTF-8+`0x1E` + ImagePayload）超过 `chapter_max_bytes`（默认 **256KB**），按段落/块边界拆成多章，标题形如 `原名 (1/N)`。默认预算保持低于旧固件单章上限 **384KiB**，以兼容旧版本；新固件改为物理块流式排版，不再按单章解压合计拒绝打开；可用 `--no-chapter-size-split` 关闭（调试）。已转换旧书不受影响，需重转才拆章。
 
 ---
 
@@ -215,7 +215,7 @@
 **章级物化分页（当前固件）**：EPUB / `.ebook` 打开时仍会把**当前章**解成 `ContentBlock` 再折成全章 `pages_`。因此：
 
 - 转换侧默认拆掉超大章（§3.1，256KB 文本）
-- 固件拒绝 `uncompressed_total` > **384KB** 的章，并对分页 `bad_alloc` **软失败**（不 abort）
+- 新固件按物理块解压并将分页正文缓存到 SD，不再拒绝 `uncompressed_total` > **384KiB** 的章；内存不足或 SD 缓存失败分类返回错误。转换器仍默认拆成 256KiB，以兼容旧固件并降低切章等待。
 
 伪代码：
 

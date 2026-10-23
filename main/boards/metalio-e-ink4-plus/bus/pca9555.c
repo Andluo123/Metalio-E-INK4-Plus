@@ -3,7 +3,7 @@
 #include "pca9555.h"
 #include "metalio_i2c1.h"
 
-#include <driver/i2c.h>
+#include <driver/i2c_master.h>
 #include <esp_err.h>
 #include <esp_log.h>
 #include <stdint.h>
@@ -32,69 +32,18 @@ uint8_t pca9555_get_addr(void) {
     return s_pca9555_addr;
 }
 
-static esp_err_t i2c_master_read_slave(i2c_port_t i2c_num, uint8_t* data_rd, size_t size, int reg) {
-    if (size == 0) {
-        return ESP_OK;
-    }
-    if (!metalio_i2c1_lock(I2C1_LOCK_MS)) {
-        return ESP_ERR_TIMEOUT;
-    }
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    if (cmd == NULL) {
-        metalio_i2c1_unlock();
-        ESP_LOGE("epdiy", "insufficient memory for I2C transaction");
-        return ESP_ERR_NO_MEM;
-    }
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (s_pca9555_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_stop(cmd);
-
-    esp_err_t ret = i2c_master_cmd_begin(i2c_num, cmd, 50 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK) {
-        metalio_i2c1_unlock();
-        return ret;
-    }
-
-    cmd = i2c_cmd_link_create();
-    if (cmd == NULL) {
-        metalio_i2c1_unlock();
-        ESP_LOGE("epdiy", "insufficient memory for I2C transaction");
-        return ESP_ERR_NO_MEM;
-    }
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (s_pca9555_addr << 1) | I2C_MASTER_READ, true);
-    if (size > 1) {
-        i2c_master_read(cmd, data_rd, size - 1, I2C_MASTER_ACK);
-    }
-    i2c_master_read_byte(cmd, data_rd + size - 1, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-
-    ret = i2c_master_cmd_begin(i2c_num, cmd, 50 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd);
+static esp_err_t i2c_master_read_slave(i2c_port_t port, uint8_t* data, size_t size, int reg) {
+    if (size == 0) return ESP_OK;
+    if (!metalio_i2c1_lock(I2C1_LOCK_MS)) return ESP_ERR_TIMEOUT;
+    const esp_err_t ret = metalio_i2c1_read_reg_stop_locked(port, s_pca9555_addr,
+                                                          (uint8_t)reg, data, size, 50);
     metalio_i2c1_unlock();
     return ret;
 }
 
-static esp_err_t i2c_master_write_slave(i2c_port_t i2c_num, uint8_t ctrl, uint8_t* data_wr, size_t size) {
-    if (!metalio_i2c1_lock(I2C1_LOCK_MS)) {
-        return ESP_ERR_TIMEOUT;
-    }
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    if (cmd == NULL) {
-        metalio_i2c1_unlock();
-        ESP_LOGE("epdiy", "insufficient memory for I2C transaction");
-        return ESP_ERR_NO_MEM;
-    }
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (s_pca9555_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, ctrl, true);
-
-    i2c_master_write(cmd, data_wr, size, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(i2c_num, cmd, 50 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd);
+static esp_err_t i2c_master_write_slave(i2c_port_t port, uint8_t reg, uint8_t* data, size_t size) {
+    if (!metalio_i2c1_lock(I2C1_LOCK_MS)) return ESP_ERR_TIMEOUT;
+    const esp_err_t ret = metalio_i2c1_write_reg_locked(port, s_pca9555_addr, reg, data, size, 50);
     metalio_i2c1_unlock();
     return ret;
 }

@@ -1,11 +1,13 @@
 #include "cloud_screen/cloud_screen.h"
 #include "cloud_screen/cloud_screen_priv.h"
 #include "cloud_screen/cloud_chrome.h"
+#include "cloud_screen/cloud_dialogs.h"
 #include "cloud_screen/download/cloud_download.h"
 #include "cloud_screen/cloud_fetch.h"
 #include "cloud_screen/cloud_list.h"
 #include "cloud_screen/cloud_ui_helpers.h"
 #include "cloud_screen/preview/cloud_wallpaper_preview.h"
+#include "cloud_screen/ap/ap_transfer.h"
 #include "cloud_screen/push/push_resources_library.h"
 #include "cloud_screen/push/push_resources_priv.h"
 
@@ -23,6 +25,7 @@
 #include "reader/reader.h"
 #include "reader/download_gate.h"
 #include "screen_common.h"
+#include "settings_storage_tab.h"
 #include "vk_key_handler.h"
 #include "vk_page_repeat.h"
 #include "application.h"
@@ -35,6 +38,7 @@ UiState& Cloud_State() {
 }
 
 lv_timer_t* s_status_clear_timer = nullptr;
+static lv_timer_t* s_storage_error_timer = nullptr;
 DownloadGate s_dl_gate{};
 DownloadGate s_sync_gate{};  // 进页/手动拉列表刷新
 int64_t s_last_user_sync_us = 0;  // 上次手动刷新；0=尚未点过
@@ -83,6 +87,8 @@ void InvalidateSession() {
              static_cast<unsigned>(st.xfer.op_generation + 1));
     // 停传输业务；等网任务可复用（勿杀句柄）
     DetachCloudNetPrep("InvalidateSession");
+    CloudRadioAbandon();
+    SettingsStorageTab_Reset();
     s_dl_gate.RequestCancel();
     s_sync_gate.RequestCancel();
     AbortCloudGatesOffLvgl();
@@ -115,6 +121,7 @@ void InvalidateSession() {
     st.xfer.dl_user_abort = false;
     st.xfer.dl_job_total = 0;
     st.xfer.dl_job_done = 0;
+    CloseDialog();
     HideDlProgressPage();
     st.xfer.download_type = reader::PushResourceType::kUnknown;
     st.xfer.download_gen = 0;
@@ -124,14 +131,18 @@ void InvalidateSession() {
     StopDlWorker();
 }
 
-void AsyncStopTransferUi(void* /*user*/) {
+void AsyncStopTransferUi(void* user) {
+    const auto gen = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(user));
+    if (Cloud_State().xfer.op_generation != gen) return;
     ApplyStopTransferUi();
 }
 
 void ApplyStopTransferUi() {
     auto& st = Cloud_State();
     const bool was_busy =
-        st.xfer.download_busy || st.data.batch_busy || st.data.delete_busy || st.xfer.dl_page_open;
+        st.xfer.download_busy || st.data.batch_busy || st.data.delete_busy || st.xfer.dl_page_open ||
+        st.xfer.pending_index >= 0;
+    if (was_busy) ++st.xfer.op_generation;
     st.xfer.download_busy = false;
     st.xfer.download_gen = 0;
     st.xfer.download_key.clear();
@@ -144,6 +155,7 @@ void ApplyStopTransferUi() {
     st.xfer.dl_job_total = 0;
     st.xfer.dl_job_done = 0;
     s_dl_owns_http.store(false, std::memory_order_release);
+    CloseDialog();
     HideDlProgressPage();
     StopDlWorker();
     if (!ScreenAlive() || !was_busy) {
@@ -166,7 +178,8 @@ void RequestStopTransfer(const char* why) {
     s_dl_gate.RequestCancel();
     s_sync_gate.RequestCancel();
     AbortCloudGatesOffLvgl();
-    if (!ScreenLvAsync(AsyncStopTransferUi, nullptr)) {
+    if (!ScreenLvAsync(AsyncStopTransferUi, reinterpret_cast<void*>(
+            static_cast<uintptr_t>(Cloud_State().xfer.op_generation)))) {
         ApplyStopTransferUi();
     }
 }
@@ -176,9 +189,16 @@ bool Cloud_OnVkKey(const char* key) {
         return true;
     }
     auto& st = Cloud_State();
+    if (st.dialogs.storage_error_mask != nullptr) return true;
     if (std::strcmp(key, "vk_home") == 0) {
         RequestStopTransfer("vk_home");
         ScreenRequestHome();
+        return true;
+    }
+    if (st.xfer.pending_index >= 0) {
+        if (std::strcmp(key, "vk_prev") == 0) {
+            AbortDownloadJobFromUi();
+        }
         return true;
     }
     if (st.xfer.dl_page_open) {
@@ -279,6 +299,10 @@ void Cloud_OnScreenDeleted(lv_event_t* e) {
     if (lv_event_get_target(e) != st.chrome.screen) {
         return;
     }
+    if (s_storage_error_timer != nullptr) {
+        lv_timer_delete(s_storage_error_timer);
+        s_storage_error_timer = nullptr;
+    }
     ScreenPaintCoalesceReset(&s_cloud_paint);
     ScreenPaintCoalesceReset(&s_cloud_check_paint);
     InvalidateSession();
@@ -301,11 +325,26 @@ void Cloud_OnScreenDeleted(lv_event_t* e) {
     st.chrome.sync_lbl = nullptr;
     st.chrome.multi_bar = nullptr;
     st.chrome.page_lbl = nullptr;
+    st.chrome.radio_status_lbl = nullptr;
     st.chrome.section_title = nullptr;
     st.chrome.status_lbl = nullptr;
+    st.chrome.header_row = nullptr;
+    st.chrome.list_frame = nullptr;
+    st.chrome.ap_panel = nullptr;
+    st.chrome.ap_ssid_lbl = nullptr;
+    st.chrome.ap_url_lbl = nullptr;
+    st.chrome.ap_status_lbl = nullptr;
+    st.chrome.ap_qr_wifi = nullptr;
+    st.chrome.ap_qr_url = nullptr;
+    st.chrome.usb_panel = nullptr;
+    st.chrome.filter_row = nullptr;
     for (int i = 0; i < kTabCount; ++i) {
         st.chrome.tab_btns[i] = nullptr;
         st.chrome.tab_lbls[i] = nullptr;
+    }
+    for (int i = 0; i < kFilterTabCount; ++i) {
+        st.chrome.filter_btns[i] = nullptr;
+        st.chrome.filter_lbls[i] = nullptr;
     }
     st.preview.body = nullptr;
     st.preview.title = nullptr;
@@ -315,6 +354,7 @@ void Cloud_OnScreenDeleted(lv_event_t* e) {
     st.preview.img_host = nullptr;
     st.preview.download_btn = nullptr;
     st.preview.download_lbl = nullptr;
+    st.dialogs.storage_error_mask = nullptr;
     st.dialogs.dialog_mask = nullptr;
     st.dialogs.action_mask = nullptr;
     st.xfer.dl_page = nullptr;
@@ -340,7 +380,7 @@ lv_obj_t* CloudScreen::Create() {
     st.data.error.clear();
     st.data.status_text[0] = '\0';
     st.data.page = 0;
-    st.data.filter_tab = 0;
+    st.data.mode = kCloudModeAp;
     st.data.fetch_done = false;
     st.data.covers_loading = false;
     st.data.multi = false;
@@ -355,11 +395,26 @@ lv_obj_t* CloudScreen::Create() {
     st.chrome.sync_lbl = nullptr;
     st.chrome.multi_bar = nullptr;
     st.chrome.page_lbl = nullptr;
+    st.chrome.radio_status_lbl = nullptr;
     st.chrome.section_title = nullptr;
     st.chrome.status_lbl = nullptr;
+    st.chrome.header_row = nullptr;
+    st.chrome.list_frame = nullptr;
+    st.chrome.ap_panel = nullptr;
+    st.chrome.ap_ssid_lbl = nullptr;
+    st.chrome.ap_url_lbl = nullptr;
+    st.chrome.ap_status_lbl = nullptr;
+    st.chrome.ap_qr_wifi = nullptr;
+    st.chrome.ap_qr_url = nullptr;
+    st.chrome.usb_panel = nullptr;
+    st.chrome.filter_row = nullptr;
     for (int i = 0; i < kTabCount; ++i) {
         st.chrome.tab_btns[i] = nullptr;
         st.chrome.tab_lbls[i] = nullptr;
+    }
+    for (int i = 0; i < kFilterTabCount; ++i) {
+        st.chrome.filter_btns[i] = nullptr;
+        st.chrome.filter_lbls[i] = nullptr;
     }
     st.preview.body = nullptr;
     st.preview.title = nullptr;
@@ -374,6 +429,7 @@ lv_obj_t* CloudScreen::Create() {
     st.preview.open = false;
     // 勿清 preview busy：孤儿靠 epoch 自停
     ++st.preview.epoch;
+    st.dialogs.storage_error_mask = nullptr;
     st.dialogs.dialog_mask = nullptr;
     st.dialogs.action_mask = nullptr;
     st.xfer.dl_page = nullptr;
@@ -398,7 +454,6 @@ lv_obj_t* CloudScreen::Create() {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, Cloud_UiFont(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    Cloud_DisableScroll(scr);
     st.chrome.screen = scr;
     lv_obj_add_event_cb(scr, Cloud_OnScreenDeleted, LV_EVENT_DELETE, nullptr);
 
@@ -414,8 +469,10 @@ lv_obj_t* CloudScreen::Create() {
     s_last_user_sync_us = 0;
     BuildCloudMainChrome(scr, status.height);
     BuildWallpaperPreviewChrome(scr, status.height);
-
-    ScheduleNetPrepAndFetch();
+    s_storage_error_timer = lv_timer_create([](lv_timer_t*) {
+        if (ApTransferNeedsStorageRestart()) ShowStorageErrorDialog();
+    }, 500, nullptr);
+    EnterCloudMode(kCloudModeAp);
 
     VkKey_AttachScreen(scr, kScreenId,
                        VkKeyScreenDesc{CloudScreen::Create, Cloud_OnVkKey, nullptr, nullptr, nullptr,
@@ -425,4 +482,19 @@ lv_obj_t* CloudScreen::Create() {
 
 void CloudScreen::StopTransfer() {
     RequestStopTransfer("api");
+}
+
+void CloudScreen::ParkApForStandby() {
+    ::ParkApForStandby();
+}
+
+void CloudScreen::ReloadApAfterStandby() {
+    ::ReloadApAfterStandby();
+}
+
+void Cloud_RebootAfterStorageError() {
+    Application::GetInstance().Schedule([] {
+        ApTransferStop(false);
+        Application::GetInstance().Reboot();
+    });
 }

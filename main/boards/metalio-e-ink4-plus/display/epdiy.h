@@ -112,6 +112,11 @@ enum EpdDrawMode {
     /// Enforce NOT using S3 Vector extensions.
     /// USed for testing.
     MODE_FORCE_NO_PIE = 0x800,
+    // S31 full-screen gray wipe/reveal; bits 13..14 encode UI orientation.
+    MODE_SPATIAL_WIPE_GL = 0x1000,
+    /// Ordinary differential updates: equal old/new pixels emit no drive action.
+    /// Do not use for full refresh, recovery, tests or conditioning animations.
+    MODE_SKIP_UNCHANGED = 0x8000,
 };
 
 /** Display software rotation.
@@ -258,6 +263,8 @@ void epd_poweroff();
 
 /** Clear the whole screen by flashing it. */
 void epd_clear();
+// Checked clear for recovery: callers must not claim a white baseline on failure.
+enum EpdDrawError epd_clear_checked();
 
 /**
  * Clear an area by flashing it.

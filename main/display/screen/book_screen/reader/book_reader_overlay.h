@@ -47,9 +47,13 @@ void SetReadSettingsSheetVisible(bool visible);
 /** @brief 设置卡片打开时点正文只收起，不走分区动作 */
 void HideReadChrome();
 /** @brief 显示排版设置卡 */
-void ShowReadSettingsSheet();
+void ShowReadSettingsSheet(bool default_duration = true);
 /** @brief 打开目录页 */
 void OpenReadToc();
+/** @brief 直接打开书签 / 字体 / 阅读设置面板 */
+void OpenReadBookmarks();
+void OpenReadFontSettings();
+void OpenReadSettings();
 /** @brief 异步隐藏阅读顶栏/设置等 chrome */
 void AsyncHideReadChrome(void* user_data);
 /** @brief BOOT 短按：正文弹出/收起悬浮排版卡片（须 LVGL 任务，禁止 touch_feed 同步改树）。 */

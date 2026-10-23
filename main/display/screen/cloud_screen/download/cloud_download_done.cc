@@ -59,20 +59,21 @@ void EraseItemAt(int idx) {
 
 void ScheduleBatchContinueSoon(const char* why) {
     ESP_LOGI(TAG, "batch continue scheduled (%s)", why != nullptr ? why : "");
-    Application::GetInstance().Schedule([]() {
+    const uint32_t gen = Cloud_State().xfer.op_generation;
+    Application::GetInstance().Schedule([gen]() {
+        if (!OpStillValid(gen)) return;
         lv_timer_t* t = lv_timer_create(
             [](lv_timer_t* timer) {
-                if (timer != nullptr) {
-                    lv_timer_set_user_data(timer, nullptr);
-                }
+                const auto gen = static_cast<uint32_t>(
+                    reinterpret_cast<uintptr_t>(lv_timer_get_user_data(timer)));
                 auto& st2 = Cloud_State();
-                if (!ScreenAlive() || !st2.data.batch_busy) {
+                if (!OpStillValid(gen) || !st2.data.batch_busy) {
                     return;
                 }
                 ESP_LOGI(TAG, "batch continue after settle");
                 ContinueBatchSaveIfNeeded();
             },
-            150, nullptr);
+            150, reinterpret_cast<void*>(static_cast<uintptr_t>(gen)));
         if (t == nullptr) {
             ESP_LOGW(TAG, "batch continue timer create failed");
             ContinueBatchSaveIfNeeded();
@@ -86,18 +87,7 @@ void AsyncDownloadDone(void* user_data) {
     auto* done = static_cast<CloudDownloadDoneMsg*>(user_data);
     auto& st = Cloud_State();
     if (!OpStillValid(done->op_gen)) {
-        st.data.batch_save_ids.clear();
-        st.data.batch_busy = false;
-        st.xfer.download_busy = false;
-        st.xfer.download_gen = 0;
-        st.xfer.download_key.clear();
-        st.xfer.dl_cancel_pending = false;
-        st.xfer.dl_cancel_key.clear();
-        st.xfer.dl_user_abort = false;
-        HideDlProgressPage();
         delete done;
-        ResumeCloudSideHttpAfterDl();
-        StopDlWorker();
         return;
     }
 
@@ -213,6 +203,9 @@ void AsyncDownloadDone(void* user_data) {
 
 void ContinueBatchSaveIfNeeded() {
     auto& st = Cloud_State();
+    if (st.xfer.pending_index >= 0 || st.xfer.download_busy) {
+        return;
+    }
     if (st.xfer.dl_user_abort) {
         st.data.batch_save_ids.clear();
         st.data.batch_busy = false;

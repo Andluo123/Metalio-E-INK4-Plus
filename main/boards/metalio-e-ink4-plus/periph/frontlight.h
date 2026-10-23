@@ -63,6 +63,9 @@ public:
      */
     void RestoreBrightness();
 
+    /** Restore the saved UI target without enabling the hardware output. */
+    void PrepareBrightnessRestore();
+
     /**
      * @brief 设置目标亮度（0–100），经定时器逐步过渡
      * @param brightness 目标亮度

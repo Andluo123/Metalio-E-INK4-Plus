@@ -38,8 +38,15 @@ void ResumeCloudSideHttpAfterDl();
 void OnDownloadProgress(int percent, void* user);
 /** @brief 云下载 worker 入口 */
 void CloudDownloadWorker(void* arg);
-/** @brief 开始单项资源下载 */
-void StartResourceDownload(int index);
+enum class CloudSaveChoice {
+    kAsk, // 同名时等待用户选择
+    kReplace, // 明确覆盖原文件
+    kKeepBoth, // 自动生成新文件名
+    kSkip, // 本轮跳过，保留云端任务
+};
+
+/** @brief 开始单项资源下载；同名时按用户选择处理 */
+void StartResourceDownload(int index, CloudSaveChoice choice = CloudSaveChoice::kAsk);
 /** @brief 下载完成异步回调入口 */
 void AsyncDownloadDone(void* user_data);
 /** @brief 若批量保存未完则继续 */

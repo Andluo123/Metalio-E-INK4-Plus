@@ -1,3 +1,4 @@
+#include "epd_content_policy.h"
 #include "wallpaper_screen/preview/wallpaper_preview.h"
 #include "wallpaper_screen/wallpaper_screen_priv.h"
 #include "wallpaper_screen/preview/wallpaper_adjust.h"
@@ -38,12 +39,14 @@ void ClearPreviewImage() {
 struct LoadWork {
     int index = -1;
     uint32_t epoch = 0;
+    uint32_t generation = 0;
     char path[192] = {};
 };
 
 struct LoadResultMsg {
     int index = -1;
     uint32_t epoch = 0;
+    uint32_t generation = 0;
     bool ok = false;
     char err[80] = {};
     reader::RasterImage* img = nullptr;
@@ -59,11 +62,19 @@ void ApplyPreviewAsync(void* p) {
     if (!Wallpaper_State().screen_alive || msg->epoch != Wallpaper_State().epoch) {
         delete msg->img;
         delete msg;
+        if (Wallpaper_State().screen_alive.load() && !Wallpaper_State().decode_paused.load() &&
+            Wallpaper_State().mode == UiMode::kPreview && Wallpaper_State().preview.raster == nullptr) {
+            ScheduleLoadPreview(Wallpaper_State().preview.idx);
+        }
         return;
     }
-    if (Wallpaper_State().mode != UiMode::kPreview || msg->index != Wallpaper_State().preview.idx) {
+    if (Wallpaper_State().decode_paused.load() ||
+        msg->generation != Wallpaper_State().decode_generation.load() ||
+        Wallpaper_State().mode != UiMode::kPreview || msg->index != Wallpaper_State().preview.idx) {
         delete msg->img;
         delete msg;
+        if (!Wallpaper_State().decode_paused.load() && Wallpaper_State().mode == UiMode::kPreview &&
+            Wallpaper_State().preview.raster == nullptr) ScheduleLoadPreview(Wallpaper_State().preview.idx);
         return;
     }
 
@@ -94,6 +105,7 @@ void ApplyPreviewAsync(void* p) {
     if (Wallpaper_State().ui.preview_img != nullptr) {
         lv_image_set_scale(Wallpaper_State().ui.preview_img, LV_SCALE_NONE);
         lv_image_set_src(Wallpaper_State().ui.preview_img, &Wallpaper_State().preview.raster->dsc);
+        EpdSetContentRole(Wallpaper_State().ui.preview_img,EpdContentRole::WallpaperPreview);
         lv_obj_set_size(Wallpaper_State().ui.preview_img, Wallpaper_State().preview.raster->width, Wallpaper_State().preview.raster->height);
         lv_obj_clear_flag(Wallpaper_State().ui.preview_img, LV_OBJ_FLAG_HIDDEN);
         lv_obj_center(Wallpaper_State().ui.preview_img);
@@ -120,10 +132,12 @@ void LoadPreviewTask(void* arg) {
     } else {
         msg->index = work->index;
         msg->epoch = work->epoch;
+        msg->generation = work->generation;
+        WallpaperDecodeToken token{work->epoch, work->generation};
         auto* img = new reader::RasterImage();
-        if (!reader::DecodeImageFileToL8(work->path, FrameInner(kPreviewMaxW, kBorderW),
-                                         FrameInner(kPreviewMaxH, kBorderW), *img) ||
-            img->empty()) {
+        if (!reader::DecodeImageFileToL8(work->path, 0, 0, *img, Wallpaper_DecodeCancelled, &token) ||
+            !reader::ScaleRasterToFit(*img, FrameInner(kPreviewMaxW, kBorderW),
+                                     FrameInner(kPreviewMaxH, kBorderW), *img)) {
             delete img;
             std::snprintf(msg->err, sizeof(msg->err), "%s", Lang::Strings::WALLPAPER_DECODE_FAIL);
         } else {
@@ -134,7 +148,7 @@ void LoadPreviewTask(void* arg) {
         delete work;
     }
 
-    if (lv_async_call(ApplyPreviewAsync, msg) != LV_RESULT_OK) {
+    if (!ScreenLvAsync(ApplyPreviewAsync, msg)) {
         delete msg->img;
         delete msg;
         Wallpaper_State().workers.load_busy.store(false);
@@ -144,6 +158,7 @@ void LoadPreviewTask(void* arg) {
 }
 
 void ScheduleLoadPreview(int index) {
+    if (Wallpaper_State().decode_paused.load()) return;
     if (index < 0 || index >= static_cast<int>(Wallpaper_State().list.files.size())) {
         ESP_LOGW(TAG, "preview skip: bad index=%d files=%u", index,
                  static_cast<unsigned>(Wallpaper_State().list.files.size()));
@@ -156,6 +171,7 @@ void ScheduleLoadPreview(int index) {
     auto* work = new LoadWork{};
     work->index = index;
     work->epoch = Wallpaper_State().epoch;
+    work->generation = Wallpaper_State().decode_generation.load();
     std::snprintf(work->path, sizeof(work->path), "%s",
                   Wallpaper_State().list.files[static_cast<size_t>(index)].path);
     // 与 thumb 相同：解码栈放 SPIRAM，避免内部 12KB 连续块不足 →「预览启动失败」
@@ -195,6 +211,8 @@ void OpenPreview(int index) {
     if (index < 0 || index >= static_cast<int>(Wallpaper_State().list.files.size())) {
         return;
     }
+    CancelThumbFill();
+    Wallpaper_State().decode_generation.fetch_add(1);
     CloseOverwriteDialog();
     Wallpaper_State().preview.adjust_open = false;
     ResetOrientState();
@@ -216,9 +234,11 @@ void OpenPreview(int index) {
     UpdateDeleteButtonUi();
     UpdateAdjustUi();
     ScheduleLoadPreview(index);
+    Wallpaper_RevealAfterWhite();
 }
 
 void ClosePreview() {
+    Wallpaper_State().decode_generation.fetch_add(1);
     CloseOverwriteDialog();
     if (Wallpaper_State().workers.save_busy.load()) {
         ++Wallpaper_State().epoch;  // 作废在途保存
@@ -231,6 +251,7 @@ void ClosePreview() {
     ClearPreviewImage();
     ShowMode(UiMode::kList);
     RebuildListPage();
+    Wallpaper_RevealAfterWhite();
 }
 
 void BuildPreviewBody(lv_obj_t* scr, lv_coord_t status_h) {

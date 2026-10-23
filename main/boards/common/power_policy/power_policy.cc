@@ -1,7 +1,9 @@
+#include "settings_screen/settings_log_upload.h"
 #include "power_policy.h"
 
 #include "power_policy_priv.h"
 #include "power_hw.h"
+#include "dual_network_board.h"
 #include "application.h"
 #include "assets/lang_config.h"
 #include "settings.h"
@@ -76,7 +78,8 @@ bool AnyFullNeed()
 bool AnyNetNeed()
 {
     return NeedHeld(PowerNeed::AudioSession) || NeedHeld(PowerNeed::LocalMic) ||
-           NeedHeld(PowerNeed::OtaDownload) || NeedHeld(PowerNeed::UiKeepNet);
+           NeedHeld(PowerNeed::OtaDownload) || NeedHeld(PowerNeed::UiKeepNet) ||
+           NeedHeld(PowerNeed::PeripheralReset);
 }
 
 bool DeviceWantsPerf(DeviceState st)
@@ -107,7 +110,8 @@ bool DeviceWantsPa(DeviceState st)
 
 bool NeedsHardNetActiveLocked()
 {
-    if (NeedHeld(PowerNeed::LocalMic) || NeedHeld(PowerNeed::OtaDownload)) {
+    if (NeedHeld(PowerNeed::LocalMic) || NeedHeld(PowerNeed::OtaDownload) ||
+        NeedHeld(PowerNeed::PeripheralReset)) {
         return true;
     }
     return DeviceWantsPerf(pwr::device_state);
@@ -215,7 +219,8 @@ pwr::Mode EvaluateProvisioningLocked()
 
 bool IsWifiBoard()
 {
-    return true; // S31 仅 WifiBoard
+    auto* dual = dynamic_cast<DualNetworkBoard*>(pwr::board);
+    return dual == nullptr || dual->GetNetworkType() == NetworkType::WIFI;
 }
 
 void RestoreWifiConfigUiAsync(void* /*arg*/)
@@ -240,6 +245,15 @@ void RestoreProvisioningUiAsync(void* /*arg*/)
 /** 与 boot_key EnterStandbyAsync 同形：无 lambda；进待机前先停传输 */
 void EnterStandbyUiShowCb(void* /*arg*/)
 {
+    // The UI queue may run after a transfer has acquired its power need.
+    // Never let an obsolete idle request cancel that transfer.
+    xSemaphoreTake(pwr::mu, portMAX_DELAY);
+    const bool still_idle = pwr::standby_ui_requested && pwr::mode == pwr::Mode::StandbyUi &&
+        !NeedsHardNetActiveLocked() && !AnyFullNeed() &&
+        !NeedHeld(PowerNeed::StandbyInhibit) && !NeedHeld(PowerNeed::UsbVirtualDisk);
+    xSemaphoreGive(pwr::mu);
+    if (!still_idle) return;
+    SettingsLogUpload_RequestAbort("standby");
     CloudScreen::StopTransfer();
     StandbyScreen::Show();
 }
@@ -389,6 +403,7 @@ void CpuFreqAsyncCb(void* /*arg*/)
 
 void TickCb(void* /*arg*/)
 {
+    power_hw_report_sleep_reset();
     if (pwr::mu == nullptr) {
         return;
     }
@@ -502,6 +517,7 @@ void FlushCpuFreqOutsideLock()
 
 void BeginPowerOffLocked()
 {
+    SettingsLogUpload_RequestAbort("shutdown");
     if (shutdown_requested) {
         return;
     }
@@ -562,6 +578,7 @@ void ApplyLocked(Mode next)
         }
         // 档位未变时仍按 DeviceState 刷 PA：Idle↔Speaking 等常停在 NetActive
         const bool want_pa =
+            !NeedHeld(PowerNeed::PeripheralReset) &&
             !NeedHeld(PowerNeed::UiKeepNet) &&
             ((next == Mode::Full) || (next == Mode::NetActive && DeviceWantsPa(device_state)));
         if (!NeedHeld(PowerNeed::UiKeepNet)) {
@@ -594,6 +611,7 @@ void ApplyLocked(Mode next)
 
     const int want_mhz = (next == Mode::AppIdle) ? idle_cpu_mhz : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
     const bool want_pa =
+        !NeedHeld(PowerNeed::PeripheralReset) &&
         !NeedHeld(PowerNeed::UiKeepNet) &&
         ((next == Mode::Full) || (next == Mode::NetActive && DeviceWantsPa(device_state)));
     // 待机须 Overlay 已起来再停网（电源键短按就是先 Show 再 Reevaluate）
@@ -648,6 +666,7 @@ PowerPolicy& PowerPolicy::GetInstance()
 
 void PowerPolicy::Init(Board* board)
 {
+    ESP_ERROR_CHECK(power_hw_sleep_init());
     LoadPowerPrefsFromNvs();
     SelfCheckThresholdsOnce();
     pwr::board = board;
@@ -682,12 +701,19 @@ void PowerPolicy::Acquire(PowerNeed need)
     }
     xSemaphoreTake(pwr::mu, portMAX_DELAY);
     if (need == PowerNeed::PhoneCall || need == PowerNeed::BtAudio || need == PowerNeed::AudioSession ||
-        need == PowerNeed::LocalMic || need == PowerNeed::OtaDownload || need == PowerNeed::UiKeepNet) {
+        need == PowerNeed::LocalMic || need == PowerNeed::OtaDownload || need == PowerNeed::UiKeepNet ||
+        need == PowerNeed::PeripheralReset) {
         pwr::ClearNetGraceLocked();
     }
     uint8_t& ref = pwr::need_ref[static_cast<int>(need)];
     if (ref < 255) {
         ++ref;
+    }
+    if (!StandbyScreen::IsActive() &&
+        (NeedsHardNetActiveLocked() || AnyFullNeed() ||
+         NeedHeld(PowerNeed::StandbyInhibit) || NeedHeld(PowerNeed::UsbVirtualDisk))) {
+        pwr::standby_ui_requested = false;
+        pwr::standby_show_pending = false;
     }
     pwr::ReevaluateLocked();
     xSemaphoreGive(pwr::mu);
@@ -794,6 +820,7 @@ void PowerPolicy::RequestReevaluate()
 
 void PowerPolicy::RequestPowerOff()
 {
+    SettingsLogUpload_RequestAbort("power_off");
     if (pwr::mu == nullptr) {
         power_hw_begin_power_off();
         return;
@@ -818,7 +845,6 @@ void PowerPolicy::OnStandbyOverlayDismissed()
     pwr::ReevaluateLocked();
     pwr::standby_wake_exit = false;
     xSemaphoreGive(pwr::mu);
-    pwr::ResumeIotKeysIfNeeded();
     pwr::FlushCpuFreqOutsideLock();
 }
 

@@ -9,6 +9,7 @@
 #include <lvgl.h>
 
 #include "book_screen/reader/book_reader_prefs.h"
+#include "book_screen/cover/book_cover_geometry.h"
 #include "reader/book_library.h"
 #include "reader/book_session.h"
 #include "reader/reader_types.h"
@@ -29,15 +30,14 @@ constexpr const char* kBookFontPathAlt = SD_PATH_BOOK_FONT_ALT;
 constexpr lv_coord_t kListPad = UiSx(16);   // 首页/书架外边距
 constexpr lv_coord_t kFooterH = UiSy(36);   // 阅读底栏槽高（397=36）
 // 分页高度相对正文区再收一点：末行字形/下划线(+4)可能略超 line_height，避免钻进底栏
-constexpr lv_coord_t kReadViewportBottomSlack = UiSy(8);
-constexpr lv_coord_t kCoverFrameBorder = 2; // 封面外框；≥2px 减轻 DU 擦白残影
+constexpr lv_coord_t kReadViewportBottomSlack = UiSy(4);
 constexpr lv_coord_t kCoverSpineInset = UiSx(6);  // 书脊竖线相对左边框内缩
 constexpr lv_coord_t kRowBorderW = UiSx(2);
 constexpr lv_coord_t kRowRadius = UiSx(8);
 constexpr lv_coord_t kReadPadTop = kListPad;  // 与左右边距一致
 constexpr int kFontListPageSize = 5;         // 设置卡字体列表每页固定行数
 constexpr uint32_t kLayoutDebounceMs = 300;   // 抬起且停顿后再排版（定时器内仍会等手指）
-constexpr uint32_t kLayoutHintTickMs = 500;   // 「完成」提示到期检查
+constexpr uint32_t kLayoutHintTickMs = 2000;  // 分阶段编排结果发布与提示到期检查
 constexpr int64_t kLayoutHintDoneUs = 1500 * 1000;  // 「完成」显示时长
 
 struct ReadFontEntry {
@@ -108,6 +108,8 @@ struct BookUiState {
         std::unique_ptr<reader::BookSession> session;
         lv_obj_t* read_scr = nullptr;
         lv_obj_t* content = nullptr;
+        lv_obj_t* text_raster_image = nullptr; // Cleared by the image's DELETE event.
+        lv_obj_t* background_layer = nullptr;
         lv_obj_t* footer_host = nullptr; // 底栏白底槽；page_label 放其中
         lv_obj_t* page_label = nullptr;
         lv_obj_t* title_label = nullptr;
@@ -135,6 +137,8 @@ struct BookUiState {
         // 异步打开：worker 解析，经 ScreenLvAsync 回 LVGL（禁止 worker 裸 lv_async_call）
         std::atomic<bool> opening{false};
         std::atomic<uint32_t> open_token{0};
+        bool prefs_reopen_pending = false; // LVGL: wait for all session/font users before reopen
+        lv_timer_t* prefs_reopen_timer = nullptr;
         bool deferred_cleanup = false;  // 打开中离开：结束后再关 session/字库
         reader::BookFormat opening_format = reader::BookFormat::kTxt;
 
@@ -171,10 +175,27 @@ struct BookUiState {
 
         // 阅读时长 checkpoint：仅 LVGL 任务启停；周期 fold+写 .pos
         lv_timer_t* read_time_ckpt_timer = nullptr;
+        bool standby_paused = false; // UI：取消后等待原有 worker 完成，阻止新任务
+        bool standby_detached = false; // UI：字库及 SD 句柄已关闭
         bool reading_paused_by_standby = false; // 进待机停钟，退出待机可恢复
     } reader;
 
     struct Settings {
+        reader::RasterImage reader_sheet_cover;
+        int reader_tab = 4; // 0 toc, 1 font, 2 bookmark, 3 settings, 4 default duration
+        int bookmark_group=0;
+        bool bookmark_multi=false;
+        std::vector<uint32_t> bookmark_selected;
+        std::string bookmark_ui_path;
+        bool reader_light_page = false; // independent top frontlight panel
+        lv_obj_t* reader_light_panel = nullptr;
+        bool reader_sheet_scrolling = false;
+        bool reader_eye_mode = false;
+        int reader_eye_previous_cct = 3; // FrontlightCct::kOff
+        lv_obj_t* reader_sheet_body = nullptr;
+        lv_obj_t* reader_sheet_scroll = nullptr;
+        lv_coord_t reader_scroll[5] = {};
+        lv_coord_t reader_scroll_last = 0;
         lv_obj_t* settings_sheet = nullptr;  // 悬浮设置卡片（盖正文）
         // 设置卡控件缓存：字体翻页 / 边距行距 ± 原地刷，避免整卡 clean
         struct SheetFontRow {
@@ -199,6 +220,8 @@ struct BookUiState {
         lv_obj_t* sheet_gap_bound = nullptr;
         lv_obj_t* sheet_fl_bright_value = nullptr; // 前光亮度文案
         std::vector<ReadFontEntry> font_entries;
+        bool font_scan_loading = false; // 后台字体目录扫描尚未发布
+        bool font_scan_failed = false; // 扫描或任务创建失败，容器显示错误提示
         int font_list_page = 0;  // 设置卡字体列表页码
         bool font_multi = false;
         std::vector<uint8_t> font_selected; // 与 font_entries 等长
@@ -262,6 +285,7 @@ BookUiState& Book_State();
 /** @brief 是否为目录/设置等覆盖层 chrome */
 bool IsReadOverlayChrome(BookUiState::ReadChrome c);
 /** @brief 按偏好刷新正文几何（须在 LVGL 任务） */
+lv_coord_t ReaderFooterHeight();
 void ApplyReaderPageGeometry(ReaderGeomMode mode);
 /** @brief 方向切换后重设顶栏/底栏/设置卡尺寸（横屏卡可滚） */
 void ApplyReaderChromeSize();

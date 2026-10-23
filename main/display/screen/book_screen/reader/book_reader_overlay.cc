@@ -1,6 +1,7 @@
 #pragma GCC optimize("O1")
 
 #include "book_screen/reader/book_reader_overlay.h"
+#include "book_screen/reader/book_auto_turn.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/settings/book_font_multi.h"
 #include "book_screen/book_font_runtime.h"
@@ -10,12 +11,14 @@
 #include "book_screen/reader/book_open_worker.h"
 #include "book_screen/reader/book_reader_prefs.h"
 #include "book_screen/settings/book_tap_ui.h"
+#include "book_screen/settings/book_ttf_panel.h"
 #include "book_screen/reader/book_toc_footer.h"
 #include "book_screen/book_nav.h"
 #include "book_screen/reader/book_reader_body.h"
 #include "book_screen/settings/book_settings_sheet.h"
 
 #include <lvgl.h>
+#include "epd_refresh.h"
 #include <cstdio>
 
 void SetReadStatusVisible(bool visible) {
@@ -60,6 +63,7 @@ void SetReadStatusCenterTitle(const char* title) {
 }
 
 void SetReadSettingsSheetVisible(bool visible) {
+    if (ReaderAutoTurnEnabled()) ResetReaderAutoTurnDeadline();
     auto& st = Book_State();
     if (st.settings.settings_sheet == nullptr || !lv_obj_is_valid(st.settings.settings_sheet)) {
         return;
@@ -80,9 +84,16 @@ void SetReadSettingsSheetVisible(bool visible) {
 }
 
 void HideReadChrome() {
+    CancelReadFontScan();
+    CloseBookmarkMessage();
+    HideReadLightPanel();
+    ResetBookmarkSelection();
     auto& st = Book_State();
+    st.settings.reader_sheet_scrolling = false;
+    EpdSetUiScrolling(false);
     ScreenPaintCoalesceReset(&s_settings_sheet_paint);
     TapZonesPanelClose();
+    TtfPanelClose();
     st.settings.font_multi = false;
     st.settings.font_suppress_click_until_us = 0;
     st.settings.font_suppress_click_idx = -1;
@@ -105,6 +116,16 @@ void HideReadChrome() {
     } else if (was_settings) {
         // 关卡：落盘未完成的 ± 排版，并重绘正文
         FlushLayoutDebounce();
+        // Long TOC/font lists can own hundreds of widgets. Release them before
+        // rendering the page instead of retaining an invisible card in RAM.
+        CancelListCoverFill();
+        ClearSettingsSheetWidgetRefs();
+        if (st.settings.settings_sheet && lv_obj_is_valid(st.settings.settings_sheet))
+            lv_obj_clean(st.settings.settings_sheet);
+        st.settings.reader_sheet_cover.Reset();
+        if (st.settings.reader_light_panel && lv_obj_is_valid(st.settings.reader_light_panel))
+            lv_obj_delete(st.settings.reader_light_panel);
+        st.settings.reader_light_panel = nullptr;
         ApplyReaderPageGeometry(ReaderGeomMode::kImmersive);
         StartChapterPageWorker();
         if (st.reader.session && st.reader.session->IsOpen() && st.reader.content != nullptr) {
@@ -115,10 +136,13 @@ void HideReadChrome() {
 
 // 设置卡控件已缓存时原地刷；不再因按下推迟整卡 clean（±/翻页不拆树）
 void ClearSettingsSheetWidgetRefs() {
+    ResetReadingSheetLiveRefs();
     auto& st = Book_State();
     for (int i = 0; i < kFontListPageSize; ++i) {
         st.settings.sheet_font_rows[i] = {};
     }
+    st.settings.reader_sheet_body = nullptr;
+    st.settings.reader_sheet_scroll = nullptr;
     st.settings.sheet_font_title = nullptr;
     st.settings.sheet_font_page_prev = nullptr;
     st.settings.sheet_font_page_next = nullptr;
@@ -149,9 +173,7 @@ void ClearSettingsSheetWidgetRefs() {
 
 bool SettingsSheetWidgetsReady() {
     auto& st = Book_State();
-    return st.settings.settings_sheet != nullptr && lv_obj_is_valid(st.settings.settings_sheet) &&
-           st.settings.sheet_margin_value != nullptr && lv_obj_is_valid(st.settings.sheet_margin_value) &&
-           st.settings.sheet_font_page_lab != nullptr && lv_obj_is_valid(st.settings.sheet_font_page_lab);
+    return st.settings.reader_sheet_body != nullptr && lv_obj_is_valid(st.settings.reader_sheet_body);
 }
 
 void SetSheetBtnEnabled(lv_obj_t* btn, bool enabled) {
@@ -208,6 +230,10 @@ void RefreshSettingsSheetAdj() {
 
 void RefreshSettingsSheetFontList() {
     auto& st = Book_State();
+    if (st.settings.reader_sheet_body != nullptr && st.settings.reader_tab == 1) {
+        RequestSettingsSheetPaint();
+        return;
+    }
     if (!SettingsSheetWidgetsReady()) {
         return;
     }
@@ -316,11 +342,9 @@ void RefreshSettingsSheetFontList() {
 }
 
 void RefreshSettingsSheet() {
-    if (Book_State().reader.read_chrome != BookUiState::ReadChrome::kSettings) {
-        return;
-    }
-    RefreshSettingsSheetFontList();
-    RefreshSettingsSheetAdj();
+    if (Book_State().reader.standby_paused) return;
+    if (Book_State().settings.reader_sheet_scrolling) return;
+    if (Book_State().reader.read_chrome == BookUiState::ReadChrome::kSettings && !RefreshReadingSheetInPlace()) RebuildSettingsSheet();
 }
 
 // 排版后保卡可见；控件已由 coalesce/Rebuild 就绪则不再叠刷
@@ -330,14 +354,28 @@ void EnsureSettingsSheetAfterLayout() {
     if (!SettingsSheetWidgetsReady()) {
         EnsureFontListPageShowsSelection();
         RebuildSettingsSheet();
+    } else {
+        RequestSettingsSheetPaint();
     }
 }
 
-void ShowReadSettingsSheet() {
+void ShowReadSettingsSheet(bool default_duration) {
     auto& st = Book_State();
     if (st.reader.read_scr == nullptr || st.reader.opening.load() || !st.reader.session || !st.reader.session->IsOpen()) {
         return;
     }
+    if (default_duration) {
+        HideReadLightPanel();
+        // A fresh reader tap starts at duration, never resurrecting an import subpanel.
+        TtfPanelClose();
+        ResetBookmarkSelection();
+        st.settings.reader_tab = 4;
+        st.settings.reader_light_page = true;
+    }
+    if (st.settings.reader_tab == 1) StartReadFontScan();
+    else CancelReadFontScan();
+    if (st.settings.reader_tab == 0 || st.settings.reader_tab == 1)
+        st.settings.reader_scroll[st.settings.reader_tab] = -1;
     TapZonesPanelClose();
     s_reader_page_delta.store(0, std::memory_order_release);
     st.reader.read_chrome = BookUiState::ReadChrome::kSettings;
@@ -346,32 +384,32 @@ void ShowReadSettingsSheet() {
     SetReadStatusVisible(true);
     SetReadSettingsSheetVisible(true);
 
-    EnsureFontListPageShowsSelection();
-    if (SettingsSheetWidgetsReady()) {
-        // 与 ▲▼/± 同路：合并上屏，勿同步再刷一帧
-        RequestSettingsSheetPaint();
-        return;
-    }
     RebuildSettingsSheet();
 }
 
 void OpenReadToc() {
-    auto& st = Book_State();
-    if (st.reader.read_scr == nullptr || st.reader.opening.load() || !st.reader.session || !st.reader.session->IsOpen()) {
-        return;
-    }
-    FlushLayoutDebounce();
-    TapZonesPanelClose();
-    if (st.reader.read_chrome == BookUiState::ReadChrome::kToc) {
-        return;
-    }
-    s_reader_page_delta.store(0, std::memory_order_release);
-    SetReadSettingsSheetVisible(false);
-    st.reader.read_chrome = BookUiState::ReadChrome::kToc;
-    SyncReaderAaForImmersion(false);
-    // -1：等 RenderTocList 算出本页行数后再落到当前章所在页
-    st.reader.toc_list_page = -1;
-    ApplyReaderPageGeometry(ReaderGeomMode::kOverlayList);
-    RenderTocList();
+    HideReadLightPanel();
+    ResetBookmarkSelection();
+    Book_State().settings.reader_tab = 0;
+    ShowReadSettingsSheet(false);
 }
 
+void OpenReadBookmarks() {
+    HideReadLightPanel();
+    Book_State().settings.reader_tab = 2;
+    ShowReadSettingsSheet(false);
+}
+
+void OpenReadFontSettings() {
+    HideReadLightPanel();
+    ResetBookmarkSelection();
+    Book_State().settings.reader_tab = 1;
+    ShowReadSettingsSheet(false);
+}
+
+void OpenReadSettings() {
+    HideReadLightPanel();
+    ResetBookmarkSelection();
+    Book_State().settings.reader_tab = 3;
+    ShowReadSettingsSheet(false);
+}

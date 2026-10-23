@@ -224,7 +224,7 @@ void SetStatusTip(const char* text, bool auto_clear) {
     }
 }
 
-bool ItemMatchesTab(const reader::CloudPushResource& item, int tab) {
+static bool ItemMatchesTab(const reader::CloudPushResource& item, int tab) {
     if (tab <= 0) {
         return true;
     }
@@ -256,15 +256,30 @@ void RefreshSectionTitle() {
     if (st.chrome.section_title == nullptr) {
         return;
     }
-    const char* title = Lang::Strings::CLOUD_PENDING;
-    if (st.data.filter_tab == 1) {
-        title = Lang::Strings::CLOUD_PUSH_WALLPAPER;
-    } else if (st.data.filter_tab == 2) {
-        title = Lang::Strings::CLOUD_PUSH_BOOK;
-    } else if (st.data.filter_tab == 3) {
-        title = Lang::Strings::CLOUD_PUSH_FONT;
+    lv_label_set_text(st.chrome.section_title, Lang::Strings::CLOUD_PENDING);
+}
+
+static void StyleFilterBtn(lv_obj_t* lbl, bool on) {
+    if (lbl == nullptr) {
+        return;
     }
-    lv_label_set_text(st.chrome.section_title, title);
+    lv_obj_set_style_border_side(lbl, on ? LV_BORDER_SIDE_BOTTOM : LV_BORDER_SIDE_NONE, 0);
+    lv_obj_set_style_border_width(lbl, on ? kTabBorderW : 0, 0);
+    lv_obj_set_style_border_color(lbl, lv_color_black(), 0);
+    lv_obj_set_style_pad_bottom(lbl, on ? kSyncUnderlinePadBottom : 0, 0);
+    const lv_font_t* font = on ? fontpack_lv_font_get(30, 4) : Cloud_ItemFont();
+    if (font == nullptr) {
+        font = Cloud_ItemFont();
+    }
+    lv_obj_set_style_text_font(lbl, font, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
+}
+
+void RefreshFilterUi() {
+    auto& st = Cloud_State();
+    for (int i = 0; i < kFilterTabCount; ++i) {
+        StyleFilterBtn(st.chrome.filter_lbls[i], st.data.filter_tab == i);
+    }
 }
 
 void StyleTabBtn(lv_obj_t* btn, lv_obj_t* lbl, bool on) {
@@ -282,7 +297,7 @@ void StyleTabBtn(lv_obj_t* btn, lv_obj_t* lbl, bool on) {
 void RefreshTabUi() {
     auto& st = Cloud_State();
     for (int i = 0; i < kTabCount; ++i) {
-        StyleTabBtn(st.chrome.tab_btns[i], st.chrome.tab_lbls[i], st.data.filter_tab == i);
+        StyleTabBtn(st.chrome.tab_btns[i], st.chrome.tab_lbls[i], st.data.mode == i);
     }
     RefreshSectionTitle();
 }

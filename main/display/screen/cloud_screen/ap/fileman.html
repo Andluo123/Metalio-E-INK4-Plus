@@ -1,0 +1,1239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>CloudZao文件管理</title>
+<style>
+:root{--bg:#f5f5f5;--card:#fff;--ink:#202020;--muted:#707070;--line:#e7e7e7;--mark:#f0f0f0;--green:#C8F24D;--field:#f5f5f5;--press:#eeeeee;--accent:#303030;--on-green:#20240f;--danger:#b63f38;--error-bg:#fcf2f1;--shade:0 2px 8px rgba(0,0,0,.04)}
+html[data-theme="night"]{color-scheme:dark;--bg:#121212;--card:#1e1e1e;--ink:#eeeeee;--muted:#a4a4a4;--line:#333;--mark:#2b2b2b;--field:#282828;--press:#303030;--accent:#dedede;--danger:#f0a29a;--error-bg:#352725;--shade:none}
+*{box-sizing:border-box}
+button,input,select{font-family:inherit}
+body{margin:0;font:16px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink);background:var(--bg)}
+.brand{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;background:#000;padding:14px 18px;border-bottom:1px solid #303030}
+.logo{margin:0;line-height:0}
+.logo img{display:block;width:48px;height:auto}
+#theme{width:36px;height:36px;border:0;border-radius:50%;background:#2b2b2b;color:#e5e5e5;display:flex;align-items:center;justify-content:center}
+.pathcard{margin:12px 0 0;border:1px solid var(--line);background:var(--card);border-radius:16px;padding:14px 16px;box-shadow:var(--shade)}
+.pathhead{display:flex;align-items:center;gap:8px}
+#crumb{flex:1;min-width:0;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:4px 0;font-size:15px;word-break:break-all}
+#crumb .seg{color:var(--accent);font-weight:600;text-decoration:none}
+#crumb .home{display:inline-flex;align-items:center}
+#crumb .sep{color:var(--muted);margin:0 6px}
+.statusline{display:flex;align-items:center;justify-content:safe center;gap:10px;margin-top:8px;white-space:nowrap;overflow-x:auto;font-size:12px;color:var(--muted)}
+#stat{flex:none}
+.hints{margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
+.hints summary{display:flex;align-items:center;gap:6px;cursor:pointer;list-style:none;font-size:12px;font-weight:600;color:var(--ink)}
+.hints summary svg{flex:none}
+.hints summary::-webkit-details-marker{display:none}
+.hints summary::after{content:"";width:6px;height:6px;margin-left:auto;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg) translateY(-2px);opacity:.6}
+.hints:not([open]) summary::after{transform:rotate(-45deg) translateY(1px)}
+.hintgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.hint{border:1px solid var(--line);display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-width:0;padding:8px 10px;border-radius:10px;background:var(--field);box-shadow:var(--shade)}
+.hint .chip{flex:none;background:var(--mark);color:var(--accent);font-weight:600}
+.hintpath{min-width:0;font-size:12px;line-height:1.3;color:var(--muted);overflow-wrap:anywhere}
+main{max-width:720px;margin:0 auto;padding:10px 12px calc(108px + env(safe-area-inset-bottom,0px))}
+#list{margin-top:14px;border:1px solid var(--line);background:var(--card);border-radius:16px;overflow:hidden;min-height:120px;box-shadow:var(--shade)}
+.row{display:flex;align-items:center;gap:12px;width:100%;padding:12px 8px 12px 14px;border:0;border-bottom:1px solid var(--line);background:var(--card);text-align:left;font:inherit;color:inherit;cursor:pointer}
+.row:last-child{border-bottom:0}
+.row:active,.row.on{background:var(--press)}
+.row.on .name{color:var(--accent)}
+.tick{width:22px;height:22px;border-radius:7px;border:2px solid var(--muted);flex:none}
+.row.on .tick{background:var(--green);border-color:transparent;position:relative}
+.row.on .tick::after{content:"";position:absolute;left:7px;top:3px;width:5px;height:9px;border:solid var(--on-green);border-width:0 2px 2px 0;transform:rotate(45deg)}
+#selbar{border:1px solid var(--line);position:fixed;left:calc(12px + env(safe-area-inset-left,0px));right:calc(12px + env(safe-area-inset-right,0px));bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:8;display:flex;align-items:center;justify-content:flex-start;gap:8px;padding:10px 12px;background:var(--card);color:var(--ink);border-radius:16px;box-shadow:var(--shade)}
+#selbar button{border:0;border-radius:10px;padding:8px 12px;background:var(--field);color:var(--ink);font-size:14px}
+#sel-del{color:var(--danger)}
+#sel-del:disabled{color:var(--muted)}
+body.picking .fabs{visibility:hidden}
+html[data-theme="night"] #selbar{border:1px solid #2c2c2c}
+.mark{width:40px;height:40px;border-radius:12px;background:var(--mark);color:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}
+.meta{flex:1;min-width:0}
+.name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.size{flex:none;font-size:12px;color:var(--muted);padding-right:4px}
+.more{border:0;background:transparent;font-size:22px;line-height:1;padding:8px 12px;color:var(--muted)}
+.empty,.loading{padding:36px 16px;text-align:center;color:var(--muted)}
+.loading{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;min-height:160px}
+.ring{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#msg{min-height:1.2em;margin:12px 0;font-size:14px;white-space:pre-wrap;text-align:left}
+.fabs{position:fixed;right:calc(16px + env(safe-area-inset-right,0px));bottom:calc(20px + env(safe-area-inset-bottom,0px));z-index:6;display:flex;align-items:center;gap:10px}
+.fabs button{width:54px;height:54px;border:1px solid transparent;border-radius:50%;background:var(--green);color:var(--on-green);box-shadow:var(--shade);display:flex;align-items:center;justify-content:center;font-size:32px;line-height:1}
+#upchip{width:auto;height:36px;padding:0 12px;border-radius:999px;font-size:13px;font-weight:600}
+#sheet{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.4);display:flex;align-items:flex-end}
+.card{border:1px solid var(--line);width:100%;max-height:78vh;overflow:auto;background:var(--card);color:var(--ink);border-radius:18px 18px 0 0;padding:10px 16px calc(24px + env(safe-area-inset-bottom,0px));animation:rise .2s ease-out}
+.handle{width:36px;height:4px;border-radius:4px;background:var(--muted);margin:2px auto 12px}
+@keyframes rise{from{transform:translateY(100%)}to{transform:none}}
+#sheet.center-dialog{align-items:center;justify-content:center;padding:24px 20px;background:rgba(0,0,0,.5)}
+#sheet.center-dialog .card{display:flex;flex-direction:column;max-width:380px;max-height:calc(100% - 16px);overflow:hidden;border-radius:18px;padding:0;box-shadow:0 12px 36px rgba(0,0,0,.18);animation:appear .2s ease-out}
+.dialog-title{flex:none;margin:0;padding:20px 24px 16px;border-bottom:1px solid var(--line);font-size:18px;line-height:1.5;font-weight:600;text-align:center;overflow-wrap:anywhere}
+.dialog-text{min-height:0;overflow-y:auto;margin:0;padding:20px 24px;font-size:14px;line-height:1.75;color:var(--ink);white-space:pre-wrap;overflow-wrap:anywhere}
+.dialog-actions{flex:none;display:flex;justify-content:center;gap:10px;padding:16px 24px 20px;border-top:1px solid var(--line)}
+.dialog-actions button{min-width:96px;min-height:38px;max-width:100%;padding:8px 20px;border:0;border-radius:8px;background:var(--green);color:var(--on-green);font-size:14px;line-height:1.5;font-weight:600}
+.dialog-actions button:active{opacity:.85}
+.dialog-actions .secondary{background:var(--field);color:var(--ink);border:1px solid var(--line)}
+.dialog-actions .danger{background:#b63f38;color:#fff}
+.delete-paths{display:flex;flex-wrap:wrap;align-items:flex-start;gap:10px;margin-bottom:14px;padding:0;font-size:13px;line-height:1.5}
+.delete-item{display:inline-flex;align-items:center;gap:6px;flex:0 1 auto;min-width:0;max-width:min(100%,320px);min-height:36px;padding:2px 4px 2px 12px;border:1px solid var(--line);border-radius:10px;background:var(--field);color:var(--ink)}
+.delete-name{display:flex;align-items:center;flex:0 1 auto;min-width:0;padding:0;border:0;background:transparent;color:inherit;font:inherit;text-align:left}
+.delete-start{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.delete-end{flex:none;white-space:nowrap}
+.delete-item.expanded{max-width:100%}
+.delete-item.expanded .delete-name{display:block;overflow-wrap:anywhere}
+.delete-item.expanded .delete-start,.delete-item.expanded .delete-end{white-space:normal;overflow:visible}
+.delete-remove{position:relative;display:flex;align-items:center;justify-content:center;flex:none;width:21px;height:21px;padding:0;border:1px solid var(--line);border-radius:50%;background:var(--card);color:var(--muted);box-shadow:0 1px 2px rgba(0,0,0,.14),inset 0 1px 0 rgba(255,255,255,.12)}
+.delete-remove:active{background:var(--press);color:var(--ink);box-shadow:inset 0 1px 2px rgba(0,0,0,.12)}
+.delete-remove svg{display:block;width:10.5px;height:10.5px;flex:none}
+.delete-remove::after{content:"";position:absolute;inset:-9px;border-radius:50%}
+.delete-warning{margin:0;color:var(--muted)}
+.delete-error{margin:12px 0 0;color:var(--danger)}
+.dialog-text .loading{padding:12px 0;min-height:120px}
+.dialog-text .loading .detail{margin:0;width:100%}
+.card.delete-card{background:var(--bg)}
+.delete-box{padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card);box-shadow:var(--shade)}
+.delete-card .dialog-title{padding:0 0 12px;font-size:16px;text-align:left}
+.delete-card .dialog-text{overflow-y:visible;padding:14px 0 0;font-size:13px}
+.delete-card .dialog-actions{margin-top:14px;padding:14px 0 0}
+.delete-card .dialog-actions button{flex:1;min-height:44px;border-radius:12px;font-size:15px}
+@keyframes appear{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
+.ops{display:flex;flex-direction:column;gap:8px}
+.op{min-height:48px;display:flex;align-items:center;justify-content:flex-start;gap:12px;width:100%;border:1px solid var(--line);border-radius:12px;padding:14px;font-size:15px;background:var(--field);color:var(--ink);text-align:left}
+.op svg{flex:none}
+.op.danger{color:var(--danger)}
+.stitle{font-size:16px;font-weight:700;margin:4px 0 12px;word-break:break-all;text-align:left}
+.titleline{display:flex;align-items:baseline;justify-content:flex-start;flex-wrap:wrap;gap:8px;margin:4px 0 12px}
+.titleline .stitle{margin:0}
+.titleline .aside{font-size:13px;font-weight:600;color:var(--muted);min-width:0;overflow-wrap:anywhere}
+.field{width:100%;font-size:16px;padding:12px;border:1px solid var(--muted);border-radius:10px;background:var(--card);color:var(--ink);text-align:left}
+.pair{display:flex;gap:8px;margin-top:12px}
+.pair button{flex:1;border:1px solid var(--line);border-radius:12px;padding:14px;font-size:16px;background:var(--field);color:var(--ink);text-align:center}
+.pair .go{background:var(--green);color:#111}
+.pair .go:disabled{background:var(--field);color:var(--muted)}
+.moverow{display:flex;align-items:center;justify-content:flex-start;gap:10px;width:100%;border:0;border-bottom:1px solid var(--line);background:transparent;color:var(--ink);padding:12px 4px;text-align:left;font:inherit}
+.ubar{height:6px;border-radius:99px;background:var(--mark);overflow:hidden;margin:8px 0}
+.ubar i{display:block;height:100%;background:var(--green)}
+.ustat{display:flex;justify-content:flex-start;gap:8px;font-size:13px;color:var(--muted);text-align:left}
+.card.savepick{background:var(--bg);padding-left:12px;padding-right:12px}
+.savehead,.savebox{border:1px solid var(--line);background:var(--card);border-radius:14px;box-shadow:var(--shade)}
+.savehead{display:flex;align-items:flex-start;gap:12px;padding:16px;margin-bottom:14px}
+.savehead #up-where{flex:0 1 auto;justify-content:flex-start;text-align:left}
+.savehead .stitle{margin:0;flex:none}
+.savebox{padding:4px 12px 8px;min-height:160px}
+.savebox.loading{padding:24px 12px}
+#up-where{flex:1;min-width:0;display:flex;flex-wrap:wrap;align-items:center;font-size:15px;font-weight:600}
+#up-where button{border:0;background:transparent;padding:2px 0;color:inherit;font:inherit;font-weight:600}
+#up-where .sep{color:#b5b5b5;margin:0 4px}
+#up-where .home{display:inline-flex;align-items:center}
+.ufile{padding:10px 0;border-bottom:1px solid var(--line)}
+.ufile .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:normal;overflow-wrap:anywhere}
+.chips{display:flex;align-items:center;gap:6px;flex:none}
+.chip{font-size:12px;line-height:1.3;padding:4px 8px;border-radius:6px;background:var(--field);color:var(--muted)}
+.job-heading{display:flex;align-items:baseline;gap:12px;margin-bottom:8px}
+.job-main{display:flex;align-items:center;gap:12px}
+.job-info{flex:1;min-width:0}
+.job-size{flex:none;font-size:12px;color:var(--muted);white-space:nowrap}
+.job-progress{display:flex;align-items:center;gap:8px;min-height:32px;flex:none}
+.job-progress .chips{margin-left:auto}
+.job-speed{white-space:nowrap}
+.job-progress-note{margin:10px 0 0;font-size:12px;color:var(--muted)}
+.ufile .ubar{margin:10px 0 0}
+.ufile .job-path{margin:0;line-height:1.5}
+.ufile button,.ulink{border:1px solid var(--line);border-radius:8px;background:var(--field);color:var(--danger);box-shadow:var(--shade)}
+.ufile button{font-size:12px;min-height:32px;padding:6px 10px;flex:none}
+.ulink{display:block;width:100%;margin-top:14px;font-size:15px;padding:12px;border-radius:12px}
+.autosw{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px;padding-top:8px;border-top:1px solid var(--line);font-size:13px;font-weight:600}
+#autoclass{width:40px;height:24px;border:0;border-radius:99px;background:var(--mark);position:relative;flex:none;padding:0}
+#autoclass::after{content:"";position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:var(--shade)}
+#autoclass[aria-checked="true"]{background:var(--green)}
+#autoclass[aria-checked="true"]::after{transform:translateX(16px)}
+.autonote{margin:6px 0 0;font-size:12px;line-height:1.4;color:var(--muted)}
+.detail{font-size:12px;color:var(--muted);overflow-wrap:anywhere;white-space:normal;margin:6px 0}
+#storage{flex:none}
+button:disabled{opacity:.5;cursor:default}
+.notice{padding:12px 14px;margin:10px 0;border-radius:12px;background:var(--field);color:var(--ink);font-size:13px;line-height:1.5;overflow-wrap:anywhere;white-space:pre-wrap;text-align:left;border:1px solid var(--line)}
+.notice.bad{background:var(--error-bg);border-left:3px solid var(--danger)}
+#msg:empty{display:none}
+[hidden]{display:none!important}
+#up-note{text-align:left;margin-bottom:12px}
+#sheet-msg{flex:none}
+.ufile .job-error{margin:10px 0 0}
+.ufile .job-action:disabled{color:var(--muted)}
+#up-summary{line-height:1.6}
+#up-controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+#up-controls button{flex:1;margin:0;color:var(--danger)}
+#up-controls #up-clear{color:var(--ink)}
+
+button{cursor:pointer;touch-action:manipulation}
+button:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.field:focus{outline:2px solid var(--accent);outline-offset:2px}
+.ufile[data-status="done"] .job-state,.ufile[data-status="saving"] .job-state{background:var(--mark);color:var(--accent)}
+.ufile[data-status="fail"] .job-state{background:var(--error-bg);color:var(--danger)}
+.ufile .job-action{color:var(--accent)}
+.card.upload-card{background:var(--bg)}
+.upload-head{padding:16px;margin-bottom:14px;border:1px solid var(--line);border-radius:14px;background:var(--card);box-shadow:var(--shade)}
+.upload-head .titleline{justify-content:flex-start;margin:0;padding-bottom:12px;border-bottom:1px solid var(--line)}
+.upload-head #up-note{margin:12px 0 0;text-align:left}
+.upload-card .ufile{padding:14px;margin-bottom:10px;border:1px solid var(--line);border-radius:12px;background:var(--card);box-shadow:var(--shade)}
+.upload-card .ufile:last-child{margin-bottom:0}
+.conflict-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:12px;border-bottom:1px solid var(--line)}
+.conflict-head .stitle{margin:0}
+.conflict-close{width:36px;height:36px;flex:none;border:0;border-radius:50%;background:var(--field);color:var(--muted);font-size:24px;line-height:1}
+.conflict-file{margin:14px 0;font-size:14px;font-weight:600;overflow-wrap:anywhere}
+.conflict-file .detail{font-weight:400}
+.conflict-options{margin:0;padding:0;border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.conflict-choice{display:flex;align-items:center;gap:12px;padding:12px;background:var(--field);border-bottom:1px solid var(--line);cursor:pointer}
+.conflict-choice:last-child{border-bottom:0}
+.conflict-choice input,.conflict-all input{width:18px;height:18px;margin:0;flex:none;accent-color:var(--green)}
+.conflict-choice span{min-width:0;font-size:14px}
+.conflict-choice strong{font-weight:600}
+.conflict-choice .detail{display:block;margin:4px 0 0}
+.conflict-all{display:flex;align-items:center;gap:10px;margin:14px 0;font-size:13px;color:var(--ink);cursor:pointer}
+.conflict-footer{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.conflict-footer .pair{margin-top:12px}
+@media(prefers-reduced-motion:reduce){.card,#sheet.center-dialog .card,.ring{animation:none}}
+#sheet:not(.center-dialog) .card{border-top-color:transparent;background-image:linear-gradient(90deg,transparent 0%,var(--green) 18%,var(--green) 82%,transparent 100%);background-size:100% 1px;background-position:top center;background-repeat:no-repeat;background-origin:border-box}
+</style>
+</head>
+<body>
+<header class="brand">
+  <h1 class="logo"><img src="cloudzao-logo.png" alt="CLOUD ZAO" width="1224" height="865"></h1>
+  <button type="button" id="theme" aria-label="切换外观"></button>
+</header>
+<main>
+<div class="pathcard">
+  <div class="pathhead"><nav id="crumb"></nav></div>
+  <div class="statusline"><span id="stat"></span><span id="storage" role="status" aria-live="polite">正在读取 SD 卡状态…</span></div>
+  <details class="hints" open>
+    <summary><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M9 18h6M10 21h4M8.5 14.5A6 6 0 1 1 15.5 14c-.6.6-1.5 1.4-1.5 2.5h-4c0-1.1-.9-1.9-1.5-2.5z"/></svg>需注意上传的文件需放在指定目录下</summary>
+    <div class="hintgrid">
+      <div class="hint"><span class="chip">书籍</span><span class="hintpath">metalio/e-ink/books</span></div>
+      <div class="hint"><span class="chip">壁纸</span><span class="hintpath">metalio/e-ink/wallpaper</span></div>
+      <div class="hint"><span class="chip">字体</span><span class="hintpath">metalio/e-ink/fonts</span></div>
+      <div class="hint"><span class="chip">待转换字体</span><span class="hintpath">metalio/e-ink/fonts_ttf</span></div>
+    </div>
+  </details>
+  <div class="autosw"><span>自动分类</span><button type="button" id="autoclass" role="switch" aria-checked="false" aria-label="自动分类"></button></div>
+  <p id="autoclass-note" class="autonote" hidden>开启后自动识别文件后缀，上传时自动保存到对应目录</p>
+</div>
+  <div id="list"></div>
+  <p id="msg" class="notice" role="status" aria-live="polite"></p>
+</main>
+<div id="selbar" hidden>
+  <span id="selcount">已选 0 项</span>
+  <button type="button" id="sel-del">删除</button>
+</div>
+<div class="fabs">
+  <button type="button" id="upchip" hidden>上传</button>
+  <button type="button" id="refresh" aria-label="刷新">
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M20 12a8 8 0 1 1-2.2-5.5M20 4.5V9h-4.5"/></svg>
+  </button>
+  <button type="button" id="add" aria-label="新建">+</button>
+</div>
+<div id="sheet" hidden><div class="card" id="card"></div></div>
+<input id="file" type="file" multiple hidden>
+<script>
+let path = new URLSearchParams(location.search).get("path") || "/";
+const msg = document.getElementById("msg");
+const sheet = document.getElementById("sheet");
+const card = document.getElementById("card");
+let busy = false;
+let deleting = false;
+let enqueuing = false;
+let reloadPending = false;
+let sheetMode = "";
+let moveItem = null;
+let moveAt = "/";
+let uploadAt = "/";
+let seq = 0;
+const queue = [];
+let pumping = false;
+let lastItems = [];
+let selectMode = false;
+const selected = new Set();
+let conflicts = [];
+let conflictBatchStart = 0;
+let conflictChoice = "rename";
+let conflictApplyAll = false;
+let checkingSpace = false;
+let takenNames = new Set();
+const ICON_DIR = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M3 7.2c0-1 .8-1.8 1.8-1.8h4.1L11 7.4h8.2c1 0 1.8.8 1.8 1.8v8.2c0 1-.8 1.8-1.8 1.8H4.8c-1 0-1.8-.8-1.8-1.8V7.2z"/></svg>';
+const ICON_FILE = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M7 3h7.2L19 7.8V20a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm7 .8V8h3.9"/></svg>';
+const ICON_UP = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M14 6 8 12l6 6"/></svg>';
+const ICO = {
+  dl: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 4v11M8 11l4 4 4-4M5 19h14"/></svg>',
+  ren: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M4 20h4l10-10-4-4L4 16v4zM13 7l4 4"/></svg>',
+  mv: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 7h6l2 2h10v10H3V7zM12 12v5M10 15l2 2 2-2"/></svg>',
+  del: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M5 7h14M9 7V5h6v2M8 7l1 13h6l1-13"/></svg>',
+  up: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 20V8M8 12l4-4 4 4M5 4h14"/></svg>',
+  mk: '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 7h6l2 2h10v10H3V7zM12 12v6M9 15h6"/></svg>'
+};
+function enc(s) { return encodeURIComponent(s); }
+function nameError(name, dir) {
+  if (!name || /[\\/:*?"<>|\x00-\x1f]/.test(name) || name === "." || name === ".." || /[. ]$/.test(name)) return "文件名含无效字符";
+  if (new TextEncoder().encode(name).length > 246) return "文件名超过 246 字节，请缩短名称（中文通常占 3 字节）";
+  if (new TextEncoder().encode(childPath(dir,name)).length > 511) return "保存路径过长，请选择更浅的目录";
+  return "";
+}
+function child(name) { return path === "/" ? "/" + name : path + "/" + name; }
+function parentOf(p) { if (p === "/") return "/"; const i = p.lastIndexOf("/"); return i <= 0 ? "/" : p.slice(0, i); }
+function fmt(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+  return (n / 1073741824).toFixed(2) + " GB";
+}
+function say(text, bad, pageOnly) {
+  if (text && bad && !pageOnly && sheet.hidden) {
+    sheetMode = "notice";
+    openCard('<h2 class="dialog-title" id="notice-title"></h2><p class="dialog-text" id="notice-text"></p><div class="dialog-actions"><button type="button" id="notice-ok">确定</button></div>');
+    const lines = text.split("\n");
+    document.getElementById("notice-title").textContent = lines.length > 1 ? lines.shift() : "操作未完成";
+    document.getElementById("notice-text").textContent = lines.join("\n");
+    document.getElementById("notice-ok").onclick = closeSheet;
+    return;
+  }
+  const target = !pageOnly && !sheet.hidden ? document.getElementById("sheet-msg") : msg;
+  if (!target) return;
+  target.className = "notice" + (bad ? " bad" : "");
+  target.textContent = text || "";
+  target.hidden = !text;
+}
+function pickerError(boxId, buttonId, text, retry) {
+  const box = document.getElementById(boxId), button = document.getElementById(buttonId);
+  if (!box || !button) return;
+  button.disabled = true;
+  box.classList.remove("loading");
+  box.innerHTML = '<p class="notice bad">' + esc(text) + '</p><button type="button" class="op">重新加载</button>';
+  box.querySelector("button").onclick = retry;
+}
+const ICON_HOME = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6H10v6H5a1 1 0 0 1-1-1Z"/></svg>';
+function crumb() {
+  const el = document.getElementById("crumb");
+  el.replaceChildren();
+  const root = document.createElement(path === "/" ? "span" : "a");
+  root.className = "seg home";
+  root.setAttribute("aria-label", "根目录");
+  root.innerHTML = ICON_HOME;
+  if (path !== "/") {
+    root.href = "#";
+    root.onclick = function (e) { e.preventDefault(); go("/"); };
+  }
+  el.appendChild(root);
+  let acc = "";
+  path.split("/").filter(Boolean).forEach(function (b) {
+    acc += "/" + b;
+    const sep = document.createElement("span");
+    sep.className = "sep";
+    sep.textContent = "/";
+    const a = document.createElement("a");
+    a.className = "seg";
+    a.href = "#";
+    a.textContent = b;
+    const dest = acc;
+    a.onclick = function (e) { e.preventDefault(); if (dest !== path) go(dest); };
+    el.appendChild(sep);
+    el.appendChild(a);
+  });
+}
+function openCard(html) {
+  const centered = sheetMode === "notice";
+  sheet.classList.toggle("center-dialog", centered);
+  card.classList.remove("savepick");
+  card.classList.toggle("upload-card", sheetMode === "upload");
+  card.classList.toggle("delete-card", ["delete", "deleting", "delete-result"].includes(sheetMode));
+  card.innerHTML = (centered ? '' : '<div class="handle"></div>') + '<p id="sheet-msg" class="notice" role="status" aria-live="polite" hidden></p>' + html;
+  sheet.hidden = false;
+  card.scrollTop = 0;
+}
+function closeSheet() {
+  if (deleting) return;
+  sheet.hidden = true;
+  sheetMode = "";
+
+  updateChip();
+}
+function op(icon, label, id, danger) {
+  return '<button type="button" class="op' + (danger ? " danger" : "") + '" id="' + id + '">' + icon + "<span>" + label + "</span></button>";
+}
+function openAdd() {
+  if (deleting) return;
+  sheetMode = "add";
+  openCard('<div class="ops">' + op(ICO.up, "上传文件", "act-upload") + op(ICO.mk, "新建文件夹", "act-mkdir") + "</div>");
+  document.getElementById("act-upload").onclick = function () {
+    if (autoClass) { closeSheet(); document.getElementById("file").click(); }
+    else openUploadPick();
+  };
+  document.getElementById("act-mkdir").onclick = openMkdir;
+}
+function openMkdir() {
+  sheetMode = "mkdir";
+  openCard('<div class="stitle">新建文件夹</div><input class="field" id="folder-name" placeholder="文件夹名称" autocomplete="off"><div class="pair"><button type="button" id="mk-cancel">取消</button><button type="button" class="go" id="mk-ok" disabled>创建</button></div>');
+  const input = document.getElementById("folder-name");
+  const ok = document.getElementById("mk-ok");
+  input.oninput = function () { ok.disabled = !input.value.trim(); };
+  document.getElementById("mk-cancel").onclick = closeSheet;
+  ok.onclick = function () {
+    const n = input.value.trim();
+    if (!n) return;
+    const error = nameError(n, path);
+    if (error) { say(error, true); return; }
+    closeSheet();
+    act("/mkdir", {path: path, name: n});
+  };
+  input.focus();
+}
+function openMenu(it, p) {
+  if (deleting) return;
+  sheetMode = "menu";
+  let html = '<div class="stitle">' + esc(it.name) + '</div><p class="detail">' + esc(p) + (it.dir ? " · 文件夹" : " · " + fmt(it.size || 0)) + '</p><div class="ops">';
+  if (!it.dir) html += op(ICO.dl, "下载", "m-dl");
+  html += op(ICO.ren, "重命名", "m-ren") + op(ICO.mv, "移动", "m-mv") + op(ICO.del, "删除", "m-del", true) + "</div>";
+  openCard(html);
+  const dl = document.getElementById("m-dl");
+  if (dl) dl.onclick = function () {
+    closeSheet();
+    downloadFile(p);
+  };
+  document.getElementById("m-ren").onclick = function () { openRename(it, p); };
+  document.getElementById("m-mv").onclick = function () { openMove(it, p); };
+  document.getElementById("m-del").onclick = function () { confirmDelete([p]); };
+}
+function openRename(it, p) {
+  sheetMode = "rename";
+  openCard('<div class="stitle">重命名</div><input class="field" id="new-name" autocomplete="off"><div class="pair"><button type="button" id="rn-cancel">取消</button><button type="button" class="go" id="rn-ok">重命名</button></div>');
+  const input = document.getElementById("new-name");
+  const ok = document.getElementById("rn-ok");
+  input.value = it.name;
+  const sync = function () { input.setCustomValidity(""); ok.disabled = !input.value.trim() || input.value.trim() === it.name; };
+  input.oninput = sync;
+  sync();
+  document.getElementById("rn-cancel").onclick = closeSheet;
+  ok.onclick = function () {
+    const n = input.value.trim();
+    if (!n || n === it.name) return;
+    const error = nameError(n, parentOf(p));
+    if (error) { say(error, true); return; }
+    closeSheet();
+    act("/rename", {path: p, name: n});
+  };
+  input.focus();
+}
+
+function blockedMove(dirPath) {
+  if (!moveItem || !moveItem.dir) return false;
+  return dirPath === moveItem.path || dirPath.indexOf(moveItem.path + "/") === 0;
+}
+async function openMove(it, p) {
+  moveItem = {path: p, dir: !!it.dir};
+  moveAt = parentOf(p);
+  sheetMode = "move";
+  sheet.hidden = false;
+  await paintMove();
+}
+async function paintMove() {
+  if (sheetMode !== "move") return;
+  openCard('<div class="titleline"><span class="stitle">移动到</span><span class="aside" id="move-where"></span></div><div id="move-list" class="loading"><i class="ring"></i><span>载入中</span></div><div class="pair"><button type="button" id="mv-cancel">取消</button><button type="button" class="go" id="mv-ok">移动到此处</button></div>');
+  document.getElementById("mv-cancel").onclick = closeSheet;
+  document.getElementById("move-where").textContent = moveAt;
+  const ok = document.getElementById("mv-ok");
+  const same = moveAt === parentOf(moveItem.path) || blockedMove(moveAt);
+  ok.disabled = true;
+  ok.onclick = function () {
+    if (ok.disabled) return;
+    const to = moveAt;
+    const from = moveItem.path;
+    closeSheet();
+    act("/move", {path: from, to: to});
+  };
+  let data;
+  try {
+    const r = await fetch("/api/files?path=" + enc(moveAt));
+    if (!r.ok) throw Error(await r.text());
+    data = await r.json();
+  } catch (e) { if (sheetMode === "move") pickerError("move-list", "mv-ok", e.message || "无法读取目录", paintMove); return; }
+  if (sheetMode !== "move") return;
+  ok.disabled = same;
+  const box = document.getElementById("move-list");
+  if (!box) return;
+  box.className = "";
+  box.replaceChildren();
+  if (moveAt !== "/") {
+    const up = document.createElement("button");
+    up.type = "button";
+    up.className = "moverow";
+    up.innerHTML = ICON_UP + "<span>上级目录</span>";
+    up.onclick = function () { moveAt = parentOf(moveAt); paintMove(); };
+    box.appendChild(up);
+  }
+  (data.items || []).filter(function (it) { return it.dir && !blockedMove(childPath(moveAt, it.name)); }).forEach(function (it) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "moverow";
+    row.innerHTML = ICON_DIR + "<span>" + esc(it.name) + "</span>";
+    row.onclick = function () { moveAt = childPath(moveAt, it.name); paintMove(); };
+    box.appendChild(row);
+  });
+}
+function childPath(dir, name) { return dir === "/" ? "/" + name : dir + "/" + name; }
+function openUploadPick() {
+  uploadAt = path;
+  sheetMode = "updest";
+  paintUploadPick();
+}
+function fillUploadCrumb(el) {
+  el.replaceChildren();
+  const home = document.createElement("button");
+  home.type = "button";
+  home.className = "home";
+  home.setAttribute("aria-label", "根目录");
+  home.innerHTML = ICON_HOME;
+  home.onclick = function () { if (uploadAt !== "/") { uploadAt = "/"; paintUploadPick(); } };
+  el.appendChild(home);
+  let acc = "";
+  uploadAt.split("/").filter(Boolean).forEach(function (b) {
+    acc += "/" + b;
+    const sep = document.createElement("span");
+    sep.className = "sep";
+    sep.textContent = "/";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = b;
+    const dest = acc;
+    btn.onclick = function () { if (dest !== uploadAt) { uploadAt = dest; paintUploadPick(); } };
+    el.appendChild(sep);
+    el.appendChild(btn);
+  });
+}
+async function paintUploadPick() {
+  if (sheetMode !== "updest") return;
+  openCard('<div class="savehead"><span class="stitle">保存到</span><nav id="up-where"></nav></div><div id="up-dirs" class="savebox loading"><i class="ring"></i><span>载入中</span></div><div class="pair"><button type="button" id="up-back">取消</button><button type="button" class="go" id="up-pick">选择文件</button></div>');
+  card.classList.add("savepick");
+  document.getElementById("up-back").onclick = closeSheet;
+  fillUploadCrumb(document.getElementById("up-where"));
+  document.getElementById("up-pick").disabled = true;
+  document.getElementById("up-pick").onclick = function () { document.getElementById("file").click(); };
+  let data;
+  try {
+    const r = await fetch("/api/files?path=" + enc(uploadAt));
+    if (!r.ok) throw Error(await r.text());
+    data = await r.json();
+  } catch (e) { if (sheetMode === "updest") pickerError("up-dirs", "up-pick", e.message || "无法读取目录", paintUploadPick); return; }
+  if (sheetMode !== "updest") return;
+  document.getElementById("up-pick").disabled = false;
+  const box = document.getElementById("up-dirs");
+  if (!box) return;
+  box.className = "savebox";
+  box.replaceChildren();
+  const dirsOnly = (data.items || []).filter(function (it) { return it.dir; });
+  if (uploadAt !== "/") {
+    const up = document.createElement("button");
+    up.type = "button";
+    up.className = "moverow";
+    up.innerHTML = ICON_UP + "<span>上级目录</span>";
+    up.onclick = function () { uploadAt = parentOf(uploadAt); paintUploadPick(); };
+    box.appendChild(up);
+  }
+  dirsOnly.forEach(function (it) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "moverow";
+    row.innerHTML = ICON_DIR + "<span>" + esc(it.name) + "</span>";
+    row.onclick = function () { uploadAt = childPath(uploadAt, it.name); paintUploadPick(); };
+    box.appendChild(row);
+  });
+  if (!dirsOnly.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "已到底~";
+    box.appendChild(empty);
+  }
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]; }); }
+async function act(url, fields) {
+  const body = Object.keys(fields).map(k => enc(k) + "=" + enc(fields[k])).join("&");
+  try {
+    const r = await fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body});
+    if (!r.ok) throw Error(await r.text());
+    await load();
+  } catch(e) { say(e.message || "操作失败，请刷新确认后重试",true); }
+}
+function downloadFile(p) {
+  if (pumping) { say("上传期间暂不支持下载，请完成后重试", true); return; }
+  location.href = "/download?path=" + enc(p);
+}
+function addRow(box, it, up) {
+  const p = up ? parentOf(path) : child(it.name);
+  const row = document.createElement("div");
+  const picked = !up && selectMode && selected.has(p);
+  row.className = "row" + (picked ? " on" : "");
+  row.onclick = function () {
+    if (ignoreClick) { ignoreClick = false; return; }
+    if (selectMode && !up) {
+      if (selected.has(p)) selected.delete(p);
+      else selected.add(p);
+      renderList();
+      return;
+    }
+    if (up || it.dir) go(p);
+    else downloadFile(p);
+  };
+  if (!up && selectMode) {
+    const tick = document.createElement("div");
+    tick.className = "tick";
+    row.appendChild(tick);
+  }
+  const mark = document.createElement("div");
+  mark.className = "mark";
+  mark.innerHTML = up ? ICON_UP : (it.dir ? ICON_DIR : ICON_FILE);
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const name = document.createElement("div");
+  name.className = "name";
+  name.textContent = up ? "上级目录" : it.name;
+  name.title = it.name;
+  meta.appendChild(name);
+  const size = document.createElement("div");
+  size.className = "size";
+  if (!up && !it.dir) size.textContent = fmt(it.size || 0);
+  row.append(mark, meta, size);
+  if (!up && !selectMode) {
+    const more = document.createElement("button");
+    more.className = "more";
+    more.type = "button";
+    more.textContent = "···";
+    more.onclick = function (e) { e.stopPropagation(); openMenu(it, p); };
+    row.appendChild(more);
+    let hold = 0;
+    const arm = function (e) {
+      if (e.target.closest && e.target.closest(".more")) return;
+      hold = setTimeout(function () { ignoreClick = true; enterSelect(p); }, 480);
+    };
+    const drop = function () { clearTimeout(hold); };
+    row.addEventListener("pointerdown", arm);
+    row.addEventListener("pointerup", drop);
+    row.addEventListener("pointerleave", drop);
+    row.addEventListener("pointercancel", drop);
+    row.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+  }
+  box.appendChild(row);
+}
+let ignoreClick = false;
+function paintSelect() {
+  document.body.classList.toggle("picking", selectMode);
+  const bar = document.getElementById("selbar");
+  bar.hidden = !selectMode;
+  document.getElementById("selcount").textContent = "已选 " + selected.size + " 项";
+  document.getElementById("sel-del").disabled = selected.size === 0;
+}
+function renderList() {
+  const alive = {};
+  lastItems.forEach(function (it) { alive[child(it.name)] = true; });
+  Array.from(selected).forEach(function (p) { if (!alive[p]) selected.delete(p); });
+  const box = document.getElementById("list");
+  box.replaceChildren();
+  if (path !== "/" && !selectMode) addRow(box, {name:"", dir:true}, true);
+  lastItems.forEach(function (it) { addRow(box, it, false); });
+  if (!lastItems.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "当前为空目录";
+    box.appendChild(empty);
+  }
+  paintSelect();
+}
+function enterSelect(p) {
+  ignoreClick = true;
+  setTimeout(function () { ignoreClick = false; }, 400);
+  selectMode = true;
+  selected.clear();
+  selected.add(p);
+  renderList();
+}
+function exitSelect() {
+  selectMode = false;
+  selected.clear();
+  renderList();
+}
+function showLoading() {
+  const box = document.getElementById("list");
+  box.replaceChildren();
+  const el = document.createElement("div");
+  el.className = "loading";
+  el.innerHTML = '<i class="ring"></i><span>载入中</span>';
+  box.appendChild(el);
+}
+function loadDone() {
+  busy = false;
+  if (reloadPending) load();
+}
+async function refreshStorage() {
+  const el = document.getElementById("storage");
+  try {
+    const r = await fetch("/api/storage");
+    if (!r.ok) throw Error(await r.text());
+    const d = await r.json();
+    el.textContent = d.mounted ? "SD 卡剩余 " + fmt(d.free) + " / " + fmt(d.total) : "未检测到 SD 卡，请插卡后刷新";
+  } catch(e) { el.textContent = "SD 卡状态读取失败：" + (e.message || "请重试"); }
+}
+async function load() {
+  if (busy) { reloadPending = true; return; }
+  busy = true;
+  reloadPending = false;
+  crumb();
+  refreshStorage();
+  say("", false, true);
+  showLoading();
+  let data;
+  try {
+    const r = await fetch("/api/files?path=" + enc(path));
+    if (!r.ok) throw Error(await r.text());
+    data = await r.json();
+  } catch (e) {
+    document.getElementById("stat").textContent = "";
+    document.getElementById("list").innerHTML = '<div class="empty">目录未能加载，请刷新重试</div>';
+    loadDone();
+    return;
+  }
+  const items = data.items || [];
+  lastItems = items;
+  const dirs = items.filter(function (it) { return it.dir; }).length;
+  document.getElementById("stat").textContent = dirs + " 个文件夹，" + (items.length - dirs) + " 个文件";
+  renderList();
+  if (data.truncated) say("只列出前 " + items.length + " 项", false, true);
+  loadDone();
+}
+function go(p) {
+  selectMode = false;
+  selected.clear();
+  paintSelect();
+  path = p;
+  try { history.pushState({path:p}, "", "/files?path=" + enc(p)); } catch (e) {}
+  load();
+}
+window.addEventListener("popstate", function () {
+  path = new URLSearchParams(location.search).get("path") || "/";
+  load();
+});
+function labelOf(job) {
+  if (job.status === "saving") return "设备保存中";
+  if (job.status === "wait") return "等待中";
+  if (job.status === "done") return "已完成";
+  if (job.status === "cancel") return "已取消";
+  return job.err || "失败";
+}
+function updateChip() {
+  const chip = document.getElementById("upchip");
+  chip.hidden = queue.length === 0 && conflicts.length === 0;
+  if (chip.hidden) return;
+  if (conflicts.length) { chip.textContent = "同名文件 · " + conflicts.length; return; }
+  const done = queue.filter(j => j.status === "done").length;
+  chip.textContent = pumping ? done + "/" + queue.length : "上传记录 " + queue.length;
+}
+function paintUploads() {
+  updateChip();
+  if (sheetMode !== "upload") return;
+  sheet.hidden = false;
+  if (!document.getElementById("up-rows")) {
+    openCard('<div class="upload-head"><div class="titleline"><span class="stitle">上传</span><span class="aside" id="up-summary"></span></div><p id="up-note" class="detail"></p></div><div id="up-rows"></div><div id="up-controls"><button type="button" class="ulink" id="up-all">取消剩余上传</button><button type="button" class="ulink" id="up-clear">清除记录</button></div>');
+    document.getElementById("up-all").onclick = function () { queue.forEach(cancelJob); paintUploads(); };
+    document.getElementById("up-clear").onclick = function () {
+      if (checkingSpace || enqueuing || conflicts.length) return;
+      for (let i = queue.length - 1; i >= 0; i--) {
+        if (!["done", "fail", "cancel"].includes(queue[i].status)) continue;
+        const row = document.getElementById("job-" + queue[i].id);
+        if (row) row.remove();
+        queue.splice(i, 1);
+      }
+      if (queue.length) paintUploads();
+      else closeSheet();
+    };
+  }
+  const counts = {done:0,fail:0,cancel:0};
+  queue.forEach(j => { if (Object.hasOwn(counts,j.status)) counts[j.status]++; });
+  document.getElementById("up-summary").textContent = "完成 " + counts.done + " · 失败 " + counts.fail + " · 取消 " + counts.cancel;
+  document.getElementById("up-note").textContent = queue.some(j => j.status === "saving") ? "当前文件正在设备保存，无法取消；可取消后续等待任务。" : "依次上传并保存，传输期间请保持页面在前台。";
+  const rows = document.getElementById("up-rows");
+  queue.forEach(function (j) {
+    let row = document.getElementById("job-" + j.id);
+    if (!row) {
+      row = document.createElement("div"); row.className = "ufile"; row.id = "job-" + j.id;
+      row.innerHTML = '<div class="job-heading"><div class="nm">' + esc(j.name) + '</div><span class="job-size">' + fmt(j.file.size) + '</span></div><div class="job-main"><div class="job-info"><p class="detail job-path">保存到：' + esc(childPath(j.dest,j.name)) + '</p></div><div class="job-progress"><div class="chips"><span class="chip job-state"></span><span class="chip job-speed"></span></div><button type="button" class="job-action"></button></div></div><p class="job-progress-note" role="status" hidden>设备进度暂不可用，正在重试…</p><div class="ubar"><i></i></div><p class="notice bad job-error" hidden></p>';
+      rows.prepend(row);
+      row.querySelector("button").onclick = async function () {
+        if (j.status === "fail") {
+          if (!j.dest || checkingSpace || enqueuing || deleting || conflicts.length) return;
+          checkingSpace = true; paintUploads();
+          try {
+            await requireSpace(j.file.size);
+            j.status = "wait"; j.loaded = 0; j.err = "";
+          } catch(e) { j.err = e.message || "容量校验失败，请重试"; }
+          finally { checkingSpace = false; }
+          paintUploads(); pump();
+        } else { cancelJob(j); paintUploads(); }
+      };
+    }
+    row.querySelector(".job-path").hidden = !j.dest;
+    row.dataset.status = j.status;
+    const sending = j.status === "up", waiting = j.status === "wait";
+    const pct = j.status === "saving" || j.status === "done" ? 100 : j.total ? Math.min(100,Math.round(j.loaded/j.total*100)) : 0;
+    row.querySelector(".job-state").textContent = sending ? j.cancelling ? "取消中" : j.noProgress ? "上传中" : pct + "%" : j.status === "fail" ? "上传失败" : labelOf(j);
+    const speed = row.querySelector(".job-speed"); speed.hidden = !sending || j.noProgress;
+    speed.textContent = fmt(Math.round(j.speed || 0)) + "/s";
+    const action = row.querySelector("button");
+    action.hidden = !j.dest || (!sending && !waiting && j.status !== "fail");
+    action.textContent = j.status === "fail" ? "重试" : "取消";
+    action.disabled = j.cancelling || j.status === "fail" && (checkingSpace || enqueuing || deleting || conflicts.length > 0);
+    row.querySelector(".job-progress-note").hidden = !sending || !j.noProgress;
+    row.querySelector(".ubar").hidden = sending ? !!j.noProgress : j.status !== "saving";
+    row.querySelector(".ubar i").style.width = pct + "%";
+    const error = row.querySelector(".job-error"); error.hidden = j.status !== "fail"; error.textContent = j.err;
+  });
+  document.getElementById("up-all").hidden = !queue.some(j => j.status === "wait" || j.status === "up");
+  const clear = document.getElementById("up-clear");
+  clear.hidden = counts.done + counts.fail + counts.cancel === 0;
+  clear.disabled = checkingSpace || enqueuing || conflicts.length > 0;
+  document.getElementById("up-controls").hidden = document.getElementById("up-all").hidden && clear.hidden;
+}
+async function requireSpace(bytes, exclude) {
+  const r = await fetch("/api/storage");
+  if (!r.ok) throw Error(await r.text());
+  const d = await r.json();
+  if (!d.mounted) throw Error("未检测到 SD 卡，请插卡后重试");
+  if (!Number.isFinite(d.free) || d.free < 0) throw Error("剩余容量读取失败，请重试");
+  const reserved = queue.filter(j => j !== exclude && (j.status === "wait" || j.status === "up" || j.status === "saving")).reduce((n,j) => n + j.file.size, 0);
+  if (bytes + reserved > d.free) throw Error("SD 卡空间不足\n所选文件：" + fmt(bytes) + "，队列预留：" + fmt(reserved) + "，剩余：" + fmt(d.free) + "。本次未开始上传，请减少文件或清理空间。");
+}
+function cancelJob(job) {
+  if (job.status === "wait") job.status = "cancel";
+  else if (job.status === "up") { if (job.stop) job.stop(); else job.status = "cancel"; }
+}
+
+function websocketUpload(job) {
+  return new Promise(function (resolve, reject) {
+    const id = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 12);
+    let compressor = null;
+    if (!/\.epub$/i.test(job.file.name)) {
+      try { compressor = new CompressionStream("deflate"); } catch (error) {}
+    }
+    const encoding = compressor ? "zlib-stream-v1" : "identity";
+    const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/upload");
+    job.total = job.file.size;
+    job.loaded = 0; job.speed = 0; job.noProgress = false; job.cancelling = false;
+    let settled = false, ready = false, finishing = false;
+    let offset = 0, acknowledged = 0, chunk = 0;
+    let reader = null, pending = null, position = 0, eof = false, packet = null, filled = 0;
+    let last = 0, lastTime = performance.now(), lastPaint = 0, timer, heartbeat, awaitingPong = false;
+    function armTimeout() {
+      clearTimeout(timer);
+      timer = setTimeout(function () { finish("上传超时，保存结果未知，请重新连接后刷新目录确认"); }, 120000);
+    }
+    function finish(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(heartbeat);
+      if (reader) reader.cancel().catch(function () {});
+      job.stop = null;
+      job.cancelling = false;
+      ws.close();
+      if (error) reject(new Error(error)); else resolve();
+    }
+    async function sendFile() {
+      try {
+        // 聚合压缩器的小段输出，凑满一块或到流尾才发送。
+        while (!settled && !job.cancelling) {
+          if (filled === chunk || eof) {
+            if (filled) {
+              while (ws.bufferedAmount > chunk * 2 && !settled && !job.cancelling && ws.readyState === WebSocket.OPEN) {
+                await new Promise(r => setTimeout(r, 5));
+              }
+              if (settled || job.cancelling) break;
+              if (ws.readyState !== WebSocket.OPEN) throw Error();
+              ws.send(packet.subarray(0, filled));
+            }
+            offset += filled; filled = 0;
+            if (eof) break;
+          }
+          if (!pending) {
+            const next = await reader.read();
+            if (settled || job.cancelling) break;
+            if (next.done) { eof = true; continue; }
+            pending = next.value; position = 0;
+          }
+          const length = Math.min(chunk - filled, pending.byteLength - position);
+          packet.set(pending.subarray(position, position + length), filled);
+          filled += length; position += length;
+          if (position === pending.byteLength) pending = null;
+        }
+        if (!settled && !job.cancelling && eof && filled === 0 && !finishing) {
+          finishing = true;
+          ws.send(JSON.stringify({op:"finish", id:id}));
+        }
+      } catch (error) {
+        finish("上传连接中断，保存结果未知，请重新连接后刷新目录确认");
+      }
+    }
+    job.stop = function () {
+      if (settled || job.cancelling || job.status !== "up") return;
+      job.cancelling = true;
+      if (reader) reader.cancel().catch(function () {});
+      paintUploads();
+      // 开始请求先入队，取消命令随后处理；不会再发送新的文件块。
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({op:"cancel", id:id}));
+    };
+    ws.onopen = function () {
+      ws.send(JSON.stringify({op:"start", id:id, path:job.dest, name:job.name, size:job.total, replace:!!job.replace, encoding:encoding}));
+      if (job.cancelling) ws.send(JSON.stringify({op:"cancel", id:id}));
+      armTimeout();
+    };
+    ws.onmessage = function (event) {
+      if (settled) return;
+      try {
+        const p = JSON.parse(event.data);
+        if (p.event === "pong") { awaitingPong = false; return; }
+        if (p.event === "error") { finish(p.error || "无法开始上传"); return; }
+        if (p.id !== id || !["ready", "progress"].includes(p.event) ||
+            !["receiving", "saving", "done", "failed", "cancelled"].includes(p.state) ||
+            ![p.total, p.received, p.written].every(Number.isSafeInteger) || p.total !== job.total ||
+            p.received < job.loaded || p.written < 0 || p.written > p.received || p.received > job.total ||
+            !Number.isSafeInteger(p.wire) || p.wire < acknowledged || p.wire > offset ||
+            typeof p.active !== "boolean") throw Error("设备上传进度数据无效");
+        if (p.event === "ready") {
+          if (p.encoding !== encoding || ready || p.state !== "receiving" || !p.active || p.received !== 0 ||
+              !Number.isSafeInteger(p.chunk) || p.chunk < 1 || p.chunk > 4096) throw Error("设备上传分块无效");
+          chunk = p.chunk; ready = true;
+          packet = new Uint8Array(chunk);
+          heartbeat = setInterval(function () {
+            if (settled || finishing || job.cancelling) return;
+            if (awaitingPong) { finish("心跳超时，保存结果未知，请重新连接后刷新目录确认"); return; }
+            try {
+              awaitingPong = true;
+              ws.send(JSON.stringify({op:"ping", id:id}));
+            } catch (error) { finish("上传连接中断，保存结果未知，请重新连接后刷新目录确认"); }
+          }, 60000);
+          let sourceOffset = 0;
+          const source = new ReadableStream({
+            async pull(controller) {
+              if (sourceOffset === job.total) { controller.close(); return; }
+              const end = Math.min(sourceOffset + chunk, job.total);
+              const data = await job.file.slice(sourceOffset, end).arrayBuffer();
+              if (settled || job.cancelling) return;
+              sourceOffset = end;
+              controller.enqueue(new Uint8Array(data));
+            }
+          });
+          reader = (compressor ? source.pipeThrough(compressor) : source).getReader();
+        }
+        armTimeout();
+        acknowledged = p.wire;
+        const now = performance.now();
+        if (now - lastTime >= 100 || !p.active) {
+          job.speed = Math.max(0, p.received - last) * 1000 / Math.max(1, now - lastTime);
+          last = p.received; lastTime = now;
+        }
+        job.loaded = p.received;
+        if (p.state === "saving" || p.state === "done") { job.status = "saving"; job.speed = 0; }
+        if (now - lastPaint >= 100 || p.state !== "receiving") { paintUploads(); lastPaint = now; }
+        if (!p.active) {
+          if (p.state === "done" && p.written === job.total) { finish(); return; }
+          if (p.state === "cancelled") { job.status = "cancel"; finish("cancel"); return; }
+          finish(p.error || "上传失败"); return;
+        }
+        if (p.event === "ready") sendFile();
+      } catch (error) { finish(error.message || "设备响应无效，请刷新目录确认结果"); }
+    };
+    ws.onerror = function () { finish("上传连接失败，请检查热点连接后重试"); };
+    ws.onclose = function () { finish("上传连接中断，保存结果未知，请重新连接后刷新目录确认"); };
+    armTimeout();
+  });
+}
+
+async function pump() {
+  if (pumping) return;
+  pumping = true;
+  for (;;) {
+    const job = queue.filter(function (j) { return j.status === "wait"; })[0];
+    if (!job || (conflicts.length && job.id > conflictBatchStart)) break;
+    job.status = "up";
+    job.loaded = 0;
+    job.speed = 0;
+    job.noProgress = false;
+    job.stop = null;
+    paintUploads();
+    try {
+      await requireSpace(job.file.size, job);
+      if (job.status === "cancel") continue;
+      await websocketUpload(job);
+      if (job.status === "up" || job.status === "saving") job.status = "done";
+      if (job.dest === path) load();
+    } catch (e) {
+      if (job.status !== "cancel") {
+        job.status = "fail";
+        job.err = (e && e.message) || "上传失败";
+      }
+    }
+    paintUploads();
+  }
+  pumping = false;
+  paintUploads();
+}
+function splitName(name) {
+  const i = name.lastIndexOf(".");
+  if (i <= 0) return {base: name, ext: ""};
+  return {base: name.slice(0, i), ext: name.slice(i)};
+}
+function nameKey(dest, name) { return dest.toLowerCase() + "\0" + name.toLowerCase(); }
+function numberedName(name, dest) {
+  const parts = splitName(name);
+  let n = 1;
+  let candidate = parts.base + "-" + n + parts.ext;
+  while (takenNames.has(nameKey(dest, candidate))) {
+    n += 1;
+    candidate = parts.base + "-" + n + parts.ext;
+  }
+  return candidate;
+}
+function pushJob(file, name, replace, dest) {
+  const job = {id: ++seq, file: file, name: name, dest: dest, status: "wait", loaded: 0, total: file.size || 0, speed: 0, err: "", replace: !!replace};
+  queue.push(job);
+  return job;
+}
+function finishConflicts() {
+  if (!queue.length) { closeSheet(); return; }
+  sheetMode = "upload";
+  paintUploads();
+}
+function applyConflict(kind, all) {
+  let count = all ? conflicts.length : 1;
+  while (count-- > 0 && conflicts.length) {
+    const item = conflicts[0];
+    if (kind !== "skip") {
+      const name = kind === "rename" ? numberedName(item.file.name,item.dest) : item.file.name;
+      const error = nameError(name,item.dest);
+      if (error) { paintConflict(); say(error + "，请跳过或取消后缩短文件名。",true); return; }
+      takenNames.add(nameKey(item.dest,name));
+      pushJob(item.file,name,kind === "replace",item.dest);
+    }
+    conflicts.shift();
+  }
+  if (conflicts.length) paintConflict();
+  else { finishConflicts(); pump(); }
+}
+function paintConflict() {
+  const item = conflicts[0];
+  if (!item) { finishConflicts(); return; }
+  sheetMode = "conflict";
+  const next = numberedName(item.file.name, item.dest);
+  const rest = conflicts.length - 1;
+  const choices = [
+    ["rename", "保留两份", "新文件将保存为 " + next],
+    ["replace", "替换原文件", "新文件保存成功后替换原文件"],
+    ["skip", "跳过此文件", "保留设备上的原文件，不上传此文件"]
+  ];
+  openCard('<div class="conflict-head"><div class="stitle">同名文件 <span class="detail">待处理 ' + conflicts.length + ' 项</span></div><button type="button" class="conflict-close" id="c-close" aria-label="收起同名文件处理">×</button></div>' +
+    '<div class="conflict-file">' + esc(item.file.name) + '<div class="detail">此位置已有同名项目 · ' + esc(item.dest) + '</div></div>' +
+    '<fieldset class="conflict-options" aria-label="同名文件处理方式">' + choices.map(function (choice) {
+      return '<label class="conflict-choice"><input type="radio" name="conflict-choice" value="' + choice[0] + '"' + (conflictChoice === choice[0] ? ' checked' : '') + '><span><strong>' + choice[1] + '</strong><span class="detail">' + esc(choice[2]) + '</span></span></label>';
+    }).join('') + '</fieldset>' +
+    (rest ? '<label class="conflict-all"><input type="checkbox" id="c-all"' + (conflictApplyAll ? ' checked' : '') + '>也应用于其余 ' + rest + ' 个同名文件</label>' : '') +
+    '<div class="conflict-footer"><div class="pair"><button type="button" id="c-cancel">取消本次添加</button><button type="button" class="go" id="c-apply">继续</button></div></div>');
+  document.getElementById("c-close").onclick = closeSheet;
+  card.querySelectorAll('[name="conflict-choice"]').forEach(function (input) {
+    input.onchange = function () { conflictChoice = input.value; };
+  });
+  const all = document.getElementById("c-all");
+  if (all) all.onchange = function () { conflictApplyAll = all.checked; };
+  document.getElementById("c-apply").onclick = function () { applyConflict(conflictChoice, !!all && all.checked); };
+  document.getElementById("c-cancel").onclick = function () {
+    queue.forEach(j => { if (j.id > conflictBatchStart && j.status === "wait") j.status = "cancel"; });
+    conflicts = []; finishConflicts();
+  };
+  updateChip();
+}
+let autoClass = false;
+const CLASS_DIR = {
+  epub: "/metalio/e-ink/books", txt: "/metalio/e-ink/books", ebook: "/metalio/e-ink/books", epu: "/metalio/e-ink/books",
+  png: "/metalio/e-ink/wallpaper", jpg: "/metalio/e-ink/wallpaper", jpeg: "/metalio/e-ink/wallpaper",
+  ef: "/metalio/e-ink/fonts",
+  ttf: "/metalio/e-ink/fonts_ttf", otf: "/metalio/e-ink/fonts_ttf"
+};
+function classDest(name) {
+  const i = name.lastIndexOf(".");
+  if (i <= 0 || i === name.length - 1) return "";
+  return CLASS_DIR[name.slice(i + 1).toLowerCase()] || "";
+}
+function setAutoClass(on) {
+  autoClass = !!on;
+  document.getElementById("autoclass").setAttribute("aria-checked", autoClass ? "true" : "false");
+  document.getElementById("autoclass-note").hidden = !autoClass;
+  try { localStorage.setItem("fileman-autoclass", autoClass ? "1" : "0"); } catch (e) {}
+}
+async function enqueue(files) {
+  if (deleting || enqueuing || checkingSpace || conflicts.length) { say("请先完成当前操作", true); return; }
+  enqueuing = true;
+  try {
+    const skipped = [];
+    const groups = {};
+    const invalid = [];
+    files.forEach(function (f) {
+      const dest = autoClass ? classDest(f.name) : (uploadAt || path);
+      if (!dest) { skipped.push(f); return; }
+      const error = nameError(f.name, dest);
+      if (error) { invalid.push(f.name + "：" + error); return; }
+      (groups[dest] = groups[dest] || []).push(f);
+    });
+    if (invalid.length) { say(invalid.join("\n"), true); return; }
+    say("");
+    skipped.forEach(function (file) {
+      const job = pushJob(file, file.name, false, "");
+      job.status = "fail";
+      job.err = "文件类型不支持，此文件无法进行分类";
+    });
+    takenNames = new Set(queue.filter(j => j.dest && j.status !== "cancel").map(j => nameKey(j.dest,j.name)));
+    const dests = Object.keys(groups);
+    if (!dests.length) { finishConflicts(); return; }
+    const bytes = Object.values(groups).flat().reduce((n,listFile) => n + listFile.size,0);
+    try { await requireSpace(bytes); } catch(e) { say(e.message || "容量校验失败",true); return; }
+    const listings = {};
+    for (let i = 0; i < dests.length; i++) {
+      const dest = dests[i];
+      let names;
+      try {
+        const r = await fetch("/api/files?path=" + enc(dest));
+        if (!r.ok) { say(await r.text(), true); return; }
+        const data = await r.json();
+        if (data.truncated) throw Error("目录列表不完整，请更换目录后重试");
+        names = new Set((data.items || []).map(function (it) { return it.name; }));
+      } catch (e) {
+        say(e.message || "无法读取目录", true);
+        return;
+      }
+      listings[dest] = names;
+    }
+    conflictBatchStart = seq;
+    conflictChoice = "rename";
+    conflictApplyAll = false;
+    dests.forEach(function (dest) {
+      const names = listings[dest];
+      names.forEach(function (n) { takenNames.add(nameKey(dest, n)); });
+      groups[dest].forEach(function (f) {
+        if (takenNames.has(nameKey(dest, f.name))) conflicts.push({file: f, dest: dest});
+        else {
+          takenNames.add(nameKey(dest, f.name));
+          pushJob(f, f.name, false, dest);
+        }
+      });
+    });
+    if (conflicts.length) paintConflict();
+    else { finishConflicts(); pump(); }
+  } finally { enqueuing = false; paintUploads(); }
+}
+function askDeleteSelected() { confirmDelete(Array.from(selected)); }
+function confirmDelete(paths) {
+  if (!paths.length || deleting) return;
+  if (enqueuing || checkingSpace || conflicts.length) { say("请先完成文件选择或冲突处理",true); return; }
+  sheetMode = "delete";
+  openCard('<div class="delete-box"><h2 class="dialog-title" id="delete-title">删除 ' + paths.length + ' 项？</h2><div class="dialog-text"><div class="delete-paths">' + paths.map(p => {
+    const name = p.slice(p.lastIndexOf("/") + 1);
+    const chars = Array.from(name), dot = name.lastIndexOf(".");
+    const keep = dot > 0 ? Math.min(12, Math.max(8, Array.from(name.slice(dot)).length)) : 8;
+    return '<div class="delete-item" title="' + esc(p) + '"><button type="button" class="delete-name" aria-expanded="false"><span class="delete-start">' + esc(chars.slice(0, -keep).join("")) + '</span><span class="delete-end">' + esc(chars.slice(-keep).join("")) + '</span></button><button type="button" class="delete-remove" aria-label="取消选中 ' + esc(name) + '"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div>';
+  }).join("") + '</div><p class="delete-warning">文件夹及全部子项将一并删除，无法恢复。中途失败时，已删除内容无法撤销。</p></div></div><div class="dialog-actions"><button type="button" class="secondary" id="del-cancel">取消</button><button type="button" class="danger" id="del-ok">删除</button></div>');
+  card.querySelectorAll(".delete-name").forEach(function (button) {
+    button.onclick = function () {
+      const expanded = button.parentElement.classList.toggle("expanded");
+      button.setAttribute("aria-expanded", expanded ? "true" : "false");
+    };
+  });
+  card.querySelectorAll(".delete-remove").forEach(function (button, index) {
+    const p = paths[index];
+    button.onclick = function () {
+      paths = paths.filter(item => item !== p);
+      selected.delete(p);
+      button.parentElement.remove();
+      document.getElementById("delete-title").textContent = "删除 " + paths.length + " 项？";
+      if (!paths.length) {
+        closeSheet();
+        if (!selected.size) selectMode = false;
+      }
+      renderList();
+    };
+  });
+  document.getElementById("del-cancel").onclick = closeSheet;
+  document.getElementById("del-ok").onclick = async function () {
+    deleting = true;
+    sheetMode = "deleting";
+    let deleted = 0, error = "", finished = 0, unknown = false;
+    try {
+      for (const p of paths) {
+        openCard('<div class="delete-box"><h2 class="dialog-title">正在删除</h2><div class="dialog-text"><div class="loading" role="status" aria-live="polite"><i class="ring" aria-hidden="true"></i><span>处理所选项目 ' + (finished+1) + ' / ' + paths.length + '</span><p class="detail">' + esc(p) + '</p></div><p class="delete-warning">请保持页面在前台，删除期间请勿断开设备。</p></div></div>');
+        unknown = true;
+        const r = await fetch("/delete", {method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"path="+enc(p)+"&recursive=1"});
+        if (!r.ok) throw Error(await r.text());
+        const result = await r.json();
+        unknown = false;
+        deleted += result.deleted || 0;
+        if (result.error || result.remaining) throw Error(result.error || "部分项目未删除");
+        finished++;
+      }
+    } catch(e) {
+      error = e.message || "操作失败";
+      if (unknown) error += "。当前操作结果未知，请刷新确认。";
+    }
+    finally { deleting = false; }
+    selectMode = false; selected.clear(); paintSelect();
+    await load();
+    sheetMode = "delete-result";
+    openCard('<div class="delete-box"><h2 class="dialog-title">' + (error ? "删除未全部完成" : "删除完成") + '</h2><div class="dialog-text">已确认删除 ' + deleted + ' 个文件或文件夹，完成所选项目 ' + finished + ' / ' + paths.length + '。' + (error ? '<p class="delete-error">' + esc(error) + '</p>' : '') + '</div></div><div class="dialog-actions"><button type="button" id="del-close">确定</button></div>');
+    document.getElementById("del-close").onclick = closeSheet;
+  };
+}
+
+window.addEventListener("beforeunload", function (e) {
+  if (pumping || deleting || conflicts.length) { e.preventDefault(); e.returnValue = ""; }
+});
+sheet.onclick = function (e) {
+  if (e.target !== sheet) return;
+  const dropSelect = sheetMode === "delete" && selectMode;
+  closeSheet();
+  if (dropSelect) exitSelect();
+};
+document.addEventListener("pointerdown", function (e) {
+  if (!selectMode || sheetMode === "delete") return;
+  if (e.target.closest("#selbar") || e.target.closest(".row")) return;
+  exitSelect();
+});
+card.onclick = function (e) { e.stopPropagation(); };
+document.getElementById("add").onclick = openAdd;
+document.getElementById("refresh").onclick = function () { load(); };
+document.getElementById("sel-del").onclick = askDeleteSelected;
+document.getElementById("upchip").onclick = function () {
+  if (conflicts.length) paintConflict();
+  else { sheetMode = "upload"; paintUploads(); }
+};
+document.getElementById("file").onchange = function () {
+  const files = Array.prototype.slice.call(this.files);
+  this.value = "";
+  if (files.length) enqueue(files);
+};
+const ICON_SUN = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5 5l1.8 1.8M17.2 17.2L19 19M19 5l-1.8 1.8M6.8 17.2L5 19"/></svg>';
+const ICON_MOON = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M15.5 3.2a8.2 8.2 0 1 0 5.3 12.6A7 7 0 0 1 15.5 3.2z"/></svg>';
+function applyTheme(mode) {
+  document.documentElement.setAttribute("data-theme", mode);
+  document.getElementById("theme").innerHTML = mode === "night" ? ICON_SUN : ICON_MOON;
+  try { localStorage.setItem("fileman-theme", mode); } catch (e) {}
+}
+let theme = "day";
+try { theme = localStorage.getItem("fileman-theme") === "night" ? "night" : "day"; } catch (e) {}
+applyTheme(theme);
+document.getElementById("theme").onclick = function () {
+  applyTheme(document.documentElement.getAttribute("data-theme") === "night" ? "day" : "night");
+};
+try { autoClass = localStorage.getItem("fileman-autoclass") === "1"; } catch (e) {}
+setAutoClass(autoClass);
+document.getElementById("autoclass").onclick = function () { setAutoClass(!autoClass); };
+load();
+</script>
+</body>
+</html>

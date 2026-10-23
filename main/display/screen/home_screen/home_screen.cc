@@ -3,7 +3,9 @@
 #include "home_screen_priv.h"
 #include "home_screen_ui.h"
 #include "home_apps_slash.h"
+#include "home_icon_source.h"
 #include "home_card_style.h"
+#include "pixel/home_pixel.h"
 #include "home_screen/home_hero.h"
 #include "assistant_screen/assistant_screen.h"
 #include "assets/lang_config.h"
@@ -30,9 +32,23 @@ uint8_t Home_gray_dither_l8[kDitherW * kDitherH];
 lv_image_dsc_t Home_gray_dither_img;
 bool Home_gray_dither_ready = false;
 
+void Home_OnAppNameDraw(lv_event_t* e)
+{
+    lv_obj_t* name = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    lv_draw_label_dsc_t dsc;
+    lv_draw_label_dsc_init(&dsc);
+    lv_obj_init_draw_label_dsc(name, LV_PART_MAIN, &dsc);
+    dsc.text = lv_label_get_text(name);
+    dsc.opa = LV_OPA_50;
+    dsc.ofs_x = 1;
+    lv_area_t area;
+    lv_obj_get_content_coords(name, &area);
+    lv_draw_label(lv_event_get_layer(e), &dsc, &area);
+}
+
     
     const char *Home_AppNameTask() { return Lang::Strings::HOME_APP_TASK; }
-    const char *Home_AppNameAssistant() { return Lang::Strings::HOME_APP_ASSISTANT; }
+    const char *Home_AppNameAssistant() { return AssistantScreen::DisplayName(true); }
     const char *Home_AppNameBook() { return Lang::Strings::HOME_APP_BOOK; }
     const char *Home_AppNameWallpaper() { return Lang::Strings::HOME_APP_WALLPAPER; }
     const char *Home_AppNameCloud() { return Lang::Strings::HOME_APP_CLOUD; }
@@ -70,7 +86,7 @@ lv_coord_t Home_slash_apps_h = 0;
 
 int Home_PageCount()
     {
-        if (Home_slash_layout)
+        if (Home_slash_layout || Home_card_style == HomeScreen::kCardStylePixel)
         {
             return 1;
         }
@@ -221,6 +237,7 @@ int Home_PageCount()
             return;
         }
         HomeHero_Teardown();
+        HomePixel_Stop();
         Home_scr = nullptr;
         Home_apps = nullptr;
         Home_page_lbl = nullptr;
@@ -281,9 +298,9 @@ int Home_PageCount()
         lv_obj_set_user_data(cell, const_cast<AppEntry *>(&entry));
         lv_obj_add_event_cb(cell, Home_OnAppClicked, LV_EVENT_CLICKED, const_cast<AppEntry *>(&entry));
         lv_obj_t *icon = lv_image_create(cell);
-        lv_image_set_src(icon, entry.icon_path);
-        lv_obj_set_size(icon, kIconSize, kIconSize);
-        lv_image_set_inner_align(icon, LV_IMAGE_ALIGN_CONTAIN);
+        lv_image_set_src(icon, HomeIconSource(entry.icon_path));
+        lv_obj_set_style_image_recolor(icon, lv_color_black(), 0);
+        lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
         lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, HOME_APP_CARD_ICON_PAD_TOP);
         lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
 
@@ -292,6 +309,7 @@ int Home_PageCount()
         lv_obj_set_width(name, HOME_APP_CARD_W);
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(name, fontpack_lv_font_ui(), 0);
+        lv_obj_add_event_cb(name, Home_OnAppNameDraw, LV_EVENT_DRAW_MAIN_END, nullptr);
         lv_obj_set_style_text_color(name, lv_color_black(), 0);
         lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_align(name, LV_ALIGN_BOTTOM_MID, 0, -HOME_APP_CARD_NAME_PAD_BOT);
@@ -306,7 +324,8 @@ int Home_PageCount()
     int Home_NormalizeCardStyle(int style)
     {
         if (style == HomeScreen::kCardStyleWhite || style == HomeScreen::kCardStyleGray ||
-            style == HomeScreen::kCardStyleBorder || style == HomeScreen::kCardStyleSlash)
+            style == HomeScreen::kCardStyleBorder || style == HomeScreen::kCardStyleSlash ||
+            style == HomeScreen::kCardStylePixel)
         {
             return style;
         }
@@ -355,13 +374,13 @@ void HomeScreen::SaveCardStyle(int style)
 
 lv_obj_t *HomeScreen::Create()
 {
+    HomePixel_Stop();
     lv_obj_t *scr = lv_obj_create(nullptr);
     Home_scr = scr;
     lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, fontpack_lv_font_ui(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     // 与其它 App 共用 ScreenCreateStatusBar 高度，勿再强制 HOME 专用高度（图标会相对上移）
     EpdStatusBar status = ScreenCreateStatusBar(scr);
@@ -371,6 +390,20 @@ lv_obj_t *HomeScreen::Create()
     const int pages = Home_PageCount();
     ESP_LOGI(TAG, "layout apps=%d pages=%d per_page=%d style=%d slash=%d", kTotalApps, pages,
              kAppsPerPage, card_style, Home_slash_layout ? 1 : 0);
+
+    if (card_style == kCardStylePixel) {
+        HomeHero_Teardown();
+        Home_apps = nullptr;
+        Home_page_lbl = nullptr;
+        Home_page = 0;
+        HomePixel_Build(scr, status.height);
+        lv_obj_add_event_cb(scr, Home_OnHomeDeleted, LV_EVENT_DELETE, nullptr);
+        ScreenSetIsHome(true);
+        VkKey_AttachScreen(scr, kScreenId,
+                           VkKeyScreenDesc{HomeScreen::Create, Home_OnVkKey, nullptr, Home_OnBootLongPress,
+                                           nullptr, nullptr, Home_OnVkKeyLongPress, Home_OnVkKeyPressUp});
+        return scr;
+    }
 
     if (Home_slash_layout)
     {

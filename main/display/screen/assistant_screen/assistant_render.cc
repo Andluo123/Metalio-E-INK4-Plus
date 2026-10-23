@@ -2,6 +2,8 @@
 #include "assistant_screen_priv.h"
 
 #include "assistant_render.h"
+#include <memory>
+#include "chat_cloud.h"
 #include "a2ui.h"
 
 #include <cstdio>
@@ -21,8 +23,9 @@ cJSON* MakeComp(const char* id, const char* type) {
 }
 
 // 把一页 FlowItem 编成 updateComponents，交给 a2ui 按原样式渲染。
-bool BuildPageJson(const FlowList& page, std::string& out_json) {
+bool BuildPageJson(const FlowList& page, ChatString& out_json) try {
     cJSON* root = cJSON_CreateObject();
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root_owner(root, &cJSON_Delete);
     cJSON* body = cJSON_AddObjectToObject(root, "updateComponents");
     cJSON_AddStringToObject(body, "root", "root");
     cJSON* comps = cJSON_AddArrayToObject(body, "components");
@@ -246,13 +249,16 @@ bool BuildPageJson(const FlowList& page, std::string& out_json) {
 
     // 未闭合 Card：保持打开即可（跨页卡片下半页）
     char* raw = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
+    root_owner.reset();
     if (raw == nullptr) {
         return false;
     }
+    std::unique_ptr<char, decltype(&cJSON_free)> raw_owner(raw, &cJSON_free);
     out_json.assign(raw);
-    cJSON_free(raw);
     return true;
+} catch (const std::bad_alloc&) {
+    ESP_LOGW(TAG, "Page JSON skipped: PSRAM exhausted");
+    return false;
 }
 
 void Assistant_UpdatePageIndicator() {
@@ -283,7 +289,7 @@ void Assistant_RenderCurrentPage() {
     }
     a2ui_set_host(Assistant_State().chrome.content);
 
-    std::string json;
+    ChatString json;
     {
         std::lock_guard<std::mutex> g(Assistant_State().stream.session_mu);
         if (Assistant_State().layout.pages.empty() || !Assistant_State().layout.has_a2ui_content) {
@@ -299,9 +305,27 @@ void Assistant_RenderCurrentPage() {
             return;
         }
     }
+    auto& stream = Assistant_State().stream;
+    const auto& layout = Assistant_State().layout;
+    const bool yunxin = chat_cloud::IsYunxin();
+    if (yunxin && json.size() == stream.rendered_page_json.size() &&
+        std::memcmp(json.data(), stream.rendered_page_json.data(), json.size()) == 0 &&
+        stream.rendered_page_font == Assistant_UiFont() &&
+        stream.rendered_page_width == layout.viewport_w &&
+        stream.rendered_page_height == layout.viewport_h) {
+        // Later pages may grow without recreating unchanged visible controls.
+        Assistant_UpdatePageIndicator();
+        return;
+    }
     const esp_err_t err = a2ui_handle_json(json.c_str());
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "a2ui_handle_json page failed: %s", esp_err_to_name(err));
+    }
+    if (yunxin && err == ESP_OK) {
+        stream.rendered_page_json = std::move(json);
+        stream.rendered_page_font = Assistant_UiFont();
+        stream.rendered_page_width = layout.viewport_w;
+        stream.rendered_page_height = layout.viewport_h;
     }
     a2ui_take_pending_refresh();
 

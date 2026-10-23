@@ -38,7 +38,8 @@ void DeleteWallpaperMeta(const char* wallpaper_path);
 /** @brief 下载云壁纸到本地 */
 bool DownloadCloudWallpaper(const CloudWallpaperTask& task, std::string& err_out,
                             CloudDownloadProgressFn on_progress = nullptr,
-                            void* progress_user = nullptr, DownloadGate* gate = nullptr);
+                            void* progress_user = nullptr, DownloadGate* gate = nullptr,
+                            const char* save_path = nullptr, bool overwrite = false);
 /** @brief 删除本地云壁纸文件及元数据 */
 bool DeleteCloudWallpaperLocal(const CloudWallpaperTask& task, std::string& err_out);
 

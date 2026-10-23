@@ -7,10 +7,7 @@
 extern "C" {
 #endif
 
-/** A2I1 binary image from Python server (already Floyd–Steinberg dithered). */
-#define A2UI_I1_MAGIC 0x31493241u /* 'A2I1' little-endian */
-
-/** Local L8 blob for mem:// (header + w*h bytes). Same path as book cover / camera test. */
+/** L8 image envelope (header + w*h bytes), shared by local images and cached downloads. */
 #define A2UI_L8_MAGIC 0x384C3241u /* 'A2L8' little-endian */
 
 /**
@@ -32,9 +29,9 @@ void a2ui_image_set_http_origin(const char *origin);
  * Architecture
  * ------------
  * - One surface per lv_image (owned pixel buffer + dsc); up to A2UI_IMG_MAX_SURFACES.
- * - HTTP / file://：异步拉 A2I1，上屏前解码为 L8
+ * - HTTP / file://：异步读取 A2I1/A2L8/PNG/JPEG，内容亮度保留为 L8
  * - mem://：在已持的 LVGL 锁内同步上屏（A2L8 直显，或 A2I1→L8）
- * - 墨水屏显示一律 L8（与书封/产测一致）；I1 直显在本板只剩白底线框
+ * - 内容通过角色声明按需使用灰阶；普通 UI 仍为黑白
  *
  * Tear-down order under LVGL lock:
  *   1) a2ui_image_abort_loads()  — cancel worker unit, keep pixels

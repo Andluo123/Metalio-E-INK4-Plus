@@ -1,0 +1,83 @@
+diff --git a/components/esp_driver_sdmmc/src/sd_trans_sdmmc.c b/components/esp_driver_sdmmc/src/sd_trans_sdmmc.c
+index b26e7e43c..c8f3b5c87 100644
+--- a/components/esp_driver_sdmmc/src/sd_trans_sdmmc.c
++++ b/components/esp_driver_sdmmc/src/sd_trans_sdmmc.c
+@@ -9,6 +9,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <sys/param.h>
++#include <stdatomic.h>
+ #include "esp_log.h"
+ #include "esp_intr_alloc.h"
+ #include "esp_check.h"
+@@ -27,6 +28,7 @@ typedef enum {
+ } sdmmc_req_state_t;
+ 
+ static const char *TAG = "SD_TRANS";
++static atomic_flag s_write_event_reported = ATOMIC_FLAG_INIT; // 每次启动仅保留首笔写入的错误事件
+ 
+ const uint32_t SD_DATA_ERR_MASK =
+     SDMMC_INTMASK_DTO | SDMMC_INTMASK_DCRC |
+@@ -426,6 +428,13 @@ static esp_err_t process_events(sd_host_sdmmc_slot_t *slot, sd_host_sdmmc_event_
+         }
+         ESP_LOGV(TAG, "%s state=%s next_state=%s", __func__, s_state_names[state], s_state_names[next_state]);
+     }
++    if (cmd->error != ESP_OK &&
++            (cmd->opcode == MMC_WRITE_BLOCK_SINGLE || cmd->opcode == MMC_WRITE_BLOCK_MULTIPLE) &&
++            !atomic_flag_test_and_set_explicit(&s_write_event_reported, memory_order_relaxed)) {
++        ESP_LOGE(TAG, "first write event: cmd=%" PRIu32 " error=0x%x sd_status=0x%08" PRIx32
++                 " dma_status=0x%08" PRIx32 " state=%d next_state=%d",
++                 cmd->opcode, cmd->error, orig_evt.sdmmc_status, orig_evt.dma_status, state, next_state);
++    }
+     *pstate = state;
+     *unhandled_events = evt;
+     return ESP_OK;
+diff --git a/components/sdmmc/sdmmc_cmd.c b/components/sdmmc/sdmmc_cmd.c
+index eb9622521..9f987e2b2 100644
+--- a/components/sdmmc/sdmmc_cmd.c
++++ b/components/sdmmc/sdmmc_cmd.c
+@@ -5,11 +5,15 @@
+  */
+ 
+ #include <inttypes.h>
++#include <stdatomic.h>
++#include "esp_memory_utils.h"
+ #include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
+ #include <sys/param.h> // for MIN/MAX
+ #include "esp_private/sdmmc_common.h"
+ 
+ static const char* TAG = "sdmmc_cmd";
++static atomic_flag s_write_failure_reported = ATOMIC_FLAG_INIT; // 每次启动仅记录首笔原始写入故障
+ 
+ /**
+  * @brief Get the effective chunk size for unaligned multi-block transfers.
+@@ -576,6 +580,13 @@ esp_err_t sdmmc_write_sectors_dma(sdmmc_card_t* card, const void* src,
+ 
+     uint32_t status = 0;
+     esp_err_t err = sdmmc_send_cmd(card, &cmd);
++    if (err != ESP_OK && !atomic_flag_test_and_set_explicit(&s_write_failure_reported, memory_order_relaxed)) {
++        ESP_LOGE(TAG, "first write failure: cmd=%" PRIu32 " sector=%zu blocks=%zu bytes=%zu timeout_ms=%" PRIu32
++                 " error=0x%x cmd_error=0x%x response=0x%08" PRIx32 " buffer_internal=%d buffer_external=%d stack_external=%d task=%s core=%d",
++                 cmd.opcode, start_block, block_count, cmd.datalen, cmd.timeout_ms,
++                 err, cmd.error, cmd.response[0], esp_ptr_internal(src), esp_ptr_external_ram(src),
++                 esp_ptr_external_ram(&cmd), pcTaskGetName(NULL), xPortGetCoreID());
++    }
+     esp_err_t err_cmd13 = sdmmc_send_cmd_send_status(card, &status);
+ 
+     if (err != ESP_OK) {
+@@ -586,11 +597,11 @@ esp_err_t sdmmc_write_sectors_dma(sdmmc_card_t* card, const void* src,
+                 vTaskDelay(1); // when the host is in spi mode
+             }
+             size_t successfully_written_blocks = 0;
+-            err = sdmmc_send_cmd_num_of_written_blocks(card, &successfully_written_blocks);
+-            if (err == ESP_OK) {
++            const esp_err_t written_blocks_err = sdmmc_send_cmd_num_of_written_blocks(card, &successfully_written_blocks);
++            if (written_blocks_err == ESP_OK) {
+                 ESP_LOGD(TAG, "%s: successfully wrote %zu blocks out of %zu", __func__, successfully_written_blocks, block_count);
+             } else {
+-                ESP_LOGE(TAG, "%s: sdmmc_send_cmd_num_of_written_blocks returned 0x%x", __func__, err);
++                ESP_LOGE(TAG, "%s: sdmmc_send_cmd_num_of_written_blocks returned 0x%x", __func__, written_blocks_err);
+             }
+         }
+         if (err_cmd13 == ESP_OK) {

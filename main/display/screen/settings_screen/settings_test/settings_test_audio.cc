@@ -3,6 +3,8 @@
 #include "application.h"
 #include "assets/lang_config.h"
 #include "audio_service.h"
+#include "metalio_audio.h"
+#include "power_policy.h"
 #include "device_state.h"
 #include "fontpack_lvgl.h"
 #include "haptic_feedback.h"
@@ -35,7 +37,7 @@ enum class State {
 };
 
 State s_state = State::Idle;
-bool s_alive = false;
+std::atomic<bool> s_alive{false};
 bool s_wake_disabled = false;
 bool s_holding_testing_state = false;
 bool s_press_held = false;
@@ -120,7 +122,8 @@ void ShowConfirmDialog() {
 
     lv_obj_t* card = lv_obj_create(mask);
     lv_obj_remove_style_all(card);
-    lv_obj_set_size(card, LV_HOR_RES - UiSx(48), UiSy(220));
+    lv_obj_set_size(card, LV_HOR_RES - UiSx(80), LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(card, UiSy(144), 0);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -129,7 +132,8 @@ void ShowConfirmDialog() {
     lv_obj_set_style_radius(card, UiSx(10), 0);
     lv_obj_set_style_pad_all(card, kSettingsContentPad, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(card, kSettingsOptionGap, 0);
+    lv_obj_set_style_pad_row(card, UiSy(20), 0);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
 
@@ -328,7 +332,7 @@ void StartRecording() {
     CloseConfirmDialog();
 
     auto& as = Application::GetInstance().GetAudioService();
-    if (!as.IsStarted()) {
+    if (!as.IsStarted() || !MetalioAudio_ModeReady()) {
         // 等 AudioInitTask；手指仍按住则就绪后补开录
         ESP_LOGI(kTag, "audio not ready, defer record while held=%d", s_press_held ? 1 : 0);
         KickAudioInitIfNeeded();
@@ -395,14 +399,20 @@ void AsyncOnAudioReady(void* /*p*/) {
     }
     UpdateButtonUi();
     // 进页预热后仍可能首按撞上未就绪：手指未抬则补开录
-    if (s_press_held) {
+    if (s_press_held && s_audio_ready.load()) {
         StartRecording();
     }
 }
 
 void AudioInitTask(void* /*arg*/) {
-    Application::GetInstance().EnsureAudioServiceRunning();
-    s_audio_ready.store(Application::GetInstance().GetAudioService().IsStarted());
+    {
+        PowerNeedHold power(PowerNeed::LocalMic);
+        if (MetalioAudio_WaitModeReady(kMetalioAudioInitWaitMs) && s_alive.load()) {
+            Application::GetInstance().AcquireAudioService(Application::AudioClient::FactoryTest,
+                                                          [] { return s_alive.load(); });
+        }
+    }
+    s_audio_ready.store(Application::GetInstance().GetAudioService().IsStarted() && MetalioAudio_ModeReady());
     s_audio_init_task = nullptr;
     if (IsLive()) {
         if (!ScreenLvAsync(AsyncOnAudioReady, nullptr)) {
@@ -414,7 +424,7 @@ void AudioInitTask(void* /*arg*/) {
 
 void KickAudioInitIfNeeded() {
     if (s_audio_ready.load() &&
-        Application::GetInstance().GetAudioService().IsStarted()) {
+        Application::GetInstance().GetAudioService().IsStarted() && MetalioAudio_ModeReady()) {
         return;
     }
     if (s_audio_init_task != nullptr) {
@@ -505,4 +515,7 @@ void SettingsTestAudio_Teardown() {
     s_record_lbl = nullptr;
     s_confirm_mask = nullptr;
     s_audio_ready.store(false);
+    Application::GetInstance().Schedule([] {
+        if (!s_alive.load()) Application::GetInstance().ReleaseAudioService(Application::AudioClient::FactoryTest);
+    });
 }

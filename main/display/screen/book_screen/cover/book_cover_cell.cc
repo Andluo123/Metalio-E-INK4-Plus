@@ -1,3 +1,4 @@
+#include "epd_content_policy.h"
 #include "book_screen/cover/book_cover_cell.h"
 #include "book_screen/book_screen_priv.h"
 #include "book_screen/shelf/book_bookshelf.h"
@@ -41,6 +42,7 @@ lv_obj_t* CreateCoverSlot(lv_obj_t* parent, const reader::BookInfo& info, lv_coo
         cover_out->BindDsc();
         lv_obj_t* img = lv_image_create(host);
         lv_image_set_src(img, &cover_out->dsc);
+        EpdSetContentRole(img,EpdContentRole::Cover);
         lv_obj_center(img);
         lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
     } else {
@@ -109,27 +111,6 @@ lv_obj_t* CreateBookCoverCell(lv_obj_t* parent, const reader::BookInfo& info, in
         }
     }
 
-    if (long_press_delete && st.shelf.shelf_multi) {
-        lv_obj_t* check = lv_obj_create(host);
-        lv_obj_remove_style_all(check);
-        lv_obj_set_size(check, kShelfCheckSize, kShelfCheckSize);
-        lv_obj_set_style_bg_color(check, lv_color_white(), 0);
-        lv_obj_set_style_bg_opa(check, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_color(check, lv_color_black(), 0);
-        lv_obj_set_style_border_width(check, kRowBorderW, 0);
-        lv_obj_set_style_radius(check, 4, 0);
-        lv_obj_align(check, LV_ALIGN_TOP_RIGHT, -4, 4);
-        Book_DisableScroll(check);
-        lv_obj_clear_flag(check, LV_OBJ_FLAG_CLICKABLE);
-        if (ShelfItemSelected(index)) {
-            lv_obj_t* mark = lv_label_create(check);
-            lv_label_set_text(mark, "√");
-            lv_obj_set_style_text_font(mark, Book_ItemFont(), 0);
-            lv_obj_set_style_text_color(mark, lv_color_black(), 0);
-            lv_obj_center(mark);
-            lv_obj_clear_flag(mark, LV_OBJ_FLAG_CLICKABLE);
-        }
-    }
 
     if (show_title) {
         const lv_font_t* item_font = Book_ItemFont();
@@ -143,6 +124,31 @@ lv_obj_t* CreateBookCoverCell(lv_obj_t* parent, const reader::BookInfo& info, in
         lv_label_set_text(title, clipped.c_str());
         lv_obj_clear_flag(title, LV_OBJ_FLAG_CLICKABLE);
     }
+    if (long_press_delete && st.shelf.shelf_multi) {
+        lv_obj_t* check = lv_obj_create(cell);
+        lv_obj_remove_style_all(check);
+        lv_obj_set_size(check, kShelfCoverCheckSize, kShelfCoverCheckSize);
+        lv_obj_set_style_bg_color(check, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(check, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(check, lv_color_black(), 0);
+        lv_obj_set_style_border_width(check, 2, 0);
+        lv_obj_set_style_radius(check, LV_RADIUS_CIRCLE, 0);
+        lv_obj_add_flag(check,LV_OBJ_FLAG_FLOATING);
+        lv_obj_add_flag(check,LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(check,LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_set_pos(check,cell_w-kShelfCoverCheckSize/2,0);
+        Book_DisableScroll(check);
+
+        if (ShelfItemSelected(index)) {
+            lv_obj_t* mark = lv_label_create(check);
+            lv_label_set_text(mark, "√");
+            lv_obj_set_style_text_font(mark, Book_ItemFont(), 0);
+            lv_obj_set_style_text_color(mark, lv_color_black(), 0);
+            lv_obj_center(mark);
+            lv_obj_clear_flag(mark, LV_OBJ_FLAG_CLICKABLE);
+        }
+    }
+
     return cell;
 }
 

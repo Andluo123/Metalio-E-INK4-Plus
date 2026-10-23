@@ -110,7 +110,7 @@ bool Ml307Udp::Connect(const std::string& host, int port) {
     // 等待连接完成
     bits = xEventGroupWaitBits(event_group_handle_, ML307_UDP_CONNECTED | ML307_UDP_ERROR, pdTRUE, pdFALSE, UDP_CONNECT_TIMEOUT_MS / portTICK_PERIOD_MS);
     if (bits & ML307_UDP_ERROR) {
-        ESP_LOGE(TAG, "Failed to connect to %s:%d", host.c_str(), port);
+
         return false;
     }
     return true;

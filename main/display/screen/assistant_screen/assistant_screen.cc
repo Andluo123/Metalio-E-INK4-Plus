@@ -12,6 +12,7 @@
 #include "a2ui.h"
 #include "a2ui_image.h"
 #include "application.h"
+#include "firmware_memory.h"
 #include "assistant_boot_photo.h"
 #include "board.h"
 #include "boot_key_handler.h"
@@ -26,7 +27,7 @@
 #include <cstring>
 
 #include <esp_log.h>
-#include <esp_lv_adapter.h>
+#include "lv_adapter_epdiy.h"
 #include <esp_timer.h>
 
 AssistantUiState& Assistant_State() {
@@ -41,7 +42,7 @@ bool Assistant_OnVkKey(const char* key) {
 
     // vk_home：直接出栈（阅读进百问回阅读）；不翻页、不清栈回首页
     if (std::strcmp(key, "vk_home") == 0) {
-        ESP_LOGI(TAG, "vk_home -> navigate back");
+        ESP_LOGD(TAG, "vk_home -> navigate back");
         // 先停收消息/合并绘制/连翻，避免卸页过程中再 Render 踩已毁控件
         Assistant_State().active.store(false, std::memory_order_release);
         if (Assistant_State().stream.coalesce_timer != nullptr) {
@@ -59,7 +60,7 @@ bool Assistant_OnVkKey(const char* key) {
         if (Assistant_TurnPage(-1)) {
             return true;
         }
-        ESP_LOGI(TAG, "vk_prev on first page -> navigate back");
+        ESP_LOGD(TAG, "vk_prev on first page -> navigate back");
         return false; // 默认策略 ScreenNavigateBack
     }
 
@@ -90,13 +91,13 @@ void Assistant_OnAssistantLifecycle(lv_event_t* e) {
             a2ui_set_host(Assistant_State().chrome.content);
         }
         if (hold_through) {
-            ESP_LOGI(TAG, "enter hold-through -> schedule voice + listen (skip standby)");
+            ESP_LOGD(TAG, "enter hold-through -> schedule voice + listen (skip standby)");
             app.Schedule([]() {
                 TaskScreen::RequestCacheRefresh();
                 Application::GetInstance().StartXiaozhiVoice(true);
             });
         } else {
-            ESP_LOGI(TAG, "enter -> schedule voice session prepare (PTT, no auto listen)");
+            ESP_LOGD(TAG, "enter -> schedule voice session prepare (PTT, no auto listen)");
             app.Schedule([]() {
                 TaskScreen::RequestCacheRefresh();
                 Application::GetInstance().StartXiaozhiVoice(false);
@@ -104,7 +105,7 @@ void Assistant_OnAssistantLifecycle(lv_event_t* e) {
         }
         Assistant_ApplyPttWave(Assistant_IsPttWaveWanted());
     } else if (code == LV_EVENT_SCREEN_UNLOADED) {
-        ESP_LOGI(TAG, "leave -> schedule voice session stop (keep session RAM)");
+        ESP_LOGD(TAG, "leave -> schedule voice session stop (keep session RAM)");
         Assistant_State().active.store(false, std::memory_order_release);
         if (Assistant_State().stream.coalesce_timer != nullptr) {
             esp_timer_stop(Assistant_State().stream.coalesce_timer);
@@ -125,8 +126,7 @@ void Assistant_OnAssistantLifecycle(lv_event_t* e) {
         Assistant_State().chrome.scr = nullptr;
         Assistant_State().chrome.content = nullptr;
         Assistant_State().chrome.page_label = nullptr;
-        Assistant_State().chrome.hint_img = nullptr;
-        Assistant_State().chrome.hint_raster = nullptr;  // 像素由 hint_img DELETE 回调释放
+        Assistant_State().chrome.idle_hint = nullptr;
         Assistant_State().chrome.status_label = nullptr;
         Assistant_State().chrome.notification_label = nullptr;
         Assistant_State().ptt.ptt_wave = nullptr;
@@ -151,7 +151,7 @@ void Assistant_OnAssistantLifecycle(lv_event_t* e) {
 
 void Assistant_OpenAssistantAsync(void* /*arg*/) {
     if (AssistantScreen::IsActive()) {
-        ESP_LOGI(TAG, "RequestOpen no-op: already active");
+        ESP_LOGD(TAG, "RequestOpen no-op: already active");
         return;
     }
     HapticPulseIfEnabled();
@@ -161,7 +161,7 @@ void Assistant_OpenAssistantAsync(void* /*arg*/) {
 
 bool Assistant_OnBootPressDown() {
     // 开听只走 LongPress / hold-through；按下不听，避免短按先闪「聆听中」
-    ESP_LOGI(TAG, "boot press-down ignored for listen (click/long own the semantics)");
+    ESP_LOGD(TAG, "boot press-down ignored for listen (click/long own the semantics)");
     return true;
 }
 
@@ -182,7 +182,7 @@ bool Assistant_OnBootLongPress() {
 bool Assistant_OnBootClick() {
     // 仅短按打断 → 待命；进待机改走电源键。长按回合已在 BootKey 层屏蔽。
     if (BootKey_DidLongPress()) {
-        ESP_LOGI(TAG, "boot short ignored: long-press already armed listen");
+        ESP_LOGD(TAG, "boot short ignored: long-press already armed listen");
         return true;
     }
     ESP_LOGI(TAG, "boot short -> AbortSpeakingToIdle (no listen)");
@@ -233,21 +233,22 @@ void AssistantScreen::SyncPttOverlay() {
 }
 
 void AssistantScreen::RequestOpen() {
-    if (!esp_lv_adapter_is_initialized()) {
+    auto* adapter = LvAdapterEpdiy::Instance();
+    if (adapter == nullptr || !adapter->IsReady()) {
         return;
     }
-    if (esp_lv_adapter_lock(-1) != ESP_OK) {
+    if (!adapter->LockUi(-1)) {
         ESP_LOGW(TAG, "RequestOpen: adapter lock failed");
         return;
     }
     if (lv_async_call(Assistant_OpenAssistantAsync, nullptr) != LV_RESULT_OK) {
         ESP_LOGW(TAG, "RequestOpen: lv_async_call failed");
     }
-    esp_lv_adapter_unlock();
+    adapter->UnlockUi();
 }
 
 void AssistantScreen::SetEmotion(const char* emotion) {
-    if (Assistant_State().chrome.hint_img == nullptr || !lv_obj_is_valid(Assistant_State().chrome.hint_img)) {
+    if (Assistant_State().chrome.idle_hint == nullptr || !lv_obj_is_valid(Assistant_State().chrome.idle_hint)) {
         return;
     }
     if (Assistant_State().layout.has_a2ui_content || !Assistant_State().layout.flow.empty()) {
@@ -259,6 +260,7 @@ void AssistantScreen::SetEmotion(const char* emotion) {
 }
 
 lv_obj_t* AssistantScreen::Create() {
+    ESP_LOGI(TAG, "launch AssistantScreen");
     const lv_font_t* ui_font = Assistant_UiFont();
     Assistant_UiFontBold();
 
@@ -267,9 +269,8 @@ lv_obj_t* AssistantScreen::Create() {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, ui_font, 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    Assistant_DisableScroll(scr);
 
-    // 顶栏与其它 App 共用 ScreenCreateStatusBar（UI 默认字），勿另绑会话字
+    // 顶栏与其它 App 共用 ScreenCreateStatusBar（25@2），勿用会话 30px 字
     EpdStatusBar status = ScreenCreateStatusBar(scr);
     const lv_coord_t header_h = status.height;
     const lv_coord_t body_h = LV_VER_RES - header_h - kFooterH;
@@ -314,22 +315,13 @@ lv_obj_t* AssistantScreen::Create() {
     Assistant_DisableScroll(footer);
     lv_obj_add_flag(footer, LV_OBJ_FLAG_HIDDEN);
 
-    // 无会话全屏提示图：盖住内容区；顶栏透明，需再抬到图之上
-    lv_obj_t* hint_img = lv_image_create(scr);
-    lv_obj_add_flag(hint_img, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(hint_img, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(
-        hint_img,
-        [](lv_event_t* ev) {
-            auto* p = static_cast<reader::RasterImage*>(
-                lv_obj_get_user_data(static_cast<lv_obj_t*>(lv_event_get_target(ev))));
-            delete p;
-            if (Assistant_State().chrome.hint_raster == p) {
-                Assistant_State().chrome.hint_raster = nullptr;
-            }
-        },
-        LV_EVENT_DELETE, nullptr);
-    Assistant_LoadIdleHintImage(hint_img);
+    // 空会话页由 LVGL 控件绘制，状态栏保持在最上层。
+    lv_obj_t* idle_hint = lv_obj_create(scr);
+    lv_obj_remove_style_all(idle_hint);
+    lv_obj_set_size(idle_hint, LV_HOR_RES, LV_VER_RES);
+    lv_obj_add_flag(idle_hint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(idle_hint, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    Assistant_BuildIdleHint(idle_hint);
     lv_obj_move_foreground(status.bar);
     lv_obj_move_foreground(status.overlay);
 
@@ -348,7 +340,7 @@ lv_obj_t* AssistantScreen::Create() {
     Assistant_State().chrome.scr = scr;
     Assistant_State().chrome.content = content;
     Assistant_State().chrome.page_label = footer;
-    Assistant_State().chrome.hint_img = hint_img;
+    Assistant_State().chrome.idle_hint = idle_hint;
     Assistant_State().chrome.status_label = status.status_label;
     Assistant_State().chrome.notification_label = status.notification_label;
     Assistant_State().ptt.ptt_wave = ptt_wave;
@@ -356,6 +348,7 @@ lv_obj_t* AssistantScreen::Create() {
     Assistant_State().ptt.ptt_wave_visible = false;
     Assistant_ResetTouchPttState();
     ScreenPaintCoalesceReset(&Assistant_State().stream.page_paint);
+    Assistant_State().stream.rendered_page_json.clear();
     const bool restore_session = !Assistant_State().layout.flow.empty();
     if (!restore_session) {
         Assistant_State().layout.pages.clear();
@@ -370,7 +363,7 @@ lv_obj_t* AssistantScreen::Create() {
     Assistant_EnsureA2ui(scr);
     a2ui_set_host(content);
     if (restore_session) {
-        ESP_LOGI(TAG, "restore session flow=%u pages=%u idx=%d",
+        ESP_LOGD(TAG, "restore session flow=%u pages=%u idx=%d",
                  static_cast<unsigned>(Assistant_State().layout.flow.size()), static_cast<unsigned>(Assistant_State().layout.pages.size()),
                  Assistant_State().layout.page_index);
         Assistant_RebuildPages();
@@ -418,5 +411,6 @@ lv_obj_t* AssistantScreen::Create() {
     }
     lv_obj_add_event_cb(scr, Assistant_OnAssistantLifecycle, LV_EVENT_SCREEN_LOADED, nullptr);
     lv_obj_add_event_cb(scr, Assistant_OnAssistantLifecycle, LV_EVENT_SCREEN_UNLOADED, nullptr);
+    FirmwareMemoryCheckpoint("assistant-screen-ready");
     return scr;
 }

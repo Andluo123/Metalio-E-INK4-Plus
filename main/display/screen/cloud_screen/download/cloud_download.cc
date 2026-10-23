@@ -1,6 +1,9 @@
 #include "cloud_screen/download/cloud_download.h"
 #include "cloud_screen/cloud_screen_priv.h"
 #include "cloud_screen/cloud_list.h"
+#include "cloud_screen/cloud_dialogs.h"
+#include <cerrno>
+#include <sys/stat.h>
 #include "cloud_screen/cloud_ui_helpers.h"
 #include "cloud_screen/preview/cloud_wallpaper_preview.h"
 #include "cloud_screen/push/push_resources_library.h"
@@ -71,9 +74,11 @@ bool EnqueueDlWork(CloudDownloadWork* work) {
 
 void AbortDownloadJobFromUi() {
     auto& st = Cloud_State();
-    if (!st.xfer.dl_page_open && !st.xfer.download_busy && !st.data.batch_busy) {
+    if (!st.xfer.dl_page_open && !st.xfer.download_busy && !st.data.batch_busy &&
+        st.xfer.pending_index < 0) {
         return;
     }
+    CloseDialog();
     st.xfer.dl_user_abort = true;
     st.data.batch_save_ids.clear();
     if (st.xfer.download_busy && !st.xfer.dl_cancel_pending && !st.xfer.download_key.empty()) {
@@ -108,7 +113,8 @@ void ShowRowDownloadProgress(int percent) {
 
 bool CloudDlTasksActive() {
     const auto& st = Cloud_State();
-    return st.xfer.download_busy || st.data.batch_busy || st.data.delete_busy;
+    return st.xfer.download_busy || st.data.batch_busy || st.data.delete_busy ||
+           st.xfer.pending_index >= 0;
 }
 
 void ShowPreviewWaitDlTip() {
@@ -184,65 +190,125 @@ void OnDownloadProgress(int percent, void* /*user*/) {
 }
 
 void CloudDownloadWorker(void* /*arg*/) {
-    // PowerNeedHold 须在 vTaskDelete 前析构（任务自杀不跑栈析构）
-    {
-        PowerNeedHold hold_net(PowerNeed::OtaDownload);
-        for (;;) {
-            CloudDownloadWork* work = nullptr;
-            if (xQueueReceive(s_dl_q, &work, portMAX_DELAY) != pdTRUE) {
-                continue;
-            }
-            if (work == nullptr) {
-                break;
-            }
+    // Each queued work owns its power need until delete; an idle worker holds none.
+    for (;;) {
+        CloudDownloadWork* work = nullptr;
+        if (xQueueReceive(s_dl_q, &work, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (work == nullptr) {
+            break;
+        }
 
-            auto* msg = new CloudDownloadDoneMsg{};
-            msg->op_gen = work->op_gen;
-            msg->type = work->item.type;
-            std::string err;
-            std::snprintf(msg->key, sizeof(msg->key), "%s", work->item.task_id.c_str());
-            msg->ok = reader::DownloadPushResource(work->item, err, OnDownloadProgress, nullptr,
-                                                   &s_dl_gate,
-                                                   work->cover_bytes.empty()
-                                                       ? nullptr
-                                                       : work->cover_bytes.data(),
-                                                   work->cover_bytes.size());
-            msg->cancelled = s_dl_gate.IsCancelled() || err == Lang::Strings::CLOUD_CANCELLED;
-            if (msg->cancelled) {
-                ESP_LOGI(TAG, "download stopped key=%s", msg->key);
+        auto* msg = new CloudDownloadDoneMsg{};
+        msg->op_gen = work->op_gen;
+        msg->type = work->item.type;
+        std::string err;
+        std::snprintf(msg->key, sizeof(msg->key), "%s", work->item.task_id.c_str());
+        msg->ok = reader::DownloadPushResource(work->item, err, OnDownloadProgress, nullptr,
+                                               &s_dl_gate,
+                                               work->cover_bytes.empty()
+                                                   ? nullptr
+                                                   : work->cover_bytes.data(),
+                                               work->cover_bytes.size(), work->save_path.c_str(),
+                                               work->overwrite);
+        msg->cancelled = s_dl_gate.IsCancelled() || err == Lang::Strings::CLOUD_CANCELLED;
+        if (msg->cancelled) {
+            ESP_LOGI(TAG, "download stopped key=%s", msg->key);
+        }
+        if (msg->ok) {
+            std::string ack_err;
+            msg->acked = reader::AckPushResourceDownloaded(work->item, ack_err);
+            if (!msg->acked) {
+                ESP_LOGW(TAG, "ack push resource failed taskId=%s err=%s",
+                         work->item.task_id.c_str(), ack_err.c_str());
             }
-            if (msg->ok) {
-                std::string ack_err;
-                msg->acked = reader::AckPushResourceDownloaded(work->item, ack_err);
-                if (!msg->acked) {
-                    ESP_LOGW(TAG, "ack push resource failed taskId=%s err=%s",
-                             work->item.task_id.c_str(), ack_err.c_str());
-                }
-            } else if (!msg->cancelled) {
-                std::snprintf(msg->error, sizeof(msg->error), "%s",
-                              err.empty() ? Lang::Strings::CLOUD_DOWNLOAD_FAIL : err.c_str());
-            }
-            delete work;
+        } else if (!msg->cancelled) {
+            std::snprintf(msg->error, sizeof(msg->error), "%s",
+                          err.empty() ? Lang::Strings::CLOUD_DOWNLOAD_FAIL : err.c_str());
+        }
+        delete work;
 
-            if (!ScreenLvAsync(AsyncDownloadDone, msg)) {
-                delete msg;
-            }
+        if (!ScreenLvAsync(AsyncDownloadDone, msg)) {
+            delete msg;
         }
     }
     s_dl_task = nullptr;
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
-void StartResourceDownload(int index) {
+void StartResourceDownload(int index, CloudSaveChoice choice) {
     auto& st = Cloud_State();
-    if (st.xfer.download_busy || SyncBusy()) {
+    if (!ScreenAlive() || st.xfer.download_busy || st.xfer.pending_index >= 0 || SyncBusy()) {
         return;
     }
     if (index < 0 || index >= static_cast<int>(st.data.items.size())) {
         return;
     }
 
+    if (s_dl_task != nullptr && s_dl_gate.IsCancelled()) {
+        st.data.batch_save_ids.clear();
+        st.data.batch_busy = false;
+        HideDlProgressPage();
+        SetStatusTip(Lang::Strings::CLOUD_CANCELLING, true);
+        StopDlWorker();
+        return;
+    }
+    if (choice == CloudSaveChoice::kSkip) {
+        if (st.data.batch_busy) {
+            if (!st.data.batch_save_ids.empty()) {
+                st.data.batch_save_ids.erase(st.data.batch_save_ids.begin());
+            }
+            if (st.xfer.dl_page_open && st.xfer.dl_job_total > 0) {
+                --st.xfer.dl_job_total;
+            }
+            ScheduleBatchContinueSoon("skip");
+        } else {
+            ResumeCloudSideHttpAfterDl();
+        }
+        return;
+    }
+    std::string save_path = st.data.items[static_cast<size_t>(index)].LocalPath();
+    struct stat info {};
+    const int found = stat(save_path.c_str(), &info);
+    if (found == 0 && choice == CloudSaveChoice::kAsk) {
+        ShowSaveConflictDialog(index);
+        return;
+    }
+    if (choice == CloudSaveChoice::kKeepBoth && found == 0) {
+        const size_t slash = save_path.find_last_of('/');
+        const size_t dot = save_path.find_last_of('.');
+        const size_t split = dot != std::string::npos && dot > slash + 1 ? dot : save_path.size();
+        const std::string stem = save_path.substr(0, split);
+        const std::string ext = save_path.substr(split);
+        const std::string original = save_path;
+        for (unsigned n = 1; n <= 9999; ++n) {
+            save_path = stem + "-" + std::to_string(n) + ext;
+            if (stat(save_path.c_str(), &info) != 0) {
+                if (errno != ENOENT) save_path.clear();
+                break;
+            }
+            if (n == 9999) save_path.clear();
+        }
+        // FAT 长文件名上限；保留完整 UTF-8 名称，超长时报告失败。
+        if (save_path.size() - slash - 1 > 255 || save_path == original) save_path.clear();
+    } else if ((found != 0 && errno != ENOENT) ||
+               (found == 0 && choice == CloudSaveChoice::kReplace && !S_ISREG(info.st_mode))) {
+        save_path.clear();
+    }
+    if (save_path.empty()) {
+        st.data.batch_busy = false;
+        st.data.batch_save_ids.clear();
+        HideDlProgressPage();
+        SetStatusTip(Lang::Strings::CLOUD_SAVE_FAIL, true);
+        ResumeCloudSideHttpAfterDl();
+        StopDlWorker();
+        return;
+    }
+
     auto* work = new CloudDownloadWork{};
+    work->save_path = std::move(save_path);
+    work->overwrite = choice == CloudSaveChoice::kReplace;
     work->op_gen = st.xfer.op_generation;
     work->item = st.data.items[static_cast<size_t>(index)];
     if (index < static_cast<int>(st.data.cover_bytes.size()) &&

@@ -14,12 +14,11 @@ extern const uint8_t firmware_end[] asm("_binary_ft6336u_v03_app_bin_end");
 namespace {
 struct Transport {
     bool Write(const uint8_t* bytes, size_t size) {
-        return i2c_master_write_to_device(I2C_NUM_1, TOUCH_I2C_ADDR, bytes, size,
-                                         pdMS_TO_TICKS(500)) == ESP_OK;
+        return metalio_i2c1_transmit_locked(I2C_NUM_1, TOUCH_I2C_ADDR, bytes, size, 500) == ESP_OK;
     }
     bool Read(const uint8_t* command, size_t command_size, uint8_t* output, size_t size) {
-        return i2c_master_write_read_device(I2C_NUM_1, TOUCH_I2C_ADDR, command, command_size,
-                                           output, size, pdMS_TO_TICKS(500)) == ESP_OK;
+        return metalio_i2c1_transmit_receive_locked(I2C_NUM_1, TOUCH_I2C_ADDR, command, command_size,
+                                                    output, size, 500) == ESP_OK;
     }
     void Delay(int ms) { vTaskDelay(std::max<TickType_t>(1, pdMS_TO_TICKS(ms))); }
 };

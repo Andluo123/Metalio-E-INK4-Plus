@@ -280,7 +280,6 @@ lv_obj_t* SettingsTestTouchScreen::Create() {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(scr, fontpack_lv_font_ui(), 0);
     lv_obj_set_style_text_color(scr, lv_color_black(), 0);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     s_target_scale = 1;
 

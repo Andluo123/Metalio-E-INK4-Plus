@@ -1,23 +1,61 @@
 #include "settings_about_tab.h"
 
+#include "application.h"
 #include "assets/lang_config.h"
+#include "assets/lang_screen.h"
+#include "board.h"
+#include "display.h"
 #include "fontpack_lvgl.h"
+#include "haptic_feedback.h"
+#include "ota.h"
+#include "ota_confirm_dialog/ota_confirm_dialog.h"
 #include "settings_common.h"
+#include "lv_adapter_epdiy.h"
+#include "power_policy.h"
 
+#include <atomic>
 #include <cstdio>
-#include <cstring>
+#include <new>
+#include <memory>
+#include <string>
 
 #include <esp_app_desc.h>
 #include <esp_chip_info.h>
+#include <esp_log.h>
 #include <esp_flash.h>
 #include <esp_mac.h>
 #include <esp_psram.h>
-#include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <lvgl.h>
 
+namespace {
+
+constexpr const char* TAG = "SettingsAbout";
+
+std::atomic<bool> s_tab_alive{false};
+std::atomic<uint32_t> s_check_gen{0};
+std::atomic<bool> s_check_busy{false};
+bool s_about_prompt = false; // LVGL task / lock only.
 
 struct SettingsAboutInfoItem {
     const char* label;
     char value[96];
+    bool firmware_row = false;
+};
+
+enum class CheckResultKind : uint8_t {
+    Failed = 0,
+    Latest = 1,
+    NewVersion = 2,
+};
+
+struct CheckResultMsg {
+    uint32_t gen = 0;
+    CheckResultKind kind = CheckResultKind::Failed;
+    char current[48] = {};
+    char next[48] = {};
+    char url[256] = {};
 };
 
 static void FormatBytes(char* out, size_t out_len, uint64_t bytes) {
@@ -32,7 +70,7 @@ static void FormatBytes(char* out, size_t out_len, uint64_t bytes) {
     }
 }
 
-static void CollectInfoItems(SettingsAboutInfoItem* items, int* count) {
+void CollectInfoItems(SettingsAboutInfoItem* items, int* count) {
     const auto* app_desc = esp_app_get_description();
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
@@ -53,6 +91,7 @@ static void CollectInfoItems(SettingsAboutInfoItem* items, int* count) {
     ++idx;
 
     items[idx].label = Lang::Strings::SETTINGS_ABOUT_FW;
+    items[idx].firmware_row = true;
     std::snprintf(items[idx].value, sizeof(items[idx].value), Lang::Strings::SETTINGS_ABOUT_FW_VER_FMT,
                   app_desc->version);
     ++idx;
@@ -94,11 +133,143 @@ static void CollectInfoItems(SettingsAboutInfoItem* items, int* count) {
     *count = idx;
 }
 
-static lv_obj_t* CreateInfoRow(lv_obj_t* parent, const SettingsAboutInfoItem& item, bool with_divider) {
+void SetStatusTip(const char* text) {
+    auto* display = Board::GetInstance().GetDisplay();
+    if (display != nullptr && text != nullptr) {
+        display->SetStatus(text);
+    }
+}
+
+void AsyncApplyCheckResult(void* p) {
+    std::unique_ptr<CheckResultMsg> msg(static_cast<CheckResultMsg*>(p));
+    if (msg == nullptr) {
+        return;
+    }
+    const uint32_t gen = msg->gen;
+    const bool alive = s_tab_alive.load(std::memory_order_acquire);
+    const bool current = (gen == s_check_gen.load(std::memory_order_acquire));
+
+    if (!alive || !current) {
+        s_check_busy.store(false, std::memory_order_release);
+        return;
+    }
+
+    if (msg->kind != CheckResultKind::NewVersion) {
+        SetStatusTip(msg->kind == CheckResultKind::Failed ? Lang::Strings::OTA_CHECK_FAILED
+                                                       : Lang::Strings::OTA_ALREADY_LATEST);
+        s_check_busy.store(false, std::memory_order_release);
+        return;
+    }
+
+    // NewVersion：弹出两按钮确认；升级在主循环执行
+    const std::string url = msg->url;
+    const std::string cur = msg->current;
+    const std::string next = msg->next;
+
+    const bool shown = OtaConfirmDialog::ShowAsync(
+        cur.c_str(), next.c_str(), OtaConfirmDialog::Mode::About,
+        [url, cur, next, gen](OtaConfirmDialog::Choice choice) {
+            s_about_prompt = false;
+            s_check_busy.store(false, std::memory_order_release);
+            if (choice != OtaConfirmDialog::Choice::Upgrade) {
+                return;
+            }
+            if (!s_tab_alive.load(std::memory_order_acquire) ||
+                gen != s_check_gen.load(std::memory_order_acquire)) {
+                return;
+            }
+            Application::GetInstance().Schedule([url, cur, next]() {
+                Application::GetInstance().UpgradeFirmwareUrl(url, cur, next);
+            });
+        });
+
+    s_about_prompt = shown;
+    if (!shown) {
+        SetStatusTip(Lang::Strings::OTA_CHECK_FAILED);
+        s_check_busy.store(false, std::memory_order_release);
+    }
+}
+
+void CheckFirmwareWorker(void* arg) {
+    PowerPolicy::GetInstance().Acquire(PowerNeed::OtaDownload);
+    auto* msg = static_cast<CheckResultMsg*>(arg);
+
+    auto& board = Board::GetInstance();
+    if (!board.EnsureNetworkReady()) {
+        ESP_LOGW(TAG, "network not ready");
+    } else {
+        Ota ota;
+        const esp_err_t err = ota.CheckVersion();
+        if (err == ESP_OK) {
+            std::snprintf(msg->current, sizeof(msg->current), "%s", ota.GetCurrentVersion().c_str());
+            if (ota.HasNewVersion()) {
+                msg->kind = CheckResultKind::NewVersion;
+                std::snprintf(msg->next, sizeof(msg->next), "%s", ota.GetFirmwareVersion().c_str());
+                std::snprintf(msg->url, sizeof(msg->url), "%s", ota.GetFirmwareUrl().c_str());
+            } else {
+                msg->kind = CheckResultKind::Latest;
+            }
+        } else {
+            ESP_LOGW(TAG, "CheckVersion failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    PowerPolicy::GetInstance().Release(PowerNeed::OtaDownload);
+    bool posted = false;
+    auto* adapter = LvAdapterEpdiy::Instance();
+    if (adapter != nullptr && adapter->IsReady() && adapter->LockUi(-1)) {
+        posted = (lv_async_call(AsyncApplyCheckResult, msg) == LV_RESULT_OK);
+        adapter->UnlockUi();
+    }
+    if (!posted) {
+        s_check_busy.store(false, std::memory_order_release);
+        delete msg;
+    }
+    vTaskDelete(nullptr);
+}
+
+void OnFirmwareRowClicked(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    if (!s_tab_alive.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (s_check_busy.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (OtaConfirmDialog::IsActive()) {
+        s_check_busy.store(false, std::memory_order_release);
+        return;
+    }
+
+    auto* msg = new (std::nothrow) CheckResultMsg{};
+    if (msg == nullptr) {
+        s_check_busy.store(false);
+        SetStatusTip(Lang::Strings::OTA_CHECK_FAILED);
+        return;
+    }
+    msg->gen = s_check_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+    SetStatusTip(Lang::Strings::CHECKING_NEW_VERSION);
+
+    const BaseType_t ok =
+        xTaskCreate(CheckFirmwareWorker, "about_ota", 12288, msg, 5, nullptr);
+    if (ok != pdPASS) {
+        delete msg;
+        ESP_LOGE(TAG, "create check task failed");
+        SetStatusTip(Lang::Strings::OTA_CHECK_FAILED);
+        s_check_busy.store(false, std::memory_order_release);
+    }
+}
+
+lv_obj_t* CreateInfoRow(lv_obj_t* parent, const SettingsAboutInfoItem& item, bool with_divider) {
     lv_obj_t* row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);
     lv_obj_set_width(row, lv_pct(100));
-    lv_obj_set_height(row, kSettingsInfoRowH);
+    lv_obj_set_height(row, item.firmware_row ? LV_SIZE_CONTENT : kSettingsInfoRowH);
+    if (item.firmware_row) {
+        lv_obj_set_style_min_height(row, kSettingsInfoRowH, 0);
+    }
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     if (with_divider) {
@@ -113,12 +284,19 @@ static lv_obj_t* CreateInfoRow(lv_obj_t* parent, const SettingsAboutInfoItem& it
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(row, 2, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+    if (item.firmware_row) {
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        HapticAttachClick(row);
+        lv_obj_add_event_cb(row, OnFirmwareRowClicked, LV_EVENT_CLICKED, nullptr);
+    } else {
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    }
 
     lv_obj_t* title = lv_label_create(row);
     lv_label_set_text(title, item.label);
     lv_obj_set_width(title, lv_pct(100));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    lv_label_set_long_mode(title, item.firmware_row ? LV_LABEL_LONG_WRAP : LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(title, fontpack_lv_font_ui(), 0);
     lv_obj_set_style_text_color(title, lv_color_black(), 0);
     lv_obj_clear_flag(title, LV_OBJ_FLAG_CLICKABLE);
@@ -126,7 +304,7 @@ static lv_obj_t* CreateInfoRow(lv_obj_t* parent, const SettingsAboutInfoItem& it
     lv_obj_t* subtitle = lv_label_create(row);
     lv_label_set_text(subtitle, item.value);
     lv_obj_set_width(subtitle, lv_pct(100));
-    lv_label_set_long_mode(subtitle, LV_LABEL_LONG_DOT);
+    lv_label_set_long_mode(subtitle, item.firmware_row ? LV_LABEL_LONG_WRAP : LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(subtitle, fontpack_lv_font_ui(), 0);
     lv_obj_set_style_text_color(subtitle, lv_color_black(), 0);
     lv_obj_clear_flag(subtitle, LV_OBJ_FLAG_CLICKABLE);
@@ -134,14 +312,28 @@ static lv_obj_t* CreateInfoRow(lv_obj_t* parent, const SettingsAboutInfoItem& it
     return row;
 }
 
-void SettingsAboutTab_Reset() {}
+}  // namespace
+
+void SettingsAboutTab_Reset() {
+    s_tab_alive.store(false, std::memory_order_release);
+    s_check_gen.fetch_add(1, std::memory_order_acq_rel);
+    if (s_about_prompt) {
+        OtaConfirmDialog::Dismiss();
+        s_about_prompt = false;
+        s_check_busy.store(false);
+    }
+}
 
 void SettingsAboutTab_Build(lv_obj_t* page) {
+    s_check_gen.fetch_add(1);
+    s_tab_alive.store(true, std::memory_order_release);
+
     SettingsAboutInfoItem items[8];
     int count = 0;
     CollectInfoItems(items, &count);
 
     lv_obj_t* list = lv_obj_create(page);
+    lv_obj_add_event_cb(list, [](lv_event_t*) { SettingsAboutTab_Reset(); }, LV_EVENT_DELETE, nullptr);
     lv_obj_remove_style_all(list);
     lv_obj_set_width(list, lv_pct(100));
     lv_obj_set_height(list, LV_SIZE_CONTENT);

@@ -19,8 +19,6 @@ std::string TruncateFilenameKeepExt(const std::string& name, const lv_font_t* fo
 void Book_DisableScroll(lv_obj_t* obj);
 constexpr lv_coord_t kColRuleW = UiSx(3);      // 横屏分栏中缝粗竖线
 constexpr lv_coord_t kColRuleInset = UiSy(18); // 上下留缝，不把两栏完全隔开
-constexpr lv_coord_t kProgressBadgeH = UiSy(28); // 封面进度角标高
-constexpr lv_coord_t kProgressBadgeW = UiSx(56); // 封面进度角标宽
 /** @brief 横屏分栏中缝：粗竖线，上下留缝不把两栏完全隔开 */
 lv_obj_t* Book_AddColRule(lv_obj_t* row);
 /** @brief 按左右栏高度收中缝（须在两栏都建完后调用） */
@@ -37,6 +35,6 @@ void Book_ClampListPage();
  */
 int Book_CachedProgressX10OrZero(const char* book_abs_path);
 /**
- * @brief 封面白底黑字进度框（18 号数字 + 手绘 %）
+ * @brief 封面白底黑字进度框；文案与列表一致（如 12.3% / 100%）
  */
 lv_obj_t* Book_CreateProgressPctBadge(lv_obj_t* parent, int pct_x10);

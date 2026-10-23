@@ -15,6 +15,7 @@
 #include "reader/download_gate.h"
 #include "reader/reader_types.h"
 #include "screen_common.h"
+#include "power_policy.h"
 #include "ui_scale.h"
 
 constexpr const char* TAG = "CloudScreen";
@@ -42,7 +43,7 @@ constexpr size_t kPreviewMaxDownloadBytes = 2 * 1024 * 1024;
 constexpr uint32_t kCloudFetchStack = 8 * 1024;
 constexpr uint32_t kWallpaperPreviewStack = 10 * 1024;
 constexpr uint32_t kCoverThumbStack = 8 * 1024;
-constexpr uint32_t kCloudDownloadStack = 8 * 1024;  // 内 DRAM：写 SD 关 cache 时禁 PSRAM 栈
+constexpr uint32_t kCloudDownloadStack = 5 * 1024;  // 内 DRAM：写 SD 关 cache 时禁 PSRAM 栈
 constexpr uint32_t kCloudDeleteStack = 8 * 1024;
 constexpr int64_t kSyncThrottleUs = 3000000;  // 手动刷新最短间隔 3s
 constexpr lv_coord_t kSyncBtnH = UiSy(44);
@@ -64,7 +65,9 @@ constexpr lv_coord_t kHeaderH = UiSy(36);
 constexpr lv_coord_t kHeaderIcon = UiSx(32);
 constexpr lv_coord_t kHeaderGap = UiSx(8);
 constexpr lv_coord_t kStatusGap = UiSx(12);  // 标题与拉取提示间距（同每日清单）
-constexpr int kTabCount = 4;
+constexpr int kTabCount = 3;
+constexpr int kFilterTabCount = 4; // APP 推送框内：全部 / 壁纸 / 书籍 / 字体
+constexpr lv_coord_t kFilterH = UiSy(40);
 constexpr lv_coord_t kChipRadius = 999;  // 预览元信息胶囊
 constexpr lv_coord_t kChipH = UiSy(36);        // 略高于字高，避免贴边
 constexpr lv_coord_t kChipPadH = UiSx(16);     // 左右内边距，边框大于文字
@@ -81,25 +84,27 @@ constexpr lv_coord_t kFooterOutsideH = kFooterH;
 constexpr uint32_t kStatusClearMs = 1200;
 constexpr lv_coord_t kCheckSize = UiSx(28);  // 多选行尾勾选（同清单）
 constexpr lv_coord_t kCheckGap = UiSx(10);
-constexpr lv_coord_t kDialogCardMargin = UiSx(48);
-constexpr lv_coord_t kDialogLabelMargin = UiSx(80);
+constexpr lv_coord_t kDialogCardMargin = UiSx(80);
 constexpr lv_coord_t kDialogCardPad = UiSx(18);
 constexpr lv_coord_t kDialogCardPadSmall = UiSx(14);
 constexpr lv_coord_t kDialogRowGap = UiSy(14);
-constexpr lv_coord_t kDialogRowGapSmall = UiSy(12);
-constexpr lv_coord_t kDlBarW = UiSx(320);
+constexpr lv_coord_t kDialogRowGapSmall = UiSy(20);
 constexpr lv_coord_t kDlBarH = UiSy(28);
 constexpr lv_coord_t kDlBarRadius = UiSx(6);
 constexpr lv_coord_t kDlBarIndRadius = UiSx(4);
 constexpr lv_coord_t kCancelBtnW = UiSx(160);
 constexpr lv_coord_t kCancelBtnH = UiSy(44);
-constexpr lv_coord_t kActionDialogCardH = UiSy(220);
 constexpr lv_coord_t kActionBtnRowH = UiSy(48);
 constexpr lv_coord_t kActionBtnW = UiSx(120);
 constexpr lv_coord_t kActionBtnH = UiSy(44);
-constexpr lv_coord_t kActionDialogPadInset = UiSx(28); // pad_all 14×2
 constexpr int64_t kSuppressRowClickUs = 400000;  // 只挡长按行松手假点击，不挡其它行连点
 constexpr int64_t kDlProgUiIntervalUs = 3000 * 1000;  // 进度页约 3s 刷一次
+
+enum CloudXferMode : int {
+    kCloudModeApp = 0,  // 云端待收，框内再按类型筛选
+    kCloudModeAp = 1,   // 开放热点文件页
+    kCloudModeUsb = 2,  // 模拟 U 盘
+};
 
 struct UiState {
     struct Chrome {
@@ -111,10 +116,23 @@ struct UiState {
         lv_obj_t* sync_lbl = nullptr;
         lv_obj_t* multi_bar = nullptr;  // 取消 / 全选 / 删除 / 保存
         lv_obj_t* page_lbl = nullptr;  // 贴底，对齐壁纸页码
+        lv_obj_t* radio_status_lbl = nullptr; // 贴底：AP打开中 / WiFi连接中 / 失败原因
         lv_obj_t* tab_btns[kTabCount] = {};
         lv_obj_t* tab_lbls[kTabCount] = {};
+        lv_obj_t* filter_row = nullptr; // APP 推送框内类型筛选
+        lv_obj_t* filter_btns[kFilterTabCount] = {};
+        lv_obj_t* filter_lbls[kFilterTabCount] = {};
+        lv_obj_t* header_row = nullptr;
+        lv_obj_t* list_frame = nullptr;
         lv_obj_t* section_title = nullptr;
         lv_obj_t* status_lbl = nullptr;
+        lv_obj_t* ap_panel = nullptr;
+        lv_obj_t* ap_ssid_lbl = nullptr;
+        lv_obj_t* ap_url_lbl = nullptr;
+        lv_obj_t* ap_status_lbl = nullptr;
+        lv_obj_t* ap_qr_wifi = nullptr;
+        lv_obj_t* ap_qr_url = nullptr;
+        lv_obj_t* usb_panel = nullptr;
     } chrome;
 
     struct Preview {
@@ -140,7 +158,8 @@ struct UiState {
         std::vector<std::unique_ptr<reader::RasterImage>> thumbs;
         std::vector<std::vector<uint8_t>> cover_bytes;  // 与 items 等长：coverImageUrl 原始字节
         uint32_t thumb_epoch = 0;
-        int filter_tab = 0;  // 0全部 1壁纸 2书籍 3字体
+        int mode = kCloudModeAp;  // CloudXferMode
+        int filter_tab = 0;        // APP 推送：0全部 1壁纸 2书籍 3字体
         int page = 0;
         int page_size = 6;
         bool loading = false;
@@ -180,6 +199,7 @@ struct UiState {
     } xfer;
 
     struct Dialogs {
+        lv_obj_t* storage_error_mask = nullptr; // 内存卡故障重启弹窗
         lv_obj_t* dialog_mask = nullptr;
         lv_obj_t* action_mask = nullptr;
     } dialogs;
@@ -198,8 +218,12 @@ struct CloudFetchWork {
 };
 
 struct CloudDownloadWork {
+    // Covers queueing as well as HTTP/file work; delete releases on every exit.
+    PowerNeedHold power{PowerNeed::OtaDownload};
     uint32_t op_gen = 0;
     reader::CloudPushResource item;
+    std::string save_path; // 用户确认后的落盘路径
+    bool overwrite = false; // 用户明确授权覆盖
     std::vector<uint8_t> cover_bytes;  // 列表已缓存的 coverImageUrl，供旁路免再 HTTP
 };
 
@@ -316,3 +340,6 @@ bool Cloud_OnVkKeyLongPress(const char* key);
 bool Cloud_OnVkKeyPressUp(const char* key);
 /** @brief 云传输页删除事件 */
 void Cloud_OnScreenDeleted(lv_event_t* e);
+
+/** @brief 在应用线程停止传输并重启设备 */
+void Cloud_RebootAfterStorageError();

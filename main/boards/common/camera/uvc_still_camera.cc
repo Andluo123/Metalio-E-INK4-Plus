@@ -163,11 +163,8 @@ std::string UvcStillCamera::Explain(const std::string& question) {
     http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
     http->SetHeader("Transfer-Encoding", "chunked");
 
-    ESP_LOGI(TAG, "MCP vision POST url=%s jpeg=%u question=%s", explain_url_.c_str(),
-             (unsigned)jpeg_.len, question.c_str());
 
     if (!http->Open("POST", explain_url_)) {
-        ESP_LOGE(TAG, "Failed to connect to explain URL: %s", explain_url_.c_str());
         ReleaseJpeg();
         throw std::runtime_error("Failed to connect to explain URL");
     }

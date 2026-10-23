@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 #include <string_view>
 
 #include <freertos/FreeRTOS.h>
@@ -46,6 +47,9 @@
 #define AS_EVENT_WAKE_WORD_RUNNING          (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING    (1 << 2)
 #define AS_EVENT_PLAYBACK_NOT_EMPTY         (1 << 3)
+#define AS_EVENT_INPUT_EXITED               (1 << 4)
+#define AS_EVENT_OUTPUT_EXITED              (1 << 5)
+#define AS_EVENT_OPUS_EXITED                (1 << 6)
 
 struct AudioServiceCallbacks {
     std::function<void(void)> on_send_queue_available;
@@ -64,7 +68,7 @@ enum AudioTaskType {
 struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
-    uint32_t timestamp;
+    uint32_t timestamp = 0;
 };
 
 struct DebugStatistics {
@@ -117,6 +121,7 @@ private:
     // opus_codec: large stack in PSRAM (wake_word encode pattern); TCB in INTERNAL.
     static constexpr size_t kOpusCodecStackWords = 2048 * 13;
     AudioCodec* codec_ = nullptr;
+    bool codec_started_ = false;
     AudioServiceCallbacks callbacks_;
     std::unique_ptr<AudioProcessor> audio_processor_;
     std::unique_ptr<WakeWord> wake_word_;
@@ -150,7 +155,7 @@ private:
     bool wake_word_initialized_ = false;
     bool audio_processor_initialized_ = false;
     bool voice_detected_ = false;
-    bool service_stopped_ = true;
+    std::atomic<bool> service_stopped_{true};
     bool audio_input_need_warmup_ = false;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
@@ -158,6 +163,7 @@ private:
     std::chrono::steady_clock::time_point last_output_time_;
 
     void AudioInputTask();
+    void ParkStoppedTask(EventBits_t bit);
     void AudioOutputTask();
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);

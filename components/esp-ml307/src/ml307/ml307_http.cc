@@ -214,7 +214,7 @@ bool Ml307Http::Open(const std::string& method, const std::string& url) {
         return false;
     }
     request_chunked_ = method_supports_content && !content_.has_value();
-    ESP_LOGD(TAG, "HTTP connection created, ID: %d, protocol: %s, host: %s", http_id_, protocol_.c_str(), host_.c_str());
+
 
     if (protocol_ == "https") {
         command = "AT+MHTTPCFG=\"ssl\"," + std::to_string(http_id_) + ",1,0";

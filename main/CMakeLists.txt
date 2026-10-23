@@ -1,6 +1,8 @@
 # Metalio-E-Ink4-Plus：百问 AI + 首页/设置 + EPDiy
+set(AP_FILEMAN_GZ "${CMAKE_CURRENT_BINARY_DIR}/ap_fileman.html.gz")
 set(BOARD_DIR "boards/metalio-e-ink4-plus")
 
+# Storage sources include the runtime log writer.
 file(GLOB BOARD_COMMON_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/board/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/power/*.c"
@@ -26,8 +28,10 @@ file(GLOB BOARD_SRCS
 
 file(GLOB HOME_SCREEN_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/home_screen/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/home_screen/pixel/*.cc"
 )
 
+# Settings sources include manual log upload and its UI.
 file(GLOB SETTINGS_SCREEN_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/settings_screen/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/settings_screen/settings_test/*.cc"
@@ -55,6 +59,8 @@ file(GLOB BOOK_SCREEN_SRCS
 
 file(GLOB CLOUD_SCREEN_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/ap/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/ap/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/download/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/preview/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/push/*.cc"
@@ -72,6 +78,7 @@ file(GLOB STANDBY_SCREEN_SRCS
 
 file(GLOB READER_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/reader/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/reader/jpeg/*.cc"
 )
 
 file(GLOB A2UI_SRCS
@@ -87,6 +94,7 @@ file(GLOB OTA_UI_SRCS
 file(GLOB PROTOCOL_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/protocols/protocol.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/protocols/websocket_protocol.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/protocols/mqtt_protocol.cc"
 )
 
 set(AUDIO_PROCESSOR_SRCS "audio/processors/no_audio_processor.cc")
@@ -106,9 +114,6 @@ endif()
 # 本轮不编摄像头拍照路径（无 UVC）；用 stub
 list(FILTER ASSISTANT_SCREEN_SRCS EXCLUDE REGEX "assistant_boot_photo\\.cc$")
 
-set(ASSISTANT_HINT_EN_A2I1
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/embedded/ic_s_assistant_hint_en.a2i1")
-
 idf_component_register(
     SRCS
         "app_main.cc"
@@ -126,8 +131,10 @@ idf_component_register(
         "device_state_event.cc"
         "display/display.cc"
         "display/display_orient.cc"
-        "display/epd_gray_aa.cc"
+        "display/epd_reader_aa.cc"
+        "display/epd_content_policy.cc"
         "display/lv_adapter_epdiy.cc"
+        "display/epd_refresh.cc"
         "display/lv_adapter_epdiy_touch.cc"
         "display/epd_font24/epd_font24.c"
         "display/font/font_loader.c"
@@ -138,6 +145,7 @@ idf_component_register(
         "display/font/font_awesome_30_1.c"
         "display/lvgl_display/emoji_collection.cc"
         "display/lvgl_display/jpg/jpeg_to_image.c"
+        "boards/common/camera/dvp_camera.cc"
         "display/screen/screen_common.cc"
         "display/screen/screen_common_nav.cc"
         "display/screen/vk_key_handler.cc"
@@ -168,8 +176,10 @@ idf_component_register(
         "boards/common/sensor/sc7a20h.cc"
         "boards/metalio-e-ink4-plus/periph/metalio_accel.cc"
     EMBED_FILES
+        "assets/embedded/bg_shutdown_en.a2i1"
+        "assets/embedded/bg_shutdown_zh.a2i1"
+        "factory-test-assets/factory_test_audio.ogg"
         "boards/metalio-e-ink4-plus/display/firmware/ft6336u_v03_app.bin"
-        ${ASSISTANT_HINT_EN_A2I1}
     INCLUDE_DIRS
         "."
         "assets"
@@ -216,11 +226,15 @@ idf_component_register(
         "${BOARD_DIR}/periph"
     REQUIRES
         lvgl esp_partition fatfs nvs_flash esp_mmap_assets esp_lvgl_adapter
-        app_update spi_flash esp_psram esp_wifi esp_netif esp_http_client
-        mbedtls esp_timer efuse
+        app_update spi_flash esp_psram esp_wifi esp_netif esp_http_client esp_http_server
+        mbedtls esp_timer efuse espcoredump 78__uart-uhci espressif__iot_eth esp_driver_cam esp_driver_i2c
     PRIV_REQUIRES
         esp-wifi-connect esp-ml307 espressif__cjson 78__esp-opus-encoder 78__esp-opus
 )
+
+if(CONFIG_IDF_TARGET_ESP32S31)
+    include("${CMAKE_CURRENT_LIST_DIR}/boards/common/power_policy/s31_sleep/s31_sleep_sdk.cmake")
+endif()
 
 target_link_libraries(${COMPONENT_LIB} PUBLIC
     idf::driver
@@ -271,20 +285,52 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
     -fexceptions
 )
 
+# All application and library FatFS admissions participate in standby draining.
+foreach(_sd_fn f_open f_close f_opendir f_closedir f_stat f_mkdir f_unlink f_rename f_utime f_getfree)
+    target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=${_sd_fn}")
+endforeach()
+
+# UI objects never require DMA; keep even tiny labels/events out of DMA SRAM.
+target_link_options(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=lv_malloc_core" "-Wl,--wrap=lv_realloc_core")
+
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     BOARD_TYPE="metalio-e-ink4-plus"
     BOARD_NAME="metalio-e-ink4-plus"
     LV_LVGL_H_INCLUDE_SIMPLE
 )
 
-# LVGL I1 落墨补丁 #include "epd_i1_glyph_thin.h"：须让 LVGL 编译单元找到 main/display/
+# I1 is the default fast UI path; native L8 is used only for opted-in content.
+# Keep both blend kernels optimized, with the original binary fill/copy helpers.
 foreach(_lvgl_comp lvgl__lvgl lvgl)
     idf_component_get_property(_lvgl_lib ${_lvgl_comp} COMPONENT_LIB)
     if(_lvgl_lib)
-        target_include_directories(${_lvgl_lib} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/display")
+        idf_component_get_property(_lvgl_dir ${_lvgl_comp} COMPONENT_DIR)
+        set_property(SOURCE "${_lvgl_dir}/src/draw/sw/blend/lv_draw_sw_blend_to_l8.c"
+            TARGET_DIRECTORY ${_lvgl_lib} APPEND PROPERTY COMPILE_OPTIONS -O2)
+        set_property(SOURCE "${_lvgl_dir}/src/draw/sw/blend/lv_draw_sw_blend_to_i1.c"
+            TARGET_DIRECTORY ${_lvgl_lib} APPEND PROPERTY COMPILE_OPTIONS
+            -O2 -include "${CMAKE_CURRENT_SOURCE_DIR}/display/epd_i1_solid_fill.h")
         break()
     endif()
 endforeach()
+
+# Offline expansion avoids repeated PNG inflate and decoder allocations at runtime.
+# Immutable pixels stay in application Flash; no RAM image cache is introduced.
+file(GLOB _home_icon_pngs CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/xingzhi-assets/ic_app_home_*.png")
+file(GLOB _home_icon_overrides CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/embedded/ic_app_home_*.png")
+set(_pixel_icon_dir "${CMAKE_CURRENT_SOURCE_DIR}/assets/embedded/pixel")
+file(GLOB _pixel_icon_pngs CONFIGURE_DEPENDS "${_pixel_icon_dir}/ic_px_*.png")
+set(_home_icon_pixels "${CMAKE_CURRENT_BINARY_DIR}/home_icon_pixels.cc")
+add_custom_command(OUTPUT "${_home_icon_pixels}"
+    COMMAND ${PYTHON} "${CMAKE_CURRENT_SOURCE_DIR}/../tools/generate_home_icon_pixels.py"
+        --assets "${CMAKE_CURRENT_SOURCE_DIR}/xingzhi-assets" --output "${_home_icon_pixels}"
+        --override-dir "${CMAKE_CURRENT_SOURCE_DIR}/assets/embedded"
+        --pixel-dir "${_pixel_icon_dir}"
+    DEPENDS ${_home_icon_pngs} ${_home_icon_overrides} ${_pixel_icon_pngs} "${CMAKE_CURRENT_SOURCE_DIR}/../tools/generate_home_icon_pixels.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/xingzhi-assets" "${CMAKE_CURRENT_SOURCE_DIR}/assets/embedded" "${_pixel_icon_dir}"
+    VERBATIM)
+target_sources(${COMPONENT_LIB} PRIVATE "${_home_icon_pixels}" "${CMAKE_CURRENT_SOURCE_DIR}/display/home_icon_decoder.cc")
 
 spiffs_create_partition_assets(
     resources
@@ -294,4 +340,16 @@ spiffs_create_partition_assets(
     MMAP_SUPPORT_SJPG
     MMAP_SUPPORT_SPNG
     MMAP_SPLIT_HEIGHT 16
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/xingzhi-assets"
 )
+
+# 设备页面压缩并嵌入 Flash。
+add_custom_command(OUTPUT "${AP_FILEMAN_GZ}"
+    COMMAND "${PYTHON}" "${PROJECT_DIR}/scripts/pack_ap_fileman.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/ap/fileman.html"
+        "${AP_FILEMAN_GZ}"
+    DEPENDS "${PROJECT_DIR}/scripts/pack_ap_fileman.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/ap/fileman.html"
+        "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/ap/cloudzao-logo.png"
+    VERBATIM)
+target_add_binary_data(${COMPONENT_LIB} "${AP_FILEMAN_GZ}" BINARY)

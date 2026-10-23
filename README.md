@@ -60,7 +60,7 @@ Product data lives under SD `metalio/e-ink/`. Cloud APIs use **ink-screen** push
 ### 2.2 E-paper reading
 
 - **E-paper UI**: LVGL I1 / A2I1 via EPDiy; full and partial refresh; lists and reader **must not scroll** -- page with bezel keys or volume keys (TCA9555 **P1.0** + / **P1.1** -)
-- **Logical UI size**: 684x1216 with content insets (`DISPLAY_CONTENT_*` in `config.h`)
+- **Logical UI size**: 680x1212 with 2px insets on all sides; standby and shutdown use the full 684x1216 panel (`DISPLAY_CONTENT_*` in `config.h`).
 - **Library**: 3x3 cover grid -> detail -> body; `.ebook` / `.epub` / `.txt`
 - **Fonts**: UI fontpack on Flash `font_data`; reader `.ef` fonts on SD or via Transfer
 - **Toolchain**: `tools/ebook/` converts PDF/EPUB/MOBI/TXT to device `.ebook` (with Web preview)
@@ -330,6 +330,8 @@ Firmware is based on xiaozhi-esp32, customized for `metalio-e-ink4-plus`. CMake 
 | **MCP** | `mcp_server.cc` | On-device Model Context Protocol |
 | **Power** | `boards/common/power_policy/` | Power tiers, standby, shutdown |
 | **Common** | `boards/common/` | Wi-Fi, SD, gauge, USB MSC, BT codec |
+
+The display uses a 30-phase image waveform table while retaining the S31 / E0470A14-AF scan timing and TPS65185 power driver. Display quality must be validated on the target device.
 
 ### 9.2 State machine
 

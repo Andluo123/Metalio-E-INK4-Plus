@@ -44,6 +44,10 @@ extern "C" {
 #define SD_APP_ROOT "/sdcard/metalio/e-ink"
 #endif
 
+#define SD_PATH_LOGS SD_APP_ROOT "/logs"
+#define SD_PATH_RUNTIME_LOG SD_PATH_LOGS "/metalio_logs.txt"
+#define SD_PATH_COREDUMP SD_PATH_LOGS "/metalio_coredump.elf"
+
 #define SD_PATH_RECORDINGS  SD_APP_ROOT "/recordings"   // 录音
 #define SD_PATH_BOOKS       SD_APP_ROOT "/books"        // 电子书
 #define SD_PATH_FONTS       SD_APP_ROOT "/fonts"        // 阅读 .ef 字体
@@ -52,7 +56,7 @@ extern "C" {
 #define SD_PATH_CHAT_LOG    SD_APP_ROOT "/chat_log"     // 百问会话 JSON
 #define SD_PATH_WALLPAPER    SD_APP_ROOT "/wallpaper"    // 壁纸库
 
-#define SD_PATH_BOOK_FONT      SD_PATH_FONTS "/misans_25_2.ef"              // 默认阅读字体
+#define SD_PATH_BOOK_FONT      SD_PATH_FONTS "/misans_40_2.ef"              // 默认阅读字体
 #define SD_PATH_BOOK_FONT_ALT  SD_PATH_FONTS "/font_misans_regular_25_2.ef" // 备用阅读字体
 
 #define SD_PATH_BG_SHUTDOWN    SD_PATH_WALLPAPER "/bg_shutdown.a2i1" // 关机壁纸文件名

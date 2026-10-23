@@ -20,7 +20,8 @@
 namespace reader {
 
 bool DownloadFont(const CloudPushResource& item, std::string& err_out,
-                  CloudDownloadProgressFn on_progress, void* progress_user, DownloadGate* gate) {
+                  CloudDownloadProgressFn on_progress, void* progress_user, DownloadGate* gate,
+                  const char* save_path, bool overwrite) {
     err_out.clear();
     PowerNeedHold hold_net(PowerNeed::OtaDownload);
     if (gate != nullptr && gate->IsCancelled()) {
@@ -44,7 +45,7 @@ bool DownloadFont(const CloudPushResource& item, std::string& err_out,
         return false;
     }
 
-    const std::string final_path = item.LocalPath();
+    const std::string final_path = save_path != nullptr ? save_path : item.LocalPath();
     if (!IsAllowedFontLocalPath(final_path)) {
         err_out = Lang::Strings::CLOUD_PATH_INVALID;
         return false;
@@ -62,10 +63,8 @@ bool DownloadFont(const CloudPushResource& item, std::string& err_out,
         return false;
     }
 
-    unlink(final_path.c_str());
-    if (rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+    if (!CommitDownloadedFile(tmp_path, final_path, overwrite, err_out)) {
         unlink(tmp_path.c_str());
-        err_out = Lang::Strings::CLOUD_SAVE_FAIL;
         return false;
     }
     ESP_LOGI(TAG, "saved cloud font -> %s", final_path.c_str());
@@ -74,18 +73,19 @@ bool DownloadFont(const CloudPushResource& item, std::string& err_out,
 
 bool DownloadPushResource(const CloudPushResource& item, std::string& err_out,
                           CloudDownloadProgressFn on_progress, void* progress_user,
-                          DownloadGate* gate, const uint8_t* cover_bytes, size_t cover_len) {
+                          DownloadGate* gate, const uint8_t* cover_bytes, size_t cover_len,
+                          const char* save_path, bool overwrite) {
     err_out.clear();
     if (item.type == PushResourceType::kBook) {
         return DownloadCloudBook(ToBookTask(item), err_out, on_progress, progress_user, gate,
-                                 cover_bytes, cover_len);
+                                 cover_bytes, cover_len, save_path, overwrite);
     }
     if (item.type == PushResourceType::kBadge) {
         return DownloadCloudWallpaper(ToWallpaperTask(item), err_out, on_progress, progress_user,
-                                      gate);
+                                      gate, save_path, overwrite);
     }
     if (item.type == PushResourceType::kFont) {
-        return DownloadFont(item, err_out, on_progress, progress_user, gate);
+        return DownloadFont(item, err_out, on_progress, progress_user, gate, save_path, overwrite);
     }
     err_out = Lang::Strings::CLOUD_UNKNOWN_TYPE;
     return false;
@@ -137,18 +137,15 @@ bool DeletePushResourceRemote(const CloudPushResource& item, std::string& err_ou
     }
     http->SetTimeout(kHttpTimeoutMs);
     api::ApplyJsonHeaders(http);
-    api::LogHttpRequest(TAG, "DELETE", url, body);
     http->SetContent(std::move(body));
     if (!http->Open("DELETE", url)) {
         err_out = Lang::Strings::CLOUD_REQUEST_FAIL;
-        api::LogHttpResponse(TAG, -1, err_out);
         return false;
     }
 
     const int status = http->GetStatusCode();
     const std::string resp = http->ReadAll();
     http->Close();
-    api::LogHttpResponse(TAG, status, api::RedactClawUrlsForLog(resp));
     if (status < 200 || status >= 300) {
         err_out = Lang::Strings::CLOUD_REQUEST_FAIL;
         return false;

@@ -6,6 +6,7 @@
 #include "boot_key_handler.h"
 #include "power_policy.h" // kBootLongPressMs（屏触 PTT 与 BOOT 同阈值）
 #include "reader_types.h"
+#include "yunxin_text_format.h"
 #include "screen_common.h"
 
 #include <atomic>
@@ -22,9 +23,6 @@
 #include <lvgl.h>
 
 constexpr const char* TAG = "AssistantScreen";
-constexpr const char* kIdleHintAssetZh = "ic_s_assistant_hint.a2i1";  // 无会话时全屏提示图：中文走 resources；英文嵌入固件（可随 app OTA）。
-constexpr int kIdleHintMaxW = DISPLAY_CONTENT_W; // 原 397 全屏 480×800
-constexpr int kIdleHintMaxH = DISPLAY_CONTENT_H;
 
 constexpr uint32_t kTouchPttLongPressMs = ::kBootLongPressMs;  // 屏触 PTT 臂听阈值：与 BOOT 共用 kBootLongPressMs，勿各写各的。
 constexpr uint16_t kUiFontSize = 30;
@@ -175,10 +173,9 @@ struct AssistantUiState {
         lv_obj_t* scr = nullptr;
         lv_obj_t* content = nullptr;  // a2ui host：只渲染当前页
         lv_obj_t* page_label = nullptr;
-        lv_obj_t* hint_img = nullptr;  // 无会话时全屏提示图
+        lv_obj_t* idle_hint = nullptr;  // 无会话时 LVGL 欢迎页
         lv_obj_t* status_label = nullptr;       // 状态栏居中时钟/文案
         lv_obj_t* notification_label = nullptr;
-        reader::RasterImage* hint_raster = nullptr;  // 由 hint_img DELETE 释放
     } chrome;
 
     struct Layout {
@@ -200,9 +197,15 @@ struct AssistantUiState {
     } layout;
 
     struct Stream {
+        ChatString yunxin_text;
+        YunxinTextFormatter yunxin_formatter;
+        bool yunxin_dirty = false;
+        bool yunxin_rendered = false;
+        ChatString rendered_page_json;
+        const lv_font_t* rendered_page_font = nullptr;
+        lv_coord_t rendered_page_width = 0, rendered_page_height = 0;
         std::mutex session_mu;  // 保护 flow / pages / 页码；重排不持 LVGL 锁
         FlowList coalesce_buf;
-        bool coalesce_jump = false;
         bool coalesce_pending = false;
         esp_timer_handle_t coalesce_timer = nullptr;
         int64_t last_stream_paint_us = 0;
@@ -230,12 +233,12 @@ lv_coord_t Assistant_VariantLetterSpace(const char* variant);
 const lv_font_t* Assistant_FontFor(bool bold);
 /** @brief 确保 a2ui 宿主已挂到屏幕 */
 void Assistant_EnsureA2ui(lv_obj_t* scr);
-/** @brief 隐藏空状态提示图 */
+/** @brief 隐藏空状态欢迎页 */
 void Assistant_HideIdleHint();
-/** @brief 显示空状态全屏提示图 */
+/** @brief 显示空状态欢迎页 */
 void Assistant_ShowIdleHint();
-/** @brief 解码空状态提示图到 Image 控件 */
-void Assistant_LoadIdleHintImage(lv_obj_t* img);
+/** @brief 创建空状态 LVGL 欢迎页 */
+void Assistant_BuildIdleHint(lv_obj_t* host);
 /** @brief BOOT 或屏触任一源仍按住 */
 bool Assistant_IsAnyPttHeld();
 /** @brief 是否应显示 PTT 波形（Listening 且仍按住） */

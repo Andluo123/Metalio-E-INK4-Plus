@@ -215,7 +215,7 @@ bool CloudWallpaperTask::IsDownloaded() const {
 
 bool DownloadCloudWallpaper(const CloudWallpaperTask& task, std::string& err_out,
                             CloudDownloadProgressFn on_progress, void* progress_user,
-                            DownloadGate* gate) {
+                            DownloadGate* gate, const char* save_path, bool overwrite) {
     err_out.clear();
     if (gate != nullptr && gate->IsCancelled()) {
         err_out = Lang::Strings::CLOUD_CANCELLED;
@@ -234,7 +234,7 @@ bool DownloadCloudWallpaper(const CloudWallpaperTask& task, std::string& err_out
         return false;
     }
 
-    const std::string final_path = task.LocalPath();
+    const std::string final_path = save_path != nullptr ? save_path : task.LocalPath();
     const std::string wallpaper_prefix = std::string(SD_PATH_WALLPAPER) + "/";
     if (final_path.rfind(wallpaper_prefix, 0) != 0 && final_path != SD_PATH_WALLPAPER) {
         err_out = Lang::Strings::CLOUD_PATH_INVALID;
@@ -253,10 +253,8 @@ bool DownloadCloudWallpaper(const CloudWallpaperTask& task, std::string& err_out
         return false;
     }
 
-    unlink(final_path.c_str());
-    if (rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+    if (!CommitDownloadedFile(tmp_path, final_path, overwrite, err_out)) {
         unlink(tmp_path.c_str());
-        err_out = Lang::Strings::CLOUD_SAVE_FAIL;
         return false;
     }
 
