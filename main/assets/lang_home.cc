@@ -146,7 +146,7 @@
     X(SETTINGS_SCREEN_BLACK_DEPTH_DEFAULT, "默认", "Default") \
     X(SETTINGS_SCREEN_BLACK_DEPTH_MEDIUM, "中", "Medium") \
     X(SETTINGS_SCREEN_BLACK_DEPTH_STRONG, "强", "Strong") \
-    X(SETTINGS_SCREEN_BLACK_DEPTH_HINT, "提高黑色深度可能影响屏幕寿命，并造成累积发黄，建议优先使用默认档。", "Increasing black depth may affect display lifespan and cause cumulative yellowing. Default is recommended.") \
+    X(SETTINGS_SCREEN_BLACK_DEPTH_HINT, "提高黑色深度可能影响屏幕寿命，并增加底色变化风险，建议优先使用默认档。", "Increasing black depth may affect display lifespan and cause background discoloration. Default is recommended.") \
     X(SETTINGS_SCREEN_REFRESH_TITLE, "刷新模式", "Refresh mode") \
     X(SETTINGS_SCREEN_REFRESH_CLEAR, "清晰", "Clear") \
     X(SETTINGS_SCREEN_REFRESH_CLEAR_HINT, "细节更清晰，残影更少。", "Sharper detail, less ghosting.") \
@@ -577,8 +577,8 @@
     X(BOOK_OPEN_FAILED_IO, "打开失败\n文件不存在或 SD 读取失败", "Open failed\nFile missing or SD read failed") \
     X(BOOK_OPEN_FAILED_DATA, "打开失败\n书籍损坏或正文格式无效", "Open failed\nDamaged book or invalid content") \
     X(BOOK_OPEN_FAILED_MEMORY, "打开失败\n可用内存不足", "Open failed\nNot enough memory") \
-    X(BOOK_OPEN_FAILED_CACHE, "打开失败\nSD 缓存创建或读写失败，请检查空间", "Open failed\nCannot create or access SD cache") \
-    X(BOOK_OPEN_FAILED_UNSUPPORTED, "打开失败\n不支持的格式或超出安全边界", "Open failed\nUnsupported format or safety limit") \
+    X(BOOK_OPEN_FAILED_CACHE, "打开失败\n无法创建或读取阅读缓存，请检查存储卡和剩余空间", "Open failed\nCannot create or read the cache. Check the SD card and free space") \
+    X(BOOK_OPEN_FAILED_UNSUPPORTED, "打开失败\n暂不支持此书籍格式或文件参数", "Open failed\nUnsupported book format or file parameters") \
     X(BOOK_OPEN_CANCELLED, "已取消打开", "Opening cancelled") \
     X(BOOK_OPEN_FAILED_TASK, "打开失败\n无法启动解析任务", "Open failed\nCannot start parse task") \
     X(BOOK_OPENING, "正在打开", "Opening") \

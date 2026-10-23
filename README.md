@@ -77,7 +77,7 @@ Product data lives under SD `metalio/e-ink/`. Cloud APIs use **ink-screen** push
 
 - **Wi-Fi**: ESP32-S31 2.4 GHz; AP name like `MetalioEInk4Plus-xxxx`
 - **Bluetooth audio**: external chip over UART AT, three modes (see [12.1](#121-bluetooth-audio-three-modes))
-- **Virtual USB disk**: Settings -> Storage exposes microSD as USB MSC (TinyUSB on S31 **HS UTMI**; path select via **ANA_SW** GPIO36)
+- **Virtual USB disk**: Transfer -> USB transfer exposes microSD as USB MSC (TinyUSB on S31 **HS UTMI**; path select via **ANA_SW** GPIO36)
 
 ### 2.5 Power and battery life
 
@@ -109,7 +109,7 @@ Home enables these six apps (`home_screen.cc` -> `kApps[]`):
 | **Reader** | Local library browse and paged reading (volume keys P1.0 / P1.1) |
 | **Wallpaper** | Wallpaper gallery; standby / shutdown art |
 | **Transfer** | Cloud push of books, wallpapers, fonts |
-| **Settings** | Network, theme, language, haptics, power, frontlight, conversation, storage, Bluetooth, test, about |
+| **Settings** | Network, theme, language, haptics, power, frontlight, conversation, Bluetooth, test, about |
 
 ---
 
@@ -394,7 +394,7 @@ merge_firmware.sh                  # build + merge full bin
 
 ## 10. Cloud services and APIs
 
-Cloud hosts and HTTP paths live in `main/cloudzao_endpoints.c` / `main/cloudzao_endpoints.h`. Call sites only use `main/api_endpoints.h` to build URLs. In the current open-source build, those strings may be intentionally blank, so the firmware does not use a private backend by default; if you deploy your own service, fill in the real values while keeping the symbol names unchanged.
+Cloud hosts and HTTP paths live in `main/cloudzao_endpoints.c` / `main/cloudzao_endpoints.h`. Call sites only use `main/api_endpoints.h` to build URLs. In the current open-source build, cloud addresses and credentials are empty. Configure a compatible backend before using cloud-dependent features, keeping the symbol names unchanged. Local reading, wallpapers, AP transfer, and USB transfer do not require this configuration.
 
 Primary voice transport remains **WebSocket / MQTT+UDP**. Device tools can be exposed via **MCP**.
 
@@ -413,7 +413,7 @@ Home list: `home_screen.cc` -> `kApps[]` (max 12 per page).
 | **Reader** | Library 3x3 -> detail -> body; volume keys (P1.0 / P1.1) paging (11.3) |
 | **Wallpaper** | SD gallery; shutdown / standby (11.4) |
 | **Transfer** | Unified push list for books / wallpapers / fonts (11.5) |
-| **Settings** | Network / theme / language / haptics / power / frontlight / conversation / storage / BT / test / about (11.6) |
+| **Settings** | Network / theme / language / haptics / power / frontlight / conversation / BT / test / about (11.6) |
 
 System pages (no home icon): **standby**, **OTA upgrade**, Settings-embedded **Bluetooth**.
 
@@ -454,11 +454,11 @@ See `main/display/screen/assistant_screen/README.md`.
   - Else -> classic (date / lunar / weather / todos)
 - Shutdown image: NVS wallpaper first, else built-in `bg_shutdown.a2i1`
 
-### 11.5 Transfer (cloud)
+### 11.5 Transfer
 
-- Tabs: All / Wallpaper / Books / Fonts; **Refresh** pulls push queue
-- Landing dirs: BOOK->`books`, BADGE->`wallpaper`, FONT->`fonts`
-- Status bar fixed title (no clock)
+- Transfer modes: APP push / AP transfer / USB transfer. APP push filters: All / Wallpaper / Books / Fonts; **Refresh** retrieves pending files.
+- Save directories: BOOK->`books`, BADGE->`wallpaper`, FONT->`fonts`
+- APP push supports replacing, skipping, or keeping both files when names conflict. The status bar displays the clock.
 
 ### 11.6 Settings
 
@@ -471,7 +471,6 @@ See `main/display/screen/assistant_screen/README.md`.
 | **Power** | AppIdle CPU, standby delay, network grace, cumulative power-off |
 | **Frontlight** | Cool / warm / both / off + brightness |
 | **Conversation** | Baiwen TTS server preference |
-| **Storage** | SD capacity; **enable / disable virtual USB disk** |
 | **Bluetooth** | Modes 1/2/3, scan/pair (12.1) |
 | **Test** | Factory / aging entry |
 | **About** | Model, chip, FW version, MAC, Flash, PSRAM |
@@ -600,7 +599,7 @@ On ESP32-S31, USB Serial/JTAG and HS MSC use separate PHYs; still eject the virt
 
 1. Format FAT32 and insert.
 2. Put assets under `metalio/e-ink/...` per 11.7 (do not nest an extra folder named `sdcard` on the PC).
-3. Settings -> Storage -> enable virtual USB disk; copy files; eject safely; then disable.
+3. Transfer -> USB transfer -> enable virtual USB disk; copy files; eject safely; then disable.
 
 USB strings example: `Metalio` / `Metalio Ink SD` (TinyUSB). Enabling MSC drives **ANA_SW** (GPIO36) low.
 
@@ -648,7 +647,7 @@ Check FT6336 RST (TCA P1.2 high), INT (GPIO5), and shared I2C 0/1.
 
 **Q: Wi-Fi provisioning**
 
-Settings -> Network -> Wi-Fi; connect to AP `MetalioEInk4Plus-*` and follow on-device UI.
+Open Settings -> Network, scan for Wi-Fi networks, select a network, and enter its password.
 
 **Q: SD mount failed**
 
@@ -656,7 +655,7 @@ FAT32; check SDMMC 4-bit pins (GPIO20-25); on S31 ensure CNNT SDIO pad mux is re
 
 **Q: Virtual USB disk**
 
-Enable under Settings -> Storage; **ANA_SW** goes low. Eject safely before disabling.
+Enable under Transfer -> USB transfer; **ANA_SW** goes low. Eject safely before disabling.
 
 **Q: Device enters standby or powers off after idle**
 

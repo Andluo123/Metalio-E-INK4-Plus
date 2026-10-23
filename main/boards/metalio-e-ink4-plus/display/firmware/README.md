@@ -18,7 +18,7 @@ LVGL 和后台监控启动之前执行，独占 I2C1。
 
 串口日志标签为 `touch_upgrade`。成功日志为 `updated and verified V03`；
 已有 V03 或更新版本时输出 `already current; skipped`。成功后可关闭该选项重新编译。
-默认关闭，不会因为更新 ESP32 应用而自行擦除触摸固件。
+Kconfig 默认关闭此选项，本仓库预置的 `sdkconfig` 已启用。刷写前请确认面板型号及该选项；已为 V03 或更新版本时跳过升级。
 
 升级先检查文件 CRC、头部、芯片 ID 64/26 和当前版本；进入 Bootloader 后
 确认 ID 79/1C 才擦除应用区。逐包检查状态，校验 XOR，并在重启后确认版本。
