@@ -8,6 +8,7 @@
 #include "bt_audio_codec.h"
 #include "bq27220_gauge.h"
 #include "config.h"
+#include "firmware_memory.h"
 #include "frontlight.h"
 #include "metalio_accel.h"
 #include "metalio_audio.h"
@@ -59,6 +60,7 @@ public:
             ESP_LOGE(TAG, "epd init fail");
             return;
         }
+        FirmwareMemoryCheckpoint("board-epd-init");
         if (!MetalioTouch_UpgradeOnBoot()) {
             ESP_LOGE(TAG, "touch upgrade failed; continuing with touch probe");
         }
@@ -72,9 +74,11 @@ public:
         MetalioAccel_Init();
         metalio_touch_init(); // 先于 Display：INT+feed 就绪后再挂 LVGL 回调
         display_ = MetalioDisplay_Create();
+        FirmwareMemoryCheckpoint("board-display-created");
 
         MetalioVibe_Init();
         MetalioSd_Init();
+        FirmwareMemoryCheckpoint("board-sd-mounted");
         // SD 挂载后补齐本地壁纸缓存，必须早于电源键开放待机入口。
         Wallpaper_HydrateFromNvsNow();
         MetalioKeys_Init();
@@ -86,6 +90,7 @@ public:
             MetalioDisplay_SetSystemReady(display_);
         }
         MetalioAudio_Init();
+        FirmwareMemoryCheckpoint("board-audio-init");
         ESP_LOGI(TAG, "board ready display=%s sd=%s gauge=%s",
                  display_ ? "ok" : "FAIL", MetalioSd_Ok() ? "ok" : "FAIL",
                  Bq27220Gauge::GetInstance().IsReady() ? "ok" : "N/A");

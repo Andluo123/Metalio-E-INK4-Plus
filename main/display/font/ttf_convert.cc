@@ -82,6 +82,11 @@ void FinishOk() {
 /** WithCaps 创建的任务必须用 WithCaps 删除，否则栈块泄漏。 */
 [[noreturn]] void ExitWorker() {
     vTaskDeleteWithCaps(nullptr);
+    // vTaskDeleteWithCaps 删除当前任务后不会返回；保留兜底循环，
+    // 既满足 -Wreturn-type，也避免极端情况下从 noreturn 函数返回。
+    for (;;) {
+        vTaskDelay(portMAX_DELAY);
+    }
 }
 
 bool LoadCharset(const char* template_ef_path, std::vector<uint32_t>* cps) {

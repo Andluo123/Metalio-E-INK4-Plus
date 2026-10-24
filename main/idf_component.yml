@@ -1,11 +1,14 @@
 ## Metalio-E-Ink4-Plus：百问 AI 整栈（WiFi + Opus + Assistant）
 dependencies:
   idf:
-    version: '>=5.4.0'
+    version: '>=6.1.0'
   lvgl/lvgl: "==9.5.0"
   espressif/esp_lvgl_adapter: "==0.6.3"
   espressif/esp_mmap_assets: '>=1.2'
   78/esp-opus-encoder: ~2.4.1
+  # 蜂窝模组 UART DMA 接收 + iot_eth 网络接口
+  78/uart-uhci: "==0.4.1"
+  espressif/iot_eth: "==0.1.0"
   espressif/esp_codec_dev: ~1.5
   espressif/esp-sr:
     version: ~2.2.0

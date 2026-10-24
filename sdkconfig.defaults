@@ -58,3 +58,7 @@ CONFIG_COMPILER_CXX_RTTI=y
 
 # AP 文件上传和设备进度使用 WebSocket。
 CONFIG_HTTPD_WS_SUPPORT=y
+
+# 虚拟 U 盘（TinyUSB MSC）只在设置页临时启用，但缓冲区是常驻 .bss/.data。
+# 8192 会永久占用 8 KB 内部 RAM；USB 全速 12 Mbps 下 4 KB 已足够打满带宽。
+CONFIG_TINYUSB_MSC_BUFSIZE=4096

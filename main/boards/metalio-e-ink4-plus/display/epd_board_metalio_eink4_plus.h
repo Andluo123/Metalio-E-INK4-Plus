@@ -5,6 +5,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <esp_err.h>
 
 #ifdef __cplusplus
@@ -46,6 +47,42 @@ void epd_board_metalio_eink4_plus_motor_set(bool on);
  * @param on true 开，false 关
  */
 void epd_board_metalio_eink4_plus_pa_set(bool on);
+
+/**
+ * @brief P14 共享电源（4G + 蓝牙 + 功放）的状态
+ *
+ * 之所以需要显式状态机：P14 被三个子系统共用，任意一处“顺手把锁存写高”
+ * 都无法回答“现在到底有没有电、能不能发 AT 命令”。所有读写都必须经过
+ * epd_board_metalio_eink4_plus_p14_ensure_ready()，保证同一时刻只有一个
+ * 明确的轨道状态。
+ */
+typedef enum {
+    EPD_P14_UNKNOWN = 0,   /* 本电源周期尚未确认，首次 ensure 会真正写一次锁存 */
+    EPD_P14_OFF,           /* P14 低：4G/BT/PA 全部断电 */
+    EPD_P14_SETTLING,      /* P14 已拉高，等待电源稳定 */
+    EPD_P14_READY,         /* P14 高且已稳定，可发 AT / 启动 4G */
+    EPD_P14_RESETTING,     /* 正在执行蓝牙复位（P14 低），禁止 PA/查询 */
+} epd_p14_state_t;
+
+/** @brief 读当前 P14 轨道状态（只读快照，不触发 I2C） */
+epd_p14_state_t epd_board_metalio_eink4_plus_p14_state(void);
+/** @brief 状态名，用于日志（不返回 NULL） */
+const char* epd_board_metalio_eink4_plus_p14_state_name(epd_p14_state_t state);
+/**
+ * @brief 幂等确保 P14 供电就绪
+ *
+ * - 已是 READY：直接返回，绝不重写锁存（因此不会重启 4G）；
+ * - RESETTING：返回 ESP_ERR_INVALID_STATE，调用方应稍后重试；
+ * - 其他状态：写一次锁存拉高，等待剩余稳定时间后置 READY。
+ *
+ * @param settle_ms 拉高后需要的稳定时间；0 表示使用默认 20 ms
+ */
+esp_err_t epd_board_metalio_eink4_plus_p14_ensure_ready(uint32_t settle_ms);
+/** @brief 距 READY 还需等待的毫秒数；已就绪返回 0 */
+uint32_t epd_board_metalio_eink4_plus_p14_pending_settle_ms(void);
+
+/** @brief 显式拉高 P14 共享电源（4G/BT/PA）并等待稳定。 */
+esp_err_t epd_board_metalio_eink4_plus_bt_power_on(void);
 /** @brief P14 共享电源拉低 3 秒后拉高；调用方须阻止待机。 */
 esp_err_t epd_board_metalio_eink4_plus_bt_power_reset(void);
 

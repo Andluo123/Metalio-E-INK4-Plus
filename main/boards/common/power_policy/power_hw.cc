@@ -2,6 +2,7 @@
  * @brief S31 低功耗硬件原子（对齐 light_test 入睡序列）
  */
 #include "power_hw.h"
+#include "power_wake_cause.h"
 #include "s31_sleep/s31_sleep.h"
 
 #include "application.h"
@@ -199,11 +200,9 @@ esp_err_t power_hw_bt_power_reset(void) {
         EpdFlashGuard panel_guard;
         MetalioAudio_SetPa(false);
         MetalioAudio_OnPowerOff();
+        // P14 状态机内部完成“拉低 3 s → 拉高 → 80 ms 稳定 → READY”，
+        // 返回 ESP_OK 时轨道已就绪，调用方不需要再补延时。
         err = epd_board_metalio_eink4_plus_bt_power_reset();
-        if (err == ESP_OK) {
-            // 与开机 P14 恢复路径一致，待电源稳定后才允许下一次刷屏。
-            vTaskDelay(pdMS_TO_TICKS(80));
-        }
     }
     if (err == ESP_OK) {
         MetalioAudio_OnPowerRestored();
@@ -403,13 +402,15 @@ esp_err_t power_hw_light_sleep_once(uint64_t max_sleep_us) {
     fflush(stdout);
     s31_sleep::Checkpoint(s31_sleep::Phase::BeforeSleep, applied); // last checkpoint before the CPU sleeps
     esp_err_t err = s31_sleep::LightSleep(applied);
-    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    const uint32_t causes = esp_sleep_get_wakeup_causes();
+    const esp_sleep_wakeup_cause_t cause = PowerWakePrimaryCause(causes);
 
     // 醒瞬间锁存 P17；此时 USJ 可能仍哑，用 ROM 打一行便于对照
     s_gpio_wake_boot_low = false;
     s_gpio_wake_power_low = ReadPowerPinLow();
-    esp_rom_printf("PowerHw: light_sleep wake err=%s cause=%d power_low=%d\n",
-                   esp_err_to_name(err), (int)cause, s_gpio_wake_power_low ? 1 : 0);
+    esp_rom_printf("PowerHw: light_sleep wake err=%s cause=%d mask=0x%lx power_low=%d\n",
+                   esp_err_to_name(err), (int)cause, (unsigned long)causes,
+                   s_gpio_wake_power_low ? 1 : 0);
 
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
     if (max_sleep_us > 0) {

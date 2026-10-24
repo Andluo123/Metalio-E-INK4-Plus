@@ -19,6 +19,7 @@
 #include <esp_rom_sys.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -195,6 +196,69 @@ static uint8_t s_pa_on = 0;                // Port0 PA_EN 锁存，0 或 CFG_PIN
 static bool s_bt_reset_pa_off = false;     // P14 复位期间屏蔽所有 PA 开启请求
 static uint8_t s_cam_scr_on = CFG_PIN_CAM_SCR; // Port0 P05 摄像/屏电，默认高
 
+/* P14 共享电源状态机。P14 = 4G + 蓝牙 + 功放，任何一处“顺手写高锁存”
+ * 都无法回答“现在能不能发 AT 命令”，所以状态和锁存值必须一起维护。 */
+#define kP14DefaultSettleMs 20u  // 普通拉高后的电源稳定时间
+#define kP14ResetSettleMs   80u  // 蓝牙复位拉低 3 s 再拉高后的稳定时间
+
+static epd_p14_state_t s_p14_state = EPD_P14_UNKNOWN;
+static int64_t s_p14_ready_at_us = 0; // SETTLING 状态下的稳定截止时间
+static StaticSemaphore_t s_p14_mu_storage;
+static SemaphoreHandle_t s_p14_mu = NULL;
+static portMUX_TYPE s_p14_mu_init = portMUX_INITIALIZER_UNLOCKED;
+
+static SemaphoreHandle_t p14_mutex(void) {
+    portENTER_CRITICAL(&s_p14_mu_init);
+    if (s_p14_mu == NULL) {
+        s_p14_mu = xSemaphoreCreateMutexStatic(&s_p14_mu_storage);
+    }
+    portEXIT_CRITICAL(&s_p14_mu_init);
+    return s_p14_mu;
+}
+
+static void p14_set_state(epd_p14_state_t next, const char* why) {
+    if (s_p14_state == next) {
+        return;
+    }
+    ESP_LOGI(TAG, "P14 %s -> %s (%s)",
+             epd_board_metalio_eink4_plus_p14_state_name(s_p14_state),
+             epd_board_metalio_eink4_plus_p14_state_name(next), why);
+    s_p14_state = next;
+}
+
+const char* epd_board_metalio_eink4_plus_p14_state_name(epd_p14_state_t state) {
+    switch (state) {
+        case EPD_P14_OFF: return "OFF";
+        case EPD_P14_SETTLING: return "SETTLING";
+        case EPD_P14_READY: return "READY";
+        case EPD_P14_RESETTING: return "RESETTING";
+        default: return "UNKNOWN";
+    }
+}
+
+epd_p14_state_t epd_board_metalio_eink4_plus_p14_state(void) {
+    const SemaphoreHandle_t mu = p14_mutex();
+    if (mu == NULL || xSemaphoreTake(mu, 0) != pdTRUE) {
+        return s_p14_state; // 有人正在切换：返回快照，不阻塞调用方
+    }
+    const epd_p14_state_t state = s_p14_state;
+    xSemaphoreGive(mu);
+    return state;
+}
+
+uint32_t epd_board_metalio_eink4_plus_p14_pending_settle_ms(void) {
+    const SemaphoreHandle_t mu = p14_mutex();
+    if (mu == NULL || xSemaphoreTake(mu, 0) != pdTRUE) {
+        return 0;
+    }
+    int64_t remain = 0;
+    if (s_p14_state == EPD_P14_SETTLING) {
+        remain = s_p14_ready_at_us - esp_timer_get_time();
+    }
+    xSemaphoreGive(mu);
+    return remain > 0 ? (uint32_t)((remain + 999) / 1000) : 0;
+}
+
 static uint8_t p0_output_value(void) {
     uint8_t value = 0x00;
     if (config_reg.pwrup) {
@@ -250,29 +314,112 @@ void epd_board_metalio_eink4_plus_pa_set(bool on) {
     p0_write();
 }
 
+esp_err_t epd_board_metalio_eink4_plus_p14_ensure_ready(uint32_t settle_ms) {
+    if (!s_ioexp_ok) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const SemaphoreHandle_t mu = p14_mutex();
+    if (mu == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(mu, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = ESP_OK;
+    if (s_p14_state == EPD_P14_RESETTING) {
+        // 蓝牙复位期间不允许别的子系统插队上电
+        err = ESP_ERR_INVALID_STATE;
+        goto done;
+    }
+    if (s_p14_state == EPD_P14_READY) {
+        // 幂等：已就绪就不写锁存，避免无谓的 4G 掉电/重连
+        goto done;
+    }
+    if (settle_ms == 0) {
+        settle_ms = kP14DefaultSettleMs;
+    }
+    if ((s_p1_out & CFG_PIN_BT_PA_PWR) == 0 || s_p14_state != EPD_P14_SETTLING) {
+        s_p1_out |= CFG_PIN_BT_PA_PWR;
+        err = pca9555_set_value(config_reg.port, s_p1_out, CFG_PORT_INT);
+        if (err != ESP_OK) {
+            p14_set_state(EPD_P14_UNKNOWN, "rail-high write failed");
+            goto done;
+        }
+        s_p14_ready_at_us = esp_timer_get_time() + (int64_t)settle_ms * 1000;
+        p14_set_state(EPD_P14_SETTLING, "rail-high");
+    }
+    {
+        const int64_t remain = s_p14_ready_at_us - esp_timer_get_time();
+        if (remain > 0) {
+            vTaskDelay(pdMS_TO_TICKS((remain + 999) / 1000));
+        }
+    }
+    s_p14_ready_at_us = 0;
+    p14_set_state(EPD_P14_READY, "settled");
+
+done:
+    xSemaphoreGive(mu);
+    return err;
+}
+
+esp_err_t epd_board_metalio_eink4_plus_bt_power_on(void) {
+    return epd_board_metalio_eink4_plus_p14_ensure_ready(0);
+}
+
 esp_err_t epd_board_metalio_eink4_plus_bt_power_reset(void) {
     if (!s_ioexp_ok) return ESP_ERR_INVALID_STATE;
+    const SemaphoreHandle_t mu = p14_mutex();
+    if (mu == NULL) return ESP_ERR_NO_MEM;
+    if (xSemaphoreTake(mu, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    // 1) 先静音功放，再进入 RESETTING：此后 PA/查询请求一律拒绝
     s_bt_reset_pa_off = true;
     s_pa_on = 0;
     esp_err_t pa_err = pca9555_set_value(config_reg.port, p0_output_value(), CFG_PORT_CTRL);
     if (pa_err != ESP_OK) {
         s_bt_reset_pa_off = false;
+        // 复位未开始，轨道维持原状
+        p14_set_state((s_p1_out & CFG_PIN_BT_PA_PWR) ? EPD_P14_SETTLING : EPD_P14_OFF,
+                      "pa-mute failed");
+        xSemaphoreGive(mu);
         return pa_err;
     }
+    p14_set_state(EPD_P14_RESETTING, "bt-reset");
+
+    // 2) P14 拉低 3 s
     s_p1_out &= (uint8_t)~CFG_PIN_BT_PA_PWR;
     esp_err_t low_err = pca9555_set_value(config_reg.port, s_p1_out, CFG_PORT_INT);
     if (low_err == ESP_OK) {
         ESP_LOGI(TAG, "BT reset: P14 low for 3000 ms");
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
-    // 即使拉低失败也尝试恢复电源，并保持共享端口其他位。
+
+    // 3) 恢复供电。即使拉低失败也要恢复，并保持共享端口其他位。
     s_p1_out |= CFG_PIN_BT_PA_PWR;
     esp_err_t high_err = pca9555_set_value(config_reg.port, s_p1_out, CFG_PORT_INT);
     // 不恢复复位期间到达的 PA 开启请求，完成后仍保持低。
     s_pa_on = 0;
     s_bt_reset_pa_off = false;
-    if (high_err != ESP_OK) return high_err;
+    if (high_err != ESP_OK) {
+        p14_set_state(EPD_P14_UNKNOWN, "reset-high write failed");
+        xSemaphoreGive(mu);
+        return high_err;
+    }
     ESP_LOGI(TAG, "BT reset: P14 high");
+
+    // 4) 在这里等稳定性，调用方无需再猜时序
+    s_p14_ready_at_us = esp_timer_get_time() + (int64_t)kP14ResetSettleMs * 1000;
+    p14_set_state(EPD_P14_SETTLING, "reset-high");
+    {
+        const int64_t remain = s_p14_ready_at_us - esp_timer_get_time();
+        if (remain > 0) {
+            vTaskDelay(pdMS_TO_TICKS((remain + 999) / 1000));
+        }
+    }
+    s_p14_ready_at_us = 0;
+    p14_set_state(EPD_P14_READY, "reset-settled");
+    xSemaphoreGive(mu);
     return low_err;
 }
 
@@ -294,6 +441,7 @@ void epd_board_metalio_eink4_plus_sleep_cut_rails(void) {
     p0_write();
     s_p1_out &= (uint8_t)~CFG_PIN_BT_PA_PWR;
     p1_write();
+    p14_set_state(EPD_P14_OFF, "sleep-cut");
     ESP_LOGI(TAG, "sleep cut P5 then P14");
 }
 
@@ -303,6 +451,8 @@ void epd_board_metalio_eink4_plus_sleep_restore_rails(void) {
     }
     s_p1_out |= CFG_PIN_BT_PA_PWR;
     p1_write();
+    s_p14_ready_at_us = esp_timer_get_time() + (int64_t)kP14DefaultSettleMs * 1000;
+    p14_set_state(EPD_P14_SETTLING, "sleep-restore");
     s_cam_scr_on = CFG_PIN_CAM_SCR;
     p0_write();
     ESP_LOGI(TAG, "sleep restore P14 then P5");
@@ -592,6 +742,10 @@ static bool probe_and_init_ioexp(i2c_port_t port) {
         if (pca9555_set_value(port, s_p1_out, CFG_PORT_INT) != ESP_OK) {
             continue;
         }
+        // 冷启动/深睡唤醒都把 P14 拉高一次；此处只登记 SETTLING，
+        // 由第一条真正使用 4G/BT 的路径（ensure_ready）确认就绪。
+        s_p14_ready_at_us = esp_timer_get_time() + (int64_t)kP14DefaultSettleMs * 1000;
+        p14_set_state(EPD_P14_SETTLING, "ioexp-init latch-high");
         if (pca9555_set_config(port, CFG_P1_INPUT_MASK, CFG_PORT_INT) != ESP_OK) {
             continue;
         }

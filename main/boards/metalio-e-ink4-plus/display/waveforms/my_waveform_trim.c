@@ -86,18 +86,28 @@ int my_waveform_trim(const EpdWaveformPhases* src, const my_waveform_trim_t* tri
     }
 
     const uint8_t(*data)[16][4] = (const uint8_t(*)[16][4])src->luts;
-    static trimmed_seq_t seqs[16][16];
+
+    /*
+     * 这里原先用 static trimmed_seq_t seqs[16][16]（约 17 KB 常驻 .bss）。
+     * 该函数只在波形构建期调用一次，没必要长期占内部 RAM：
+     *   第一遍只记录裁剪后的长度（256 B 栈），拿到全局最长相位；
+     *   第二遍按目标灰阶逐行重算并写入，栈上只需 16 条序列（约 1 KB）。
+     * 裁剪是纯整数运算且结果确定，重算不改变输出。
+     */
+    uint8_t lengths[16][16];
     int longest = 0;
 
     for (int to = 0; to < 16; to++) {
         for (int from = 0; from < 16; from++) {
             uint8_t seq[MAX_PHASES];
+            trimmed_seq_t tmp;
             for (int f = 0; f < src->phases; f++) {
                 seq[f] = (uint8_t)lut_get(data, f, to, from);
             }
-            trim_one(seq, src->phases, to, trim, &seqs[to][from]);
-            if (seqs[to][from].len > longest) {
-                longest = seqs[to][from].len;
+            trim_one(seq, src->phases, to, trim, &tmp);
+            lengths[to][from] = (uint8_t)tmp.len;
+            if (tmp.len > longest) {
+                longest = tmp.len;
             }
         }
     }
@@ -109,8 +119,18 @@ int my_waveform_trim(const EpdWaveformPhases* src, const my_waveform_trim_t* tri
 
     memset(dst_data, 0, (size_t)phases * 16 * 4);
     for (int to = 0; to < 16; to++) {
+        trimmed_seq_t row[16];
         for (int from = 0; from < 16; from++) {
-            const trimmed_seq_t* t = &seqs[to][from];
+            uint8_t seq[MAX_PHASES];
+            for (int f = 0; f < src->phases; f++) {
+                seq[f] = (uint8_t)lut_get(data, f, to, from);
+            }
+            trim_one(seq, src->phases, to, trim, &row[from]);
+            /* 长度必须与第一遍一致；不一致说明输入在两次遍历间被改写。 */
+            if (row[from].len != lengths[to][from]) {
+                return 0;
+            }
+            const trimmed_seq_t* t = &row[from];
             const int start = longest - t->len;
             for (int i = 0; i < t->len; i++) {
                 lut_set(dst_data, start + i, to, from, t->seq[i]);

@@ -7,6 +7,7 @@
 #include "display.h"
 #include "fontpack_lvgl.h"
 #include "haptic_feedback.h"
+#include "metalio_audio.h"
 #include "ota.h"
 #include "ota_confirm_dialog/ota_confirm_dialog.h"
 #include "settings_common.h"
@@ -36,12 +37,17 @@ constexpr const char* TAG = "SettingsAbout";
 std::atomic<bool> s_tab_alive{false};
 std::atomic<uint32_t> s_check_gen{0};
 std::atomic<bool> s_check_busy{false};
+std::atomic<bool> s_bt_ver_busy{false};
+std::atomic<uint32_t> s_bt_ver_gen{0};
+std::atomic<uint32_t> s_bt_ver_request{0};
+lv_obj_t* s_bt_ver_subtitle = nullptr;
 bool s_about_prompt = false; // LVGL task / lock only.
 
 struct SettingsAboutInfoItem {
     const char* label;
     char value[96];
     bool firmware_row = false;
+    bool bt_ver_row = false;
 };
 
 enum class CheckResultKind : uint8_t {
@@ -56,6 +62,12 @@ struct CheckResultMsg {
     char current[48] = {};
     char next[48] = {};
     char url[256] = {};
+};
+
+struct BtVersionResultMsg {
+    uint32_t gen = 0;
+    uint32_t request = 0;
+    char value[96] = {};
 };
 
 static void FormatBytes(char* out, size_t out_len, uint64_t bytes) {
@@ -130,6 +142,19 @@ void CollectInfoItems(SettingsAboutInfoItem* items, int* count) {
     }
     ++idx;
 
+    items[idx].label = Lang::Strings::SETTINGS_ABOUT_BT_VER;
+    items[idx].bt_ver_row = true;
+    {
+        char bt_ver[96]{};
+        if (MetalioAudio_GetCachedBtVersion(bt_ver, sizeof(bt_ver))) {
+            std::snprintf(items[idx].value, sizeof(items[idx].value), "%s", bt_ver);
+        } else {
+            std::snprintf(items[idx].value, sizeof(items[idx].value), "%s",
+                          Lang::Strings::SETTINGS_ABOUT_BT_UNKNOWN);
+        }
+    }
+    ++idx;
+
     *count = idx;
 }
 
@@ -137,6 +162,93 @@ void SetStatusTip(const char* text) {
     auto* display = Board::GetInstance().GetDisplay();
     if (display != nullptr && text != nullptr) {
         display->SetStatus(text);
+    }
+}
+
+void AsyncApplyBtVersion(void* p) {
+    std::unique_ptr<BtVersionResultMsg> msg(static_cast<BtVersionResultMsg*>(p));
+    if (msg == nullptr) {
+        return;
+    }
+    const bool current = s_tab_alive.load(std::memory_order_acquire) &&
+                         msg->gen == s_bt_ver_gen.load(std::memory_order_acquire) &&
+                         msg->request == s_bt_ver_request.load(std::memory_order_acquire);
+    if (current) {
+        if (s_bt_ver_subtitle != nullptr) {
+            lv_label_set_text(s_bt_ver_subtitle, msg->value);
+        }
+    }
+}
+
+void BtVersionWorker(void* arg) {
+    std::unique_ptr<BtVersionResultMsg> request(static_cast<BtVersionResultMsg*>(arg));
+    const uint32_t gen = request != nullptr ? request->gen : 0;
+    const uint32_t request_id = request != nullptr ? request->request : 0;
+    PowerPolicy::GetInstance().Acquire(PowerNeed::BtAudio);
+    char bt_ver[96]{};
+    const bool ok = MetalioAudio_GetBtVersion(bt_ver, sizeof(bt_ver), 1500);
+    PowerPolicy::GetInstance().Release(PowerNeed::BtAudio);
+
+    auto* adapter = LvAdapterEpdiy::Instance();
+    auto* msg = new (std::nothrow) BtVersionResultMsg{};
+    if (msg == nullptr) {
+        if (request_id == s_bt_ver_request.load(std::memory_order_acquire)) {
+            s_bt_ver_busy.store(false, std::memory_order_release);
+        }
+        vTaskDelete(nullptr);
+        return;
+    }
+    msg->gen = gen;
+    msg->request = request_id;
+    std::snprintf(msg->value, sizeof(msg->value), "%s",
+                  ok ? bt_ver : Lang::Strings::SETTINGS_ABOUT_BT_FAILED);
+
+    bool posted = false;
+    if (adapter != nullptr && adapter->IsReady() && adapter->LockUi(-1)) {
+        posted = (lv_async_call(AsyncApplyBtVersion, msg) == LV_RESULT_OK);
+        adapter->UnlockUi();
+    }
+    if (!posted) {
+        delete msg;
+    }
+    if (request_id == s_bt_ver_request.load(std::memory_order_acquire)) {
+        s_bt_ver_busy.store(false, std::memory_order_release);
+    }
+    vTaskDelete(nullptr);
+}
+
+void OnBtVerRowClicked(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    if (!s_tab_alive.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (s_bt_ver_busy.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const uint32_t gen = s_bt_ver_gen.load(std::memory_order_acquire);
+    if (s_bt_ver_subtitle != nullptr) {
+        lv_label_set_text(s_bt_ver_subtitle, "...");
+    }
+    auto* request = new (std::nothrow) BtVersionResultMsg{};
+    if (request == nullptr) {
+        s_bt_ver_busy.store(false, std::memory_order_release);
+        if (s_bt_ver_subtitle != nullptr) {
+            lv_label_set_text(s_bt_ver_subtitle, Lang::Strings::SETTINGS_ABOUT_BT_UNKNOWN);
+        }
+        return;
+    }
+    request->gen = gen;
+    request->request = s_bt_ver_request.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (xTaskCreate(BtVersionWorker, "about_btver", 4096, request, 4, nullptr) != pdPASS) {
+        delete request;
+        if (gen == s_bt_ver_gen.load(std::memory_order_acquire)) {
+            s_bt_ver_busy.store(false, std::memory_order_release);
+        }
+        if (s_bt_ver_subtitle != nullptr) {
+            lv_label_set_text(s_bt_ver_subtitle, Lang::Strings::SETTINGS_ABOUT_BT_UNKNOWN);
+        }
     }
 }
 
@@ -289,6 +401,10 @@ lv_obj_t* CreateInfoRow(lv_obj_t* parent, const SettingsAboutInfoItem& item, boo
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         HapticAttachClick(row);
         lv_obj_add_event_cb(row, OnFirmwareRowClicked, LV_EVENT_CLICKED, nullptr);
+    } else if (item.bt_ver_row) {
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        HapticAttachClick(row);
+        lv_obj_add_event_cb(row, OnBtVerRowClicked, LV_EVENT_CLICKED, nullptr);
     } else {
         lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
     }
@@ -296,7 +412,8 @@ lv_obj_t* CreateInfoRow(lv_obj_t* parent, const SettingsAboutInfoItem& item, boo
     lv_obj_t* title = lv_label_create(row);
     lv_label_set_text(title, item.label);
     lv_obj_set_width(title, lv_pct(100));
-    lv_label_set_long_mode(title, item.firmware_row ? LV_LABEL_LONG_WRAP : LV_LABEL_LONG_DOT);
+    lv_label_set_long_mode(title, (item.firmware_row || item.bt_ver_row) ? LV_LABEL_LONG_WRAP
+                                                                         : LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(title, fontpack_lv_font_ui(), 0);
     lv_obj_set_style_text_color(title, lv_color_black(), 0);
     lv_obj_clear_flag(title, LV_OBJ_FLAG_CLICKABLE);
@@ -304,10 +421,14 @@ lv_obj_t* CreateInfoRow(lv_obj_t* parent, const SettingsAboutInfoItem& item, boo
     lv_obj_t* subtitle = lv_label_create(row);
     lv_label_set_text(subtitle, item.value);
     lv_obj_set_width(subtitle, lv_pct(100));
-    lv_label_set_long_mode(subtitle, item.firmware_row ? LV_LABEL_LONG_WRAP : LV_LABEL_LONG_DOT);
+    lv_label_set_long_mode(subtitle, (item.firmware_row || item.bt_ver_row) ? LV_LABEL_LONG_WRAP
+                                                                            : LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(subtitle, fontpack_lv_font_ui(), 0);
     lv_obj_set_style_text_color(subtitle, lv_color_black(), 0);
     lv_obj_clear_flag(subtitle, LV_OBJ_FLAG_CLICKABLE);
+    if (item.bt_ver_row) {
+        s_bt_ver_subtitle = subtitle;
+    }
 
     return row;
 }
@@ -317,6 +438,8 @@ lv_obj_t* CreateInfoRow(lv_obj_t* parent, const SettingsAboutInfoItem& item, boo
 void SettingsAboutTab_Reset() {
     s_tab_alive.store(false, std::memory_order_release);
     s_check_gen.fetch_add(1, std::memory_order_acq_rel);
+    s_bt_ver_gen.fetch_add(1, std::memory_order_acq_rel);
+    s_bt_ver_subtitle = nullptr;
     if (s_about_prompt) {
         OtaConfirmDialog::Dismiss();
         s_about_prompt = false;
@@ -326,9 +449,11 @@ void SettingsAboutTab_Reset() {
 
 void SettingsAboutTab_Build(lv_obj_t* page) {
     s_check_gen.fetch_add(1);
+    s_bt_ver_gen.fetch_add(1);
     s_tab_alive.store(true, std::memory_order_release);
+    s_bt_ver_subtitle = nullptr;
 
-    SettingsAboutInfoItem items[8];
+    SettingsAboutInfoItem items[9];
     int count = 0;
     CollectInfoItems(items, &count);
 

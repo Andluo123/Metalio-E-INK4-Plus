@@ -159,7 +159,9 @@ FontpackLvFont* FindOrCreate(uint16_t size, uint16_t bpp) {
         return nullptr;
     }
 
-    std::memset(slot, 0, sizeof(*slot));
+    // FontpackLvFont 含 lv_font_t（非平凡类型），不能用 memset 清零；
+    // 值初始化等价于原来的全零，但不会触发 -Wclass-memaccess。
+    *slot = FontpackLvFont{};
     slot->size = size;
     slot->bpp = bpp;
     slot->lv.get_glyph_dsc = GetGlyphDscCb;

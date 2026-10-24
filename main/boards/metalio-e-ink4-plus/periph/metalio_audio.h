@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 class AudioCodec;
@@ -55,6 +56,28 @@ void MetalioAudio_SetPa(bool on);
  * @brief 输入采样率 Hz
  */
 int MetalioAudio_InputRate();
+
+/**
+ * @brief 读取已缓存的蓝牙音频芯片固件版本；不会触发 UART 查询
+ * @param out 输出缓冲（UTF-8 文本）
+ * @param out_len 缓冲大小
+ * @return true 缓存有效；false 未知或缓存已失效
+ */
+bool MetalioAudio_GetCachedBtVersion(char* out, size_t out_len);
+
+/**
+ * @brief 查询蓝牙音频芯片（BH1098G）固件版本；结果缓存，重复调用直接返回
+ * @param out 输出缓冲（UTF-8 文本）
+ * @param out_len 缓冲大小
+ * @param timeout_ms 单次 AT 应答等待上限；≤0 用默认 1500ms
+ * @return true 已取得版本字符串；false 未知/超时/未初始化
+ */
+bool MetalioAudio_GetBtVersion(char* out, size_t out_len, int timeout_ms = 0);
+
+/**
+ * @brief 清除蓝牙版本缓存（下次 GetBtVersion 重新查询）
+ */
+void MetalioAudio_ClearBtVersionCache();
 
 /**
  * @brief 读取音频输入 PCM，声道布局由板级 codec 决定

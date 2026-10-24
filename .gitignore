@@ -13,12 +13,19 @@ build/
 .vscode/
 .cursor/
 .devcontainer/
-dependencies.lock
+# dependencies.lock 必须入库：离线可复现构建依赖它锁定组件版本
 .env
 releases/
 local-changes-summary.md
 
-main/assets/lang_config.h
+# 本地产物：编译自动生成的全量包与每次导出的归档
+/daily-builds/
+/metalio-e-ink4-plus.bin
+/firmware/
+# 参考固件（用于对比/反查，不属于源码）
+/merge-bin-*.bin
+
+# lang_config.h 改为构建时由 scripts/gen_lang_config_from_home.py 生成到 build 目录
 main/mmap_generate_emoji.h
 .DS_Store
 .cache

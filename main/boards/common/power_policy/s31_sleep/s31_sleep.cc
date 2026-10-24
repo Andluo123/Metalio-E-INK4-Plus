@@ -1,6 +1,7 @@
 // ESP32-S31 SDK compatibility backport and RTC sleep diagnostics.
 // Keep IRAM/DRAM/RTC placement and low-level register ordering intact.
 #include "s31_sleep.h"
+#include "power_wake_cause.h"
 #include <esp_log.h>
 #include <esp_sleep.h>
 #include <esp_timer.h>
@@ -113,7 +114,11 @@ void s31_sleep::CaptureReset() {
     s_sleep_trace.cycle = 0;
     s_sleep_trace.phase = 0;
     s_sleep_trace.applied = 0;
-    s_sleep_trace.pll_div = s_sleep_trace.pll_ctrl = s_sleep_trace.analog = s_sleep_trace.bias = 0;
+    // 对 volatile 左值的链式赋值在 C++20 起弃用：拆成独立语句。
+    s_sleep_trace.pll_div = 0;
+    s_sleep_trace.pll_ctrl = 0;
+    s_sleep_trace.analog = 0;
+    s_sleep_trace.bias = 0;
 }
 
 void s31_sleep::ReportReset() {
@@ -156,9 +161,11 @@ esp_err_t s31_sleep::LightSleep(unsigned applied) {
     // Never let the wake-only register workaround leak into normal clock use.
     s_pmu_sleep_active = false;
     s_sdk_sleep_active = false;
-    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    const uint32_t causes = esp_sleep_get_wakeup_causes();
+    const esp_sleep_wakeup_cause_t cause = PowerWakePrimaryCause(causes);
     Checkpoint(Phase::AfterSleep, applied); // CPU returned, before any I2C access
-    esp_rom_printf("PowerHw: sleep returned cycle=%lu err=%d cause=%d before I2C\n",
-                   static_cast<unsigned long>(s_sleep_trace.cycle), static_cast<int>(err), static_cast<int>(cause));
+    esp_rom_printf("PowerHw: sleep returned cycle=%lu err=%d cause=%d mask=0x%lx before I2C\n",
+                   static_cast<unsigned long>(s_sleep_trace.cycle), static_cast<int>(err),
+                   static_cast<int>(cause), static_cast<unsigned long>(causes));
     return err;
 }

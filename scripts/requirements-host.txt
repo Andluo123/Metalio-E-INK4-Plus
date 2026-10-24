@@ -1,0 +1,9 @@
+# ESP-IDF Python 环境里额外需要的包（idf_tools.py install 不装这些）。
+# 版本与当前已验证的构建一致，改动前请重新跑一次完整构建。
+#
+# qoi-conv : tools/generate_home_icon_pixels.py 读取 .qoi 图标
+# numpy    : 部分资源/字体生成脚本
+# pillow   : 图片与字体预处理
+qoi-conv==1.0.2
+numpy==2.4.6
+pillow==13.0.0

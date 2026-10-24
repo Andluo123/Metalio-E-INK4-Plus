@@ -486,7 +486,8 @@ esp_err_t a2ui_image_put_local_l8(const char *url, uint16_t w, uint16_t h, const
 
 void a2ui_image_abort_loads(void)
 {
-    s_job_gen++;
+    // volatile 的 ++ 在 C++20 起弃用；显式读改写语义不变。
+    s_job_gen = s_job_gen + 1;
     drain_queue();
 }
 

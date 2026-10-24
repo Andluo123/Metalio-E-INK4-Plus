@@ -149,7 +149,7 @@
 #define AUDIO_I2S_WS   GPIO_NUM_43 // I2S_WS
 #define AUDIO_I2S_DOUT GPIO_NUM_44 // I2S_DO（主控→喇叭）
 #define AUDIO_I2S_DIN  GPIO_NUM_45 // I2S_DI（麦→主控）
-/* 38/39 接 BH 串口；无 BT RX 回显时对调（当前：39=TX，38=RX） */
+/* 38/39 接 BH 串口；参考固件实测：39=TX，38=RX */
 #define BT_AUDIO_TX_PIN GPIO_NUM_39 // 主控 TX → 蓝牙芯片
 #define BT_AUDIO_RX_PIN GPIO_NUM_38 // 主控 RX ← 蓝牙芯片
 

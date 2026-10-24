@@ -316,6 +316,9 @@
     X(SETTINGS_ABOUT_MAC, "MAC 地址", "MAC")                                                                   \
     X(SETTINGS_ABOUT_FLASH, "Flash 容量", "Flash")                                                             \
     X(SETTINGS_ABOUT_PSRAM, "PSRAM 总大小", "PSRAM")                                                           \
+    X(SETTINGS_ABOUT_BT_VER, "蓝牙版本", "Bluetooth version")                                                  \
+    X(SETTINGS_ABOUT_BT_UNKNOWN, "点击查询", "Tap to query")                                                   \
+    X(SETTINGS_ABOUT_BT_FAILED, "未获取到", "Unavailable")                                                     \
     X(SETTINGS_ABOUT_NONE, "无", "None")                                                                       \
     X(SETTINGS_TEST_AUTO, "自动测试", "Auto test")                                                             \
     X(SETTINGS_TEST_TOUCH, "触摸测试", "Touch test")                                                           \

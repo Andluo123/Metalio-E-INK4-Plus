@@ -120,7 +120,7 @@ void Blend(lv_draw_task_t* task,const lv_draw_sw_blend_dsc_t* dsc) {
     if(dsc->src_buf && gray) {
         lv_draw_sw_blend_image_dsc_t image{};
         image.dest_buf=dest; image.dest_w=width; image.dest_h=height; image.dest_stride=dest_stride;
-        image.opa=task->type==LV_DRAW_TASK_TYPE_LAYER ? LV_OPA_COVER : dsc->opa; image.blend_mode=dsc->blend_mode;
+        image.opa=task->type==LV_DRAW_TASK_TYPE_LAYER ? lv_opa_t(LV_OPA_COVER) : dsc->opa; image.blend_mode=dsc->blend_mode;
         image.src_stride=dsc->src_stride; image.src_color_format=dsc->src_color_format;
         image.src_buf=static_cast<const uint8_t*>(dsc->src_buf)+
             size_t(area.y1-dsc->src_area->y1)*dsc->src_stride+

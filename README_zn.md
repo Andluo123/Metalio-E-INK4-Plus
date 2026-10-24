@@ -556,6 +556,16 @@ cd esp-idf
 idf.py --version
 ```
 
+Windows 下可用仓库自带脚本一次完成「检查版本 / 检查子模块 / 装工具链 / 装额外 Python 包」：
+
+```powershell
+pwsh scripts/bootstrap.ps1
+# 路径不同时显式指定：
+pwsh scripts/bootstrap.ps1 -IdfPath E:\esp-idf-v6.1 -ToolsPath E:\esp-idf
+```
+
+脚本只设置当前进程的环境变量，不改系统配置，可重复执行。
+
 ### 13.3 获取源码
 
 ```bash
@@ -564,6 +574,10 @@ cd xingzhi-ai-470
 ```
 
 > 仓库自带板级调好的 `sdkconfig`；一般直接 `idf.py build` 即可。
+>
+> `dependencies.lock` 已入库：它锁定 registry 组件的精确版本（含
+> `78/uart-uhci`、`espressif/iot_eth` 等），换机器/离线构建时不会被解析到
+> 不同版本。升级组件后请把新的 lock 文件一起提交。
 
 ### 13.4 关键配置摘要
 
@@ -586,24 +600,70 @@ cd xingzhi-ai-470
 idf.py build
 ```
 
+`main/assets/lang_config.h` 不再入库，由
+`scripts/gen_lang_config_from_home.py` 在构建时从 `main/assets/lang_home.cc`
+的 `X(...)` 列表生成到 `build/esp-idf/main/assets/`。新增界面文案只需改
+`lang_home.cc`，无需手工同步头文件。
+
+PC 侧单元测试（不需要开发板）：
+
+```powershell
+pwsh tools/tests/run_host_tests.ps1          # Windows / MSVC
+```
+
+```bash
+for src in tests/*.cc; do
+  g++ -std=c++17 -Wall -Wextra -Werror -I . "$src" -o "/tmp/$(basename "$src" .cc)" && "/tmp/$(basename "$src" .cc)"
+done
+```
+
 ### 14.2 关于 sdkconfig
 
 默认使用 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`（`-Os`）控制固件体积。两个 OTA 应用分区各为 5 MiB；修改编译优化选项后，应确认固件通过分区大小检查。
 
 修改 `sdkconfig` 前请确认相关配置的影响。 已针对墨水屏、PSRAM、分区调优；错误修改可能导致刷新、Wi-Fi 或 SD 挂载异常。
 
-### 14.3 合并完整固件（发布）
+### 14.3 全量包（产线交付物）
 
-```bash
-./merge_firmware.sh
-# 或：IDF_PATH=~/esp/v6.1 ./merge_firmware.sh
+**`idf.py build` 结束时会自动生成全量包**，不需要额外命令：
+
+```
+build/Metalio-E-Ink4-Plus-full-0x0.bin     # 16 MB，烧录首地址 0x0
 ```
 
-按 `build/flash_args` 编译并合并（含将 `use_font/font.fontpack` 写入 `font_data`）：
+合成与校验由 `scripts/merge_full_image.py` 完成，校验三处 magic：
 
-- `firmware/metalio-e-ink4-plus-{PROJECT_VER}.bin`
+| 偏移 | 内容 | 期望 |
+|:--|:--|:--|
+| `0x2000` | bootloader | `0xE9…` |
+| `0x8000` | 分区表 | `0xAA50` |
+| `0x80000` | app | `0xE9…` |
+
+任一处不符直接构建失败，避免把砖交给产线。
+
+导出到 `firmware/` 并归档（会先编译）：
+
+```bash
+./merge_firmware.sh          # 等价于 --full
+```
+
+输出：
+
+- `firmware/metalio-e-ink4-plus-{PROJECT_VER}-full-0x0.bin`
 - 根目录 `metalio-e-ink4-plus.bin`
 - `daily-builds/...`（本地归档）
+
+⚠️ 全量包段间空隙会被填 `0xFF`，因此 **NVS（设置/配网/阅读进度）会被清空**。
+这是产线整片烧录的固有代价。
+
+仅更新程序（开发调试）可以用 app-only，**烧录地址必须是 `0x80000`**：
+
+```bash
+./merge_firmware.sh --app-only    # 产出 *-app-only-0x80000.bin
+```
+
+> ❌ 绝对不要把 app-only 镜像烧到 `0x0`：会覆盖 bootloader，
+> 表现为串口反复打印 `invalid header: 0x...` + `ets_flash_boot` 断言。
 
 ### 14.4 烧录与监视
 

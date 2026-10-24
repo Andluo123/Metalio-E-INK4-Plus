@@ -2,8 +2,38 @@
 set(AP_FILEMAN_GZ "${CMAKE_CURRENT_BINARY_DIR}/ap_fileman.html.gz")
 set(BOARD_DIR "boards/metalio-e-ink4-plus")
 
+# 新增/删除源文件后应自动重新配置，而不是等到手工 idf.py reconfigure。
+# 但 ESP-IDF 会用 `cmake -P` 再 include 一次本文件来收集组件依赖，
+# 脚本模式下 CONFIGURE_DEPENDS 非法，因此这里按模式切换。
+if(CMAKE_SCRIPT_MODE_FILE)
+    set(_GLOB_OPTS "")
+else()
+    set(_GLOB_OPTS CONFIGURE_DEPENDS)
+endif()
+
+# lang_config.h 由 lang_home.cc 的 X(...) 列表生成。
+# 生成到 build 目录而不是源码树：源码树不再保存“手抄”的头文件，
+# 新增文案只需改 lang_home.cc，构建时自动同步。
+#
+# 注意：ESP-IDF 会用 `cmake -P` 再 include 一次本文件来收集组件依赖，
+# 那种脚本模式下 add_custom_command/add_custom_target 不可用，必须跳过。
+set(LANG_CONFIG_H "${CMAKE_CURRENT_BINARY_DIR}/assets/lang_config.h")
+if(NOT CMAKE_SCRIPT_MODE_FILE)
+    add_custom_command(
+        OUTPUT "${LANG_CONFIG_H}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/assets"
+        COMMAND ${PYTHON} "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/gen_lang_config_from_home.py"
+            --source "${CMAKE_CURRENT_SOURCE_DIR}/assets/lang_home.cc"
+            --output "${LANG_CONFIG_H}"
+        DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/lang_home.cc"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/gen_lang_config_from_home.py"
+        COMMENT "Generating assets/lang_config.h from assets/lang_home.cc"
+        VERBATIM)
+endif()
+
 # Storage sources include the runtime log writer.
-file(GLOB BOARD_COMMON_SRCS
+file(GLOB BOARD_COMMON_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/board/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/power/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/power/*.cc"
@@ -14,7 +44,7 @@ file(GLOB BOARD_COMMON_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/boards/common/storage/*.cc"
 )
 
-file(GLOB BOARD_SRCS
+file(GLOB BOARD_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_DIR}/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_DIR}/bus/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_DIR}/display/*.c"
@@ -26,30 +56,30 @@ file(GLOB BOARD_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_DIR}/periph/*.cc"
 )
 
-file(GLOB HOME_SCREEN_SRCS
+file(GLOB HOME_SCREEN_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/home_screen/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/home_screen/pixel/*.cc"
 )
 
 # Settings sources include manual log upload and its UI.
-file(GLOB SETTINGS_SCREEN_SRCS
+file(GLOB SETTINGS_SCREEN_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/settings_screen/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/settings_screen/settings_test/*.cc"
 )
 
-file(GLOB BLUETOOTH_SCREEN_SRCS
+file(GLOB BLUETOOTH_SCREEN_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/bluetooth_screen/*.cc"
 )
 
-file(GLOB NETWORK_SCREEN_SRCS
+file(GLOB NETWORK_SCREEN_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/network_screen/*.cc"
 )
 
-file(GLOB ASSISTANT_SCREEN_SRCS
+file(GLOB ASSISTANT_SCREEN_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/assistant_screen/*.cc"
 )
 
-file(GLOB BOOK_SCREEN_SRCS
+file(GLOB BOOK_SCREEN_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/book_screen/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/book_screen/cover/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/book_screen/reader/*.cc"
@@ -57,7 +87,7 @@ file(GLOB BOOK_SCREEN_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/book_screen/shelf/*.cc"
 )
 
-file(GLOB CLOUD_SCREEN_SRCS
+file(GLOB CLOUD_SCREEN_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/ap/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/ap/*.c"
@@ -66,32 +96,32 @@ file(GLOB CLOUD_SCREEN_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/cloud_screen/push/*.cc"
 )
 
-file(GLOB WALLPAPER_SCREEN_SRCS
+file(GLOB WALLPAPER_SCREEN_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/wallpaper_screen/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/wallpaper_screen/preview/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/wallpaper_screen/thumbs/*.cc"
 )
 
-file(GLOB STANDBY_SCREEN_SRCS
+file(GLOB STANDBY_SCREEN_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/standby_screen/*.cc"
 )
 
-file(GLOB READER_SRCS
+file(GLOB READER_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/reader/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/reader/jpeg/*.cc"
 )
 
-file(GLOB A2UI_SRCS
+file(GLOB A2UI_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/a2ui/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/a2ui/*.cc"
 )
 
-file(GLOB OTA_UI_SRCS
+file(GLOB OTA_UI_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/ota_upgrade_screen/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/display/screen/ota_confirm_dialog/*.cc"
 )
 
-file(GLOB PROTOCOL_SRCS
+file(GLOB PROTOCOL_SRCS ${_GLOB_OPTS}
     "${CMAKE_CURRENT_SOURCE_DIR}/protocols/protocol.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/protocols/websocket_protocol.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/protocols/mqtt_protocol.cc"
@@ -181,6 +211,8 @@ idf_component_register(
         "factory-test-assets/factory_test_audio.ogg"
         "boards/metalio-e-ink4-plus/display/firmware/ft6336u_v03_app.bin"
     INCLUDE_DIRS
+        # 必须排在 "." 之前：让 "assets/lang_config.h" 命中 build 目录里的生成版
+        "${CMAKE_CURRENT_BINARY_DIR}"
         "."
         "assets"
         "audio"
@@ -231,6 +263,12 @@ idf_component_register(
     PRIV_REQUIRES
         esp-wifi-connect esp-ml307 espressif__cjson 78__esp-opus-encoder 78__esp-opus
 )
+
+if(NOT CMAKE_SCRIPT_MODE_FILE)
+    # 生成头必须先于 main 组件的任何编译单元
+    add_custom_target(main_gen_lang_config DEPENDS "${LANG_CONFIG_H}")
+    add_dependencies(${COMPONENT_LIB} main_gen_lang_config)
+endif()
 
 if(CONFIG_IDF_TARGET_ESP32S31)
     include("${CMAKE_CURRENT_LIST_DIR}/boards/common/power_policy/s31_sleep/s31_sleep_sdk.cmake")
@@ -317,10 +355,10 @@ endforeach()
 
 # Offline expansion avoids repeated PNG inflate and decoder allocations at runtime.
 # Immutable pixels stay in application Flash; no RAM image cache is introduced.
-file(GLOB _home_icon_pngs CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/xingzhi-assets/ic_app_home_*.png")
-file(GLOB _home_icon_overrides CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/embedded/ic_app_home_*.png")
+file(GLOB _home_icon_pngs ${_GLOB_OPTS} "${CMAKE_CURRENT_SOURCE_DIR}/xingzhi-assets/ic_app_home_*.png")
+file(GLOB _home_icon_overrides ${_GLOB_OPTS} "${CMAKE_CURRENT_SOURCE_DIR}/assets/embedded/ic_app_home_*.png")
 set(_pixel_icon_dir "${CMAKE_CURRENT_SOURCE_DIR}/assets/embedded/pixel")
-file(GLOB _pixel_icon_pngs CONFIGURE_DEPENDS "${_pixel_icon_dir}/ic_px_*.png")
+file(GLOB _pixel_icon_pngs ${_GLOB_OPTS} "${_pixel_icon_dir}/ic_px_*.png")
 set(_home_icon_pixels "${CMAKE_CURRENT_BINARY_DIR}/home_icon_pixels.cc")
 add_custom_command(OUTPUT "${_home_icon_pixels}"
     COMMAND ${PYTHON} "${CMAKE_CURRENT_SOURCE_DIR}/../tools/generate_home_icon_pixels.py"

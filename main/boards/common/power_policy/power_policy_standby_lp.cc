@@ -1,6 +1,7 @@
 #include "power_policy_priv.h"
 
 #include "power_hw.h"
+#include "power_wake_cause.h"
 #include "standby_screen/standby_screen.h"
 #include "screen_common.h"
 #include "metalio_keys.h"
@@ -238,9 +239,10 @@ void OpenStandbyAwakeSegmentLocked()
     pwr::standby_awake_mark_us = esp_timer_get_time();
 }
 
-bool IsKeyWakeCause(esp_sleep_wakeup_cause_t cause)
+bool IsKeyWakeCause(uint32_t causes)
 {
-    return cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_EXT1;
+    return PowerWakeCauseMatches(causes, ESP_SLEEP_WAKEUP_GPIO) ||
+           PowerWakeCauseMatches(causes, ESP_SLEEP_WAKEUP_EXT1);
 }
 
 bool RunLightSleepSlice()
@@ -272,9 +274,11 @@ bool RunLightSleepSlice()
         return PollStandbyPhysicalKeys();
     }
 
-    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    if (IsKeyWakeCause(cause)) {
-        ESP_LOGI(TAG, "key wake cause=%d", static_cast<int>(cause));
+    const uint32_t causes = esp_sleep_get_wakeup_causes();
+    if (IsKeyWakeCause(causes)) {
+        ESP_LOGI(TAG, "key wake cause=%d mask=0x%lx",
+                 static_cast<int>(PowerWakePrimaryCause(causes)),
+                 static_cast<unsigned long>(causes));
         // EXT1=GPIO2 仅 P17 可拉：一律按 POWER 处理（勿 Poll BOOT）
         if (HandleGpioWakeFromLightSleep()) {
             return true;
@@ -284,14 +288,16 @@ bool RunLightSleepSlice()
         xSemaphoreGive(pwr::mu);
         return false;
     }
-    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+    if (PowerWakeCauseMatches(causes, ESP_SLEEP_WAKEUP_TIMER)) {
         xSemaphoreTake(pwr::mu, portMAX_DELAY);
         pwr::standby_elapsed_us += static_cast<int64_t>(slice);
         OpenStandbyAwakeSegmentLocked();
         xSemaphoreGive(pwr::mu);
         return false;
     }
-    ESP_LOGW(TAG, "light sleep wake cause=%d, skip slice", static_cast<int>(cause));
+    ESP_LOGW(TAG, "light sleep wake cause=%d mask=0x%lx, skip slice",
+             static_cast<int>(PowerWakePrimaryCause(causes)),
+             static_cast<unsigned long>(causes));
     xSemaphoreTake(pwr::mu, portMAX_DELAY);
     OpenStandbyAwakeSegmentLocked();
     xSemaphoreGive(pwr::mu);
