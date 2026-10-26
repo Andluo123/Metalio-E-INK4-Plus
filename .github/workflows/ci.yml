@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Host unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run tests/*.cc
+        run: |
+          set -euo pipefail
+          mkdir -p build/host-tests
+          for src in tests/*.cc; do
+            name="$(basename "$src" .cc)"
+            echo "== $name =="
+            g++ -std=c++17 -Wall -Wextra -Werror -I . "$src" -o "build/host-tests/$name"
+            "./build/host-tests/$name"
+          done
+
+  idf-build:
+    name: ESP-IDF cross build (esp32s31)
+    runs-on: ubuntu-latest
+    # esp32s31 需要 ESP-IDF 6.1；镜像 tag 与本地验证环境保持一致。
+    # 若该 tag 尚未发布，可改为自建 runner 并预先安装 ESP-IDF 6.1。
+    container:
+      image: espressif/idf:release-v6.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          # sdkconfig 已入库并锁定 ESP32-S31 与全部板级选项；
+          # 不要在这里 set-target，否则会用 sdkconfig.defaults 覆盖已调好的配置。
+          idf.py build
+
+      - name: Report size
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh"
+          idf.py size
+
+      - name: Upload app image
+        uses: actions/upload-artifact@v4
+        with:
+          name: metalio-e-ink4-plus-app
+          path: build/*.bin
+          if-no-files-found: warn
